@@ -69,7 +69,7 @@ original behavior.
 | Resource    | Routes                                                         | Purpose                                                      |
 | ----------- | -------------------------------------------------------------- | ------------------------------------------------------------ |
 | Profile     | `GET/PATCH /v1/users/me`                                       | Local identity and timezone                                  |
-| Agents      | `GET /v1/agents[/{slug}]`                                      | Native roles, backend, and configured models                 |
+| Agents      | `/v1/agents[/{slug}]`, `POST /v1/agents/{slug}/archive`        | Built-in, configured and saved agents; saved ones are edited |
 | Teams       | `/v1/teams[/{id}]`                                             | Durable named groups of agent roles                          |
 | Channels    | `/v1/channels[/{id}]`                                          | Revisioned conversation containers; deletion tombstones them |
 | Messages    | `GET /v1/channels/{id}/messages`, `PUT .../{message}/reaction` | Ordered history and persistent message feedback              |
@@ -77,6 +77,47 @@ original behavior.
 | Preferences | `/v1/prompts`, `/v1/prompts/definitions`                       | Prompt context saved for the local user                      |
 | Workflows   | `/v1/workflows[/{id}]`                                         | Workflow metadata used by the Angie management screen        |
 | Connections | `/v1/connections`, `/v1/connections/services`                  | Redacted view of operator-managed sbxloop integrations       |
+
+### Agents
+
+`GET /v1/agents` lists every agent a client can address, in merge order: the
+built-ins (Angie and the planner, builder, critic and operator), then the
+operator's `[[agents]]` from `sbxloop.toml`, then the agents people saved.
+`GET /v1/agents/{slug}` also answers an alias and a retired built-in name.
+Beside the original fields, each entry carries its identity (`avatar`, a
+`#rrggbb` `color`, `aliases`), its narrowing (`roles`, `tools`, `skills`,
+`mcp`, `credentials`, `interests`, `can_start`, `max_runs_per_day`),
+`enabled`, `source` (`builtin`, `config` or `user`), `editable` and
+`revision`. Clients that see `agents.registry` among the capability
+features may edit saved agents; the fields are defaulted, so older clients
+keep reading the same shape.
+
+| Method  | Path                        | Body                                   | Result                              |
+| ------- | --------------------------- | -------------------------------------- | ----------------------------------- |
+| `POST`  | `/v1/agents`                | the agent spec (`slug`, `name`, ...)   | 201, the agent at `revision` 1      |
+| `PATCH` | `/v1/agents/{slug}`         | `expected_revision` and changed fields | 200, the agent at the next revision |
+| `POST`  | `/v1/agents/{slug}/archive` | none                                   | 200, the agent with `enabled` false |
+
+All three need `collaboration:write`. A saved agent never takes a slug or an
+alias a built-in, configured or other saved agent already has, and a body
+naming a key the spec does not have (a host list, an egress rule) is
+refused: egress stays the operator's `[policy]`. A spec that names an
+undeclared tool, `[[credentials]]` entry or `[[mcp]]` server, or has no
+name, answers 422 `invalid_agent` with the reasons in `detail` and
+`problems`. A `model` is checked against the configured backend's
+discovered model catalog when one is cached (`sbxloop list-models` refreshes
+it); with no catalog the name is accepted as given and a wrong one
+surfaces in the run that uses it. A built-in or configured agent answers
+409 `agent_read_only`; a stale `expected_revision` answers 409
+`agent_revision_conflict` with `current_revision`; a slug already saved
+answers 409 `agent_exists`, and an archived agent 409 `agent_archived`.
+An archived agent is left out of the listing, can no longer be named in a
+team or mentioned, and still answers `GET /v1/agents/{slug}`.
+
+A saved agent is addressed like a built-in: `@slug` in a turn, a
+`target_slugs` entry or a team member. It answers in a chat session under
+its first run role (Angie's own session when it has none) with its own
+persona.
 
 An ordinary turn talks to Angie without host or MCP action tools. A known
 `@agent`, an enabled `@team`, explicit `target_slugs`, or `intent=delegate`
@@ -319,6 +360,8 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `POST`   | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
 | `POST`   | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
 | `GET`    | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
+| `POST`   | `/v1/agents`, `/v1/agents/{slug}/archive`    | collaboration write    | Save a person's own agent; archive it                                 |
+| `PATCH`  | `/v1/agents/{slug}`                          | collaboration write    | Edit a saved agent at the revision last read                          |
 | CRUD     | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
 | `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
 | `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
@@ -417,20 +460,20 @@ its reply frame.
 Every refusal is `application/problem+json` with a stable `code`, the
 request's `X-Request-Id`, and the fields a client needs to act:
 
-| Status | Codes                                                                                                                                                                                                     |
-| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | `invalid_request`, `invalid_cursor`                                                                                                                                                                       |
-| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`                                                                                          |
-| 403    | `forbidden` (with `capability`)                                                                                                                                                                           |
-| 404    | `not_found`, `unknown_target`                                                                                                                                                                             |
-| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised` |
-| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                       |
-| 411    | `length_required`                                                                                                                                                                                         |
-| 413    | `body_too_large` (with `limit`)                                                                                                                                                                           |
-| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`                                                                                                       |
-| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                   |
-| 500    | `internal_error` (never the exception's text)                                                                                                                                                             |
-| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`                                                                                                                          |
+| Status | Codes                                                                                                                                                                                                                                                                                                               |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `invalid_request`, `invalid_cursor`                                                                                                                                                                                                                                                                                 |
+| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`                                                                                                                                                                                                    |
+| 403    | `forbidden` (with `capability`)                                                                                                                                                                                                                                                                                     |
+| 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                    |
+| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived` |
+| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                 |
+| 411    | `length_required`                                                                                                                                                                                                                                                                                                   |
+| 413    | `body_too_large` (with `limit`)                                                                                                                                                                                                                                                                                     |
+| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`, `invalid_agent` (with `problems`)                                                                                                                                                                              |
+| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                                                                                                                             |
+| 500    | `internal_error` (never the exception's text)                                                                                                                                                                                                                                                                       |
+| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`                                                                                                                                                                                                                                    |
 
 `unknown_target` and `not_eligible` carry the daemon's own sentence in
 `detail` — the same one `ctl` prints.

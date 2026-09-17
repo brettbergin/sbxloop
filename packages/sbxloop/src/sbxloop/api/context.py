@@ -20,8 +20,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
-from sbxloop.agents.registry import AgentRegistry, default_registry
-from sbxloop.api.agents import AGENTS_BY_SLUG, ANGIE_PERSONA
+from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry, default_registry
+from sbxloop.api.agents import ANGIE_PERSONA, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
@@ -140,10 +140,17 @@ class ApiContext:
 
     @property
     def agents(self) -> AgentRegistry:
-        """The agent registry for the config this context currently holds."""
+        """The agent registry for the config this context currently holds:
+        the built-ins, ``[[agents]]``, then the agents people saved (a
+        context without a daemon store serves only the first two)."""
         cached = self._agents
         if cached is None or cached[0] is not self.config:
-            cached = (self.config, default_registry(self.config))
+            registry: AgentRegistry = (
+                default_registry(self.config)
+                if self.loop is None
+                else DbAgentRegistry(self.config, self.loop.dstore, clock=self.clock)
+            )
+            cached = (self.config, registry)
             self._agents = cached
         return cached[1]
 
@@ -307,7 +314,12 @@ class ApiContext:
                 break
             self.hub.notify()
             previous_errors = len(errors)
-            definition = AGENTS_BY_SLUG.get(target) if target else None
+            resolved = self.agents.get(target) if target else None
+            definition = (
+                AgentDefinition.from_registry(resolved)
+                if resolved is not None and resolved.slug == target
+                else None
+            )
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
             persona += _RUNNER_INTENT.get(intent, "")
             # Mentioning a role is explicit delegation in Angie's UI.

@@ -24,6 +24,7 @@ from sbxloop.api import errors, ws
 from sbxloop.api.context import ApiContext
 from sbxloop.api.routes import (
     admin,
+    agents,
     artifacts,
     auth,
     catalog,
@@ -166,5 +167,6 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(events.router)
     app.include_router(ws.router)
     app.include_router(auth.router)
+    app.include_router(agents.router)
     app.include_router(collaboration.router)
     return app

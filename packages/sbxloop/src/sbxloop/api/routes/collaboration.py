@@ -8,8 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from sbxloop.agentmodels import model_for_phase, refreshed_models
-from sbxloop.api.agents import AGENTS, AGENTS_BY_SLUG
+from sbxloop.agents.registry import AgentRegistry
 from sbxloop.api.auth.deps import (
     Authenticated,
     current,
@@ -32,7 +31,6 @@ from sbxloop.api.collaboration import (
     Workflow,
 )
 from sbxloop.api.collaboration_schemas import (
-    AgentOut,
     AuthorOut,
     ChannelCreate,
     ChannelOut,
@@ -67,9 +65,8 @@ from sbxloop.api.collaboration_schemas import (
 from sbxloop.api.context import PAGE_MAX, ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import TokenResponse, rfc3339
+from sbxloop.api.routes.agents import addressable
 from sbxloop.api.routes.auth import grant_tokens
-from sbxloop.config import Config
-from sbxloop.engine.harness import ROLE_BY_PHASE
 
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
@@ -245,6 +242,12 @@ def _author_out(author: Author, ctx: ApiContext) -> AuthorOut:
     return AuthorOut(kind=author.kind, id=author.id, display_name=display_name)
 
 
+def _messages_out(messages: list[Message], ctx: ApiContext) -> list[MessageOut]:
+    """Project messages; an agent author's name may need a registry read
+    (saved agents live in the store), so callers run this through ctx.call."""
+    return [_message_out(message, ctx) for message in messages]
+
+
 def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -320,29 +323,6 @@ def _local_user(ctx: ApiContext, auth: Authenticated) -> LocalUser:
     """The calling member's user; kept for callers of the old helper."""
     del ctx
     return member_of(auth).user
-
-
-def _agent_out(slug: str, config: Config) -> AgentOut:
-    agent = AGENTS_BY_SLUG[slug]
-    selection = model_for_phase(config, agent.phase)
-    return AgentOut(
-        slug=agent.slug,
-        name=agent.name,
-        description=agent.description,
-        capabilities=list(agent.capabilities),
-        category=agent.category,
-        instructions=agent.instructions,
-        system_prompt=agent.persona.strip(),
-        backend=config.agent.backend,
-        model=selection.model,
-        model_source=selection.source,
-        phase_models={
-            phase: model_for_phase(config, phase).model
-            for phase in (*ROLE_BY_PHASE, "concierge")
-            if ROLE_BY_PHASE.get(phase, "concierge") == agent.role
-        },
-        read_only=agent.role == "critic",
-    )
 
 
 # -- local onboarding -------------------------------------------------------------
@@ -436,32 +416,12 @@ async def update_local_user(
     return _user_out(updated)
 
 
-# -- agent catalog and teams ------------------------------------------------------
+# -- teams ---------------------------------------------------------------------------
 
 
-@router.get("/agents", response_model=list[AgentOut])
-async def list_agents(
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> list[AgentOut]:
-    config = await ctx.call(refreshed_models, ctx.config)
-    return [_agent_out(agent.slug, config) for agent in AGENTS]
-
-
-@router.get("/agents/{slug}", response_model=AgentOut)
-async def get_agent(
-    slug: str,
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> AgentOut:
-    if slug not in AGENTS_BY_SLUG:
-        raise Problem(404, "agent_not_found", "agent not found")
-    return _agent_out(slug, await ctx.call(refreshed_models, ctx.config))
-
-
-def _validate_agents(slugs: list[str]) -> tuple[str, ...]:
+def _validate_agents(registry: AgentRegistry, slugs: list[str]) -> tuple[str, ...]:
     ordered = tuple(dict.fromkeys(slugs))
-    unknown = sorted(set(ordered) - set(AGENTS_BY_SLUG))
+    unknown = sorted(slug for slug in ordered if not addressable(registry.get(slug), slug))
     if unknown:
         raise Problem(422, "unknown_agent", f"unknown agent(s): {', '.join(unknown)}")
     return ordered
@@ -501,7 +461,7 @@ async def create_team(
     member: Member = Depends(current_member),  # noqa: B008
 ) -> TeamOut:
     user = member.user
-    agents = _validate_agents(body.agent_slugs)
+    agents = await ctx.call(_validate_agents, ctx.agents, body.agent_slugs)
     try:
         team = await ctx.call(
             ctx.collaboration.create_team,
@@ -531,7 +491,7 @@ async def update_team(
     user = member.user
     values = body.model_dump(exclude_unset=True)
     if "agent_slugs" in values:
-        values["agent_slugs"] = _validate_agents(values["agent_slugs"])
+        values["agent_slugs"] = await ctx.call(_validate_agents, ctx.agents, values["agent_slugs"])
     if "is_enabled" in values:
         values["enabled"] = values.pop("is_enabled")
     try:
@@ -978,7 +938,7 @@ async def list_messages(
     messages = await ctx.call(ctx.collaboration.list_messages, user.id, channel_id, after=after)
     if messages is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    return [_message_out(message, ctx) for message in messages]
+    return await ctx.call(_messages_out, list(messages), ctx)
 
 
 @router.put("/channels/{channel_id}/messages/{message_id}/reaction", response_model=MessageOut)
@@ -1006,7 +966,7 @@ async def set_message_reaction(
     if message is None:
         raise Problem(404, "message_not_found", "message not found")
     ctx.hub.notify()
-    return _message_out(message, ctx)
+    return await ctx.call(_message_out, message, ctx)
 
 
 @router.get("/channels/{channel_id}/work", response_model=list[ChannelWorkOut])
@@ -1030,7 +990,8 @@ async def _targets(
     selectors.extend(match.group(1).casefold() for match in MENTION.finditer(content))
     result: list[str] = []
     for selector in dict.fromkeys(selectors):
-        if selector in AGENTS_BY_SLUG:
+        agent = await ctx.call(ctx.agents.get, selector)
+        if addressable(agent, selector):
             result.append(selector)
             continue
         team = await ctx.call(ctx.collaboration.get_team, user.id, selector)
@@ -1085,9 +1046,8 @@ async def create_turn(
         raise _problem(exc) from exc
     if created:
         ctx.hub.notify()
-    return TurnAccepted(
-        turn=_turn_out(turn), message=_message_out(message, ctx), replayed=not created
-    )
+    message_out = await ctx.call(_message_out, message, ctx)
+    return TurnAccepted(turn=_turn_out(turn), message=message_out, replayed=not created)
 
 
 @router.get("/channels/{channel_id}/turns/{turn_id}", response_model=TurnOut)

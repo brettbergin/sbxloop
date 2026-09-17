@@ -27,6 +27,19 @@
   user as its owner member. Existing fields and who may open a channel are
   unchanged.
 
+- **People can save their own agents through the API.** `POST /v1/agents`
+  stores an agent beside the built-ins and `[[agents]]`, `PATCH /v1/agents/{slug}` edits it against the revision last read (409
+  `agent_revision_conflict` otherwise), and `POST /v1/agents/{slug}/archive` retires it. A saved agent never takes a name a
+  built-in or configured agent has, carries no egress keys, and is checked
+  against the declared tools, credentials and MCP servers and, when the
+  backend's model catalog is cached, its models. Built-in and configured
+  agents stay read-only (409 `agent_read_only`). A saved agent can be
+  @mentioned, targeted and put in a team, and answers in its own persona;
+  an archived one cannot. `GET /v1/agents` entries gain the agent's
+  identity, narrowing, `source`, `editable` and `revision` as defaulted
+  fields, and the `agents.registry` feature advertises all of it. The new
+  `agents` table is additive (migration 0022).
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,

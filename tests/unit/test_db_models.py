@@ -70,6 +70,7 @@ COLLABORATION_TABLES = (
     "collaboration_workflows",
     "workspace_members",
     "workspace_invites",
+    "agents",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 
