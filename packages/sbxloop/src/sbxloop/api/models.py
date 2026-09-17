@@ -335,6 +335,12 @@ class Item(ApiModel):
     updated_at: str
     revision: int = 0
     available_actions: list[str] = Field(default_factory=list)
+    #: The agent asked to lead the work, or, once the run is planned, the
+    #: agent that leads it. ``None`` for work admitted without one.
+    lead_agent: str | None = None
+    #: The agent in each run role: the planned team once the item was
+    #: dispatched, the roles asked for before. ``None`` when none were.
+    assignment: dict[str, str] | None = None
 
 
 class ItemDetail(Item):
@@ -471,6 +477,9 @@ class IssueIntake(ApiModel):
     repository: str | None = None
     number: int = Field(ge=1)
     run_kind: Literal["code", "workload"] = "code"
+    lead: str | None = Field(default=None, max_length=64)
+    roles: dict[str, str] = Field(default_factory=dict, max_length=8)
+    channel_id: str | None = Field(default=None, max_length=128)
 
 
 class WorkloadIntake(ApiModel):
@@ -478,6 +487,14 @@ class WorkloadIntake(ApiModel):
     ask: str = Field(min_length=1, max_length=65536)
     profile: str | None = None
     sink: str | None = None
+    #: The agent that leads the run (the built-in lead when omitted); it
+    #: must be active and declare the ``lead`` role.
+    lead: str | None = Field(default=None, max_length=64)
+    #: The agent asked for in each run role (``planner``, ``builder``,
+    #: ``critic``, ``operator``); each must be active and declare the role.
+    roles: dict[str, str] = Field(default_factory=dict, max_length=8)
+    #: The channel the work answers to: its result is delivered there.
+    channel_id: str | None = Field(default=None, max_length=128)
 
 
 class ToolIntake(ApiModel):

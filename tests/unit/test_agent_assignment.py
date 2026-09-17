@@ -51,12 +51,12 @@ class Memory:
     def __init__(self) -> None:
         self.asked: list[tuple[str, str | None]] = []
 
-    def prompt_block(self, agent_slug: str, *, channel_id: str | None = None) -> str:
+    def prompt_block(self, agent: str, *, channel_id: str | None) -> str:
         """Only Ada remembers anything."""
-        self.asked.append((agent_slug, channel_id))
-        if agent_slug != "ada":
+        self.asked.append((agent, channel_id))
+        if agent != "ada":
             return ""
-        return f"\n\n## What you remember\n\n- {agent_slug} likes tidy commits\n"
+        return f"\n\n## What you remember\n\n- {agent} likes tidy commits\n"
 
 
 class TestPlanAssignment:

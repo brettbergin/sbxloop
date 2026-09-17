@@ -6,7 +6,8 @@ source channel is shown only in that channel, unless the platform says the
 channel is visible to the whole workspace (:class:`ChannelVisibility`;
 :class:`WorkspaceChannelVisibility` reads the channel's ``visibility``). A
 person reviews and edits an agent's memories through the API; the agent
-itself remembers and recalls through tools a later change adds.
+itself remembers, recalls and forgets through the tools in
+:mod:`sbxloop.agents.tools`, and its memory block is added to its prompts.
 
 :class:`MemoryService` is the one interface. Rows live in the daemon's store
 (``agent_memories``); forgetting is a soft delete, updates are checked

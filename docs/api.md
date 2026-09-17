@@ -234,6 +234,45 @@ The association is durable turn data, independent of event retention; unrelated
 repositories with the same issue number do not match. No source polling or
 runner behavior changes.
 
+### Admitting work for named agents
+
+`POST /v1/items` takes three optional fields on an `issue` or `workload`
+body (advertised as `intake.assignment`): `lead`, the agent that leads the
+run; `roles`, an object mapping a run role (`planner`, `builder`, `critic`,
+`operator`) to an agent slug; and `channel_id`, the channel the work answers
+to. Each named agent must exist, be active (not disabled or archived) and
+declare the role it is asked to take (`lead` for the lead); anything else is
+`422 invalid_argument` naming the agent and the role, and nothing is queued
+or labelled. Naming a `channel_id` also takes `collaboration:write` (and
+`collaboration:read` for a workspace member's client), checked first: without
+it the request is `403 forbidden`. A `channel_id` the caller cannot read is
+`404 channel_not_found`. Work asked for again after its last run finished is
+planned afresh from the new request's lead and roles.
+A body without them admits work exactly as before.
+
+When the item is dispatched, the daemon plans its assignment: each role takes
+the agent asked for and the built-in agent otherwise, and the lead is the one
+asked for or Angie. The plan is stored with the item, and every later attempt
+at the same item reuses it, even if an agent was archived since. Issues found
+by polling run with the built-in team. Items read back with `lead_agent` (the
+planned lead once dispatched, the requested one before) and `assignment` (the
+agent in each run role, or `null` when none were named and nothing is planned
+yet).
+
+A chat turn passes its channel and, for the agents it mentioned, the run roles
+they declare to the work it starts: a workload it queues carries them, and an
+issue it files or labels leaves a note the polled item picks up. The note is
+spent by the item it fills, so an old conversation's request is never replayed
+onto work the same issue is labelled for later. A turn answered by Angie names
+Angie as the lead. An item that names its channel is delivered there even when
+its key names no message in it (as part of the channel's latest turn when it
+was admitted), and never to a channel other than its own; that holds for an
+issue (`code`) admission too, whether or not any turn in the channel named the
+issue. A channel that has had no turn yet has nowhere to put a result, so the
+delivery is skipped and the daemon log says why
+(`api.work_delivery_skipped`). A work result is credited to the item's lead
+when it has one, and to the participant that asked otherwise.
+
 A finished workload or tool run's files are catalogued before its work result
 is written, so the first `work_result` message already names them. Its `work.artifacts` (and
 each entry of `GET /v1/channels/{id}/work`) lists up to 50 available files,
@@ -331,6 +370,34 @@ memory (a soft delete). With `[memory] enabled = false`, `POST` answers
 `409 memory_disabled`. Changes write `agent.memory.created`, `.updated` and
 `.deleted` events that name the memory, its agent and its source channel but
 never its text.
+
+A mentioned agent's chat persona carries the memories it may see in the turn's
+channel (nothing is added when it has none). An agent whose `tools` list names
+`memory`, or a person's own agent with no `tools` list, is also given
+`remember`, `recall` and `forget` in chat; a read-only peer turn gets `recall`
+alone. What it keeps is authored `agent:<slug>` and scoped to the channel and
+message of the turn. Built-in agents and `[[agents]]` entries with no `tools`
+list get no memory tools. In a run, a custom agent's memory block is taken
+when the run is planned and kept across a resume, and an agent whose `tools`
+names `memory` gets the same tools, writing with the run's id and channel; a
+read-only session, and a critic whatever its session, gets `recall` alone, as
+a read-only chat turn does. With `[memory] enabled = false` no memory reaches
+a prompt and no tool is offered.
+
+A run started from a channel keeps what its agents remember for that channel.
+A run with no channel — one a labelled issue, a schedule or the CLI started —
+has no channel to keep it for, so what its agents remember there is
+**workspace-global**: that agent recalls it in every channel, for anyone who
+can address it. This is deliberate, so a run's agent can use next week what it
+learned this week wherever the next ask arrives. The `remember` tool says so
+in its own description whenever the agent is working without a channel, and
+`GET /v1/agents/{slug}/memories` shows such a memory with no source channel.
+Give a run a channel when what its agents keep should stay in one place.
+
+A memory's text stays out of the daemon log: a `remember` or `recall` tool
+call is logged by length, not by content, as `agent.memory.*` events are
+logged by id. The log is one stream for the whole installation, and any agent
+can read it from any channel through `daemon_log`.
 
 Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied

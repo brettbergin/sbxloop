@@ -58,6 +58,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
+from sbxloop.agents.tools import AgentTool
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
@@ -71,7 +72,7 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
-from sbxloop.daemon.model import WorkItem, live_runs
+from sbxloop.daemon.model import WorkItem, live_runs, requested_roles_json
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
@@ -217,6 +218,14 @@ class TurnContext:
     #: pool: the product channel it answers and the agent that speaks.
     usage_channel_id: str | None = None
     usage_agent_slug: str | None = None
+    #: The answering agent's own tools (its memory), offered beside the
+    #: turn's host tools when the turn may act.
+    agent_tools: tuple[AgentTool, ...] = ()
+    #: The channel the turn belongs to, and the lead and the agent per run
+    #: role the turn asked for: what work the turn starts is admitted with.
+    channel_id: str | None = None
+    work_lead: str | None = None
+    work_roles: Mapping[str, str] = field(default_factory=dict)
     work_products: list[str] = field(default_factory=list)
     #: The sandbox generation of the turn's last session call, so a failure
     #: is blamed on the box it happened in.
@@ -287,6 +296,15 @@ ToolImpl = Callable[[dict[str, Any], str], str]
 class HostTool(NamedTuple):
     spec: HostToolSpec
     impl: ToolImpl
+
+
+def _as_roster_impl(tool: AgentTool) -> ToolImpl:
+    """An agent tool in the roster's ``(args, by)`` shape."""
+
+    def impl(args: dict[str, Any], _by: str) -> str:
+        return tool.impl(args)
+
+    return impl
 
 
 def compose_issue_body(args: Mapping[str, Any]) -> str:
@@ -526,6 +544,10 @@ class Concierge:
         return self._turn.code_work
 
     @property
+    def _turn_agent_tools(self) -> tuple[AgentTool, ...]:
+        return self._turn.agent_tools
+
+    @property
     def _turn_work_products(self) -> list[str]:
         return self._turn.work_products
 
@@ -571,6 +593,9 @@ class Concierge:
         handoff_agents: Sequence[str] | None = None,
         channel_id: str | None = None,
         agent_slug: str | None = None,
+        agent_tools: Sequence[AgentTool] = (),
+        work_lead: str | None = None,
+        work_roles: Mapping[str, str] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -583,7 +608,12 @@ class Concierge:
         ``handoff_agent`` may address (the built-ins when omitted).
         ``channel_id`` and ``agent_slug`` are where the turn's reported
         usage is charged in the workspace budget pool: the product channel
-        it answers and the agent that speaks (the role when unset)."""
+        it answers and the agent that speaks (the role when unset);
+        ``agent_tools`` are the answering agent's own tools (its memory),
+        offered only when the turn may act.
+        ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
+        this turn starts is admitted with: the channel it answers to, the
+        lead and the agent per run role (already checked by the caller)."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -616,6 +646,10 @@ class Concierge:
                 code_work=on_code_work,
                 usage_channel_id=channel_id,
                 usage_agent_slug=agent_slug or agent_role,
+                agent_tools=tuple(agent_tools),
+                channel_id=channel_id,
+                work_lead=work_lead,
+                work_roles=dict(work_roles or {}),
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -1222,6 +1256,10 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
+        for tool in self._turn_agent_tools:
+            # Adapted to the roster's (args, by) shape; the agent acts as
+            # itself, so who asked does not change what it keeps.
+            available[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
         return available
 
     def _tool_handoff(self, args: dict[str, Any], _by: str) -> str:
@@ -2235,6 +2273,11 @@ class Concierge:
             kind="workload",
             profile=profile.name if profile is not None else None,
             requested_by=self._turn_author_id,
+            channel_id=self._turn.channel_id,
+            lead_agent=self._turn.work_lead,
+            assignment_json=(
+                requested_roles_json(self._turn.work_roles) if self._turn.work_roles else None
+            ),
         )
         try:
             queued = self.dstore.upsert_new(item, self.clock())
@@ -2739,6 +2782,7 @@ class Concierge:
             title=title[:80],
             queued=queued,
         )
+        self._note_code_admission(str(ref.number), repo)
         if not queued:
             return (
                 f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
@@ -2867,6 +2911,19 @@ class Concierge:
         )
         return "\n".join(lines)
 
+    def _note_code_admission(self, number: str, repo: str) -> None:
+        """Leave the turn's channel and agents for the item a poll builds
+        from the issue, as its requester is left."""
+        turn = self._turn
+        self.dstore.note_admission(
+            number,
+            self.clock(),
+            repo=repo,
+            channel_id=turn.channel_id,
+            lead=turn.work_lead,
+            roles=turn.work_roles,
+        )
+
     def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
         repo, repo_error = self._resolve_repo(args)
@@ -2882,6 +2939,7 @@ class Concierge:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
         log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
+        self._note_code_admission(str(number), repo)
         if self._turn_code_work is not None:
             self._turn_code_work(repo, number, f"Issue #{number}")
         return (
@@ -3031,19 +3089,31 @@ class Concierge:
 
 
 def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
-    """The call's arguments, with the ones that can carry a credential hidden.
+    """The call's arguments, with the ones that can carry a credential or a
+    memory's text hidden.
 
     A URL a person types can embed a username and password, and a rejected
     one is never canonicalised — so the raw value never reaches the logs or
-    the chat chronology. Every other selector stays visible: a tool call
-    that shows up with no arguments cannot be followed or steered, and the
-    resolved targets are named in the reply either way.
+    the chat chronology. What an agent remembers is scoped to one channel,
+    but the daemon log is not: any agent can read it from any channel
+    through ``daemon_log``, so a memory's text never goes there either — its
+    length is what the call can be followed by, and the reply names the id.
+    Every other selector stays visible: a tool call that shows up with no
+    arguments cannot be followed or steered, and the resolved targets are
+    named in the reply either way.
     """
     arguments = dict(call.arguments)
     if call.name == "handoff_agent":
         return {"agent_slug": arguments.get("agent_slug")}
     if call.name == "start_entrygraph" and arguments.get("url") is not None:
         arguments["url"] = "<redacted url>"
+    if call.name == "remember":
+        content = arguments.get("content")
+        arguments["content"] = f"<{len(content)} chars>" if isinstance(content, str) else "<hidden>"
+    if call.name == "recall" and arguments.get("query") is not None:
+        # A query is written from what the agent remembers; it quotes it
+        # often enough that it belongs on the same side of this line.
+        arguments["query"] = "<redacted query>"
     return arguments
 
 

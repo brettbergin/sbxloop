@@ -2,6 +2,25 @@
 
 ### Added
 
+- **Agents use their long-term memory in chat and in runs.** A mentioned
+  agent's chat persona now carries the memories it may see in that channel
+  (nothing changes for an agent with none). An agent whose `tools` list
+  names `memory`, or a person's own agent with no `tools` list, can call
+  `remember`, `recall` and `forget`; what it keeps is written as
+  `agent:<slug>` in the turn's channel, `recall` returns only what that
+  channel may see, and a read-only peer turn gets `recall` alone. A run's
+  agent assignment snapshots each agent's memory block when it is planned
+  and keeps it across a resume, and an agent in a run whose `tools` names
+  `memory` gets the same three tools, writing with the run's id and
+  channel; a read-only session, and a critic whatever its session, gets
+  `recall` alone there too. A run with no channel keeps what its agents
+  remember for the whole workspace, so it is recalled in every channel —
+  `remember` says so in its own description when the agent is working
+  without one. A memory's text never reaches the daemon log, which every
+  agent can read from any channel. Built-in agents are given no memory
+  tools, so the shipped team's prompts and tools are unchanged.
+  `[memory] enabled = false` turns all of it off.
+
 - **Owners and admins can manage the workspace's people.** `GET /v1/users`
   lists every member with role, standing, sign-in source and last-seen time
   for any member to read. `PATCH` and `DELETE /v1/workspace/members/{user_id}`
@@ -41,6 +60,26 @@
   `auth.oidc` is advertised only while the
   section is enabled. Local password sign-in is unchanged, and the secret
   never appears in config, events or logs.
+
+- **Work can be admitted for named agents.** `POST /v1/items` takes an
+  optional `lead`, a `roles` map from run role to agent slug and a
+  `channel_id` on issue and workload bodies (advertised as
+  `intake.assignment`); an agent that does not exist, is disabled or
+  archived, or does not declare the role is refused with a 422 naming it,
+  and naming a channel takes `collaboration:write`.
+  Dispatch plans each run's agent assignment from what was asked (the
+  built-in team otherwise), stores it with the item and hands it to the
+  engine, and a later attempt reuses it (work asked for again after it
+  finished is planned afresh). Items read back with `lead_agent`
+  and `assignment`. A chat turn passes its channel and the run roles of the
+  agents it mentioned to the work it starts (spending that request on the
+  item it fills, so it is never replayed later), finished work is delivered
+  to the channel the item names, issues included, and a result is credited
+  to the item's lead. A channel with no turn yet has nowhere to put a
+  result, and the daemon log says so. Each planned agent carries what it
+  remembers in that channel. Revision 0027 adds the channel, lead,
+  assignment and agent-chain columns to work items; polled issues run
+  exactly as before.
 
 - **A workspace can hold more than one person.** Local users now belong to
   the installation's workspace as an owner, admin or member, and the
@@ -131,8 +170,7 @@
   `[memory]` section bounds how many each agent keeps (the oldest unpinned
   is dropped), how long one may be and how much a prompt may carry, and can
   turn the feature off. Changes are recorded as `agent.memory.*` events
-  without the text. Nothing reads memories into prompts yet, and agents
-  have no memory tools yet.
+  without the text.
 
 - **A run can be given named agents.** The engine takes an optional agent
   assignment (a lead, the agent in each run role, and optionally the agent
