@@ -153,7 +153,9 @@
   it once an approved landing merges. `[landing] followups`,
   `followup_label` and `max_followups_per_run` apply as before, and the
   run's recorded filings and the issue markers keep a repeated approval
-  from filing anything twice.
+  from filing anything twice. A pass that finds every follow-up already
+  recorded emits no `run.followups` event, so a run reports its follow-ups
+  once rather than a second time as "already tracked".
 
 - **A failed `sbx create` says what sbx said.** Every create failure was
   rewrapped as "check host capacity and that `sbx create --help` supports

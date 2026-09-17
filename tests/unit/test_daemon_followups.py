@@ -15,11 +15,13 @@ from typing import Any
 
 from sbxloop.config import Config
 from sbxloop.engine.followups import (
+    FollowupFiler,
     collect_followups,
     followup_key,
     followup_marker,
     issue_body,
     marker_key,
+    recorded_review_rounds,
 )
 from sbxloop.engine.issue_lookup import LookupReceipt, fingerprint
 from sbxloop.engine.review import Followup, ReviewRound, ReviewVerdict
@@ -95,6 +97,19 @@ def gate_ready(tmp_path: Path, config: Config | None = None) -> tuple[Harness, F
     return h, fake, run_id
 
 
+def engine_pass(h: Harness, fake: FakeGithub, run_id: str) -> None:
+    """What the engine's landing does when it parks: file the follow-ups
+    and record them, before the daemon ever sees the gate approved."""
+    bus = EventBus()
+    bus.subscribe(h.store.append_event)
+    filer = FollowupFiler(
+        fake, REPO, h.store, bus, h.config, trigger_label=h.config.labels_for(REPO).trigger
+    )
+    filer.file(
+        h.store.get_run(run_id), recorded_review_rounds(h.store, run_id), issues_enabled=True
+    )
+
+
 def approve(h: Harness, run_id: str) -> None:
     gate = h.dstore.merge_gate_for(run_id)
     assert gate is not None and h.dstore.claim_merge_gate(run_id)
@@ -133,6 +148,40 @@ class TestGatedApproval:
         assert len(fake.issues_created) == 1
         again = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert again == comments
+        # A pass that files nothing new reports nothing: one event, not a
+        # second one calling the run's own issue "already tracked".
+        (event,) = followup_events(h, run_id)
+        assert "reused" not in event.data
+
+    def test_the_engine_filing_at_the_park_is_reported_once(self, tmp_path: Path) -> None:
+        """The engine files when its landing parks; the daemon's pass after
+        the merge finds every note recorded and stays quiet."""
+        h, fake, run_id = gate_ready(tmp_path)
+        engine_pass(h, fake, run_id)
+        assert len(fake.issues_created) == 1
+        approve(h, run_id)
+        assert fake.merges
+        assert len(fake.issues_created) == 1
+        (event,) = followup_events(h, run_id)
+        assert [f["title"] for f in event.data["filed"]] == [TITLE]
+        assert "reused" not in event.data
+
+    def test_the_engine_checklist_at_the_park_is_reported_once(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {
+                "home": str(tmp_path / "state"),
+                "github": {"repo": REPO},
+                "landing": {"followups": "comment"},
+            }
+        )
+        h, fake, run_id = gate_ready(tmp_path, cfg)
+        engine_pass(h, fake, run_id)
+        approve(h, run_id)
+        assert fake.merges
+        checklists = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
+        assert len(checklists) == 1
+        (event,) = followup_events(h, run_id)
+        assert event.data["mode"] == "comment"
 
     def test_followups_the_run_already_filed_are_not_filed_again(self, tmp_path: Path) -> None:
         """The engine files at the park too; the daemon's pass after the

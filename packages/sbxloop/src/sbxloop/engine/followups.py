@@ -314,6 +314,12 @@ class FollowupFiler:
         filed: list[tuple[str, str]] = []
         listed: list[str] = []
         reused: list[tuple[str, str]] = []
+        # What this pass itself did (an issue filed, a row recorded, a
+        # comment posted). A pass that finds everything already recorded
+        # (the daemon's pass after the engine filed at the park) reports
+        # nothing, rather than a second event calling the run's own issues
+        # "already tracked".
+        fresh: list[str] = []
         started = time.time()
         mode: str = cfg.followups
         downgraded = False
@@ -323,7 +329,15 @@ class FollowupFiler:
             if mode == "issues":
                 try:
                     self._file_issues(
-                        run, candidates, already, filed, listed, reused, started, attribution
+                        run,
+                        candidates,
+                        already,
+                        filed,
+                        listed,
+                        reused,
+                        fresh,
+                        started,
+                        attribution,
                     )
                 except GithubOpsError as exc:
                     if exc.http_status != 410:
@@ -346,10 +360,11 @@ class FollowupFiler:
                         ),
                     )
                     self._record_comment(run_id, len(already) + 1, len(candidates), started)
+                    fresh.append("(comment)")
                 listed = [c.followup.title.strip() for c in candidates]
         except GithubOpsError:
             log.warning("run.followups_failed", run=run_id, pr=run.pr_number, exc_info=True)
-        if not filed and not listed:
+        if not fresh or (not filed and not listed):
             return
         extra: dict[str, Any] = {}
         if reused:
@@ -383,13 +398,15 @@ class FollowupFiler:
         filed: list[tuple[str, str]],
         listed: list[str],
         reused: list[tuple[str, str]],
+        fresh: list[str],
         started: float,
         attribution: str | None,
     ) -> None:
         """The ``issues`` mode of :meth:`file`: one issue per candidate
         (recorded as filed as it goes) and one pointer comment on the PR.
         ``filed`` is appended in place so a 410 midway leaves the caller
-        knowing what landed."""
+        knowing what landed; ``fresh`` gets the key of each row this call
+        records, so the caller knows whether it did anything at all."""
         ops, repo, run_id = self.ops, self.repo, run.run_id
         assert run.pr_number is not None
         cfg = self.cfg.landing
@@ -459,6 +476,7 @@ class FollowupFiler:
                 started_at=started,
             )
             already[cand.key] = url
+            fresh.append(cand.key)
         if (filed or held) and "(comment)" not in already:
             # One pointer on the PR, so the human sees them without opening
             # the tracker.
@@ -468,6 +486,7 @@ class FollowupFiler:
                 checklist_comment(candidates, run_id=run_id, filed=filed, held=held),
             )
             self._record_comment(run_id, len(already) + 1, len(filed), started)
+            fresh.append("(comment)")
 
     def _record_comment(self, run_id: str, attempt: int, count: int, started: float) -> None:
         self.store.record_phase(
