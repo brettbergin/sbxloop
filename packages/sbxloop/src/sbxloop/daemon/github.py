@@ -22,10 +22,13 @@ from sbxloop.config import VCS_KINDS, Config, VcsKind
 from sbxloop.errors import (
     DaemonError,
     GithubOpsError,
+    ProvisionError,
+    SbxAuthError,
     SbxError,
     SbxloopError,
     SbxNotFoundError,
     WorkerError,
+    caused_by_sbx_auth,
 )
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
@@ -47,6 +50,8 @@ DAEMON_SANDBOX_PREFIX = "sbxloop-daemon"
 SANDBOX_NAME_PREFIX = f"{DAEMON_SANDBOX_PREFIX}-github"
 # Ops issued from the daemon (not from a run) carry this run id in events.
 DAEMON_RUN_ID = "daemon"
+# The kind is a config value; prose written for a person names the product.
+_FORGE_NAMES: dict[str, str] = {"github": "GitHub", "gitlab": "GitLab", "gitea": "Gitea"}
 # A dead github sandbox costs one re-provision; a GitHub outage must not
 # cost one per failing call (each is a full microVM boot + worker install),
 # so between re-provisions failures propagate to the caller, whose own
@@ -63,6 +68,24 @@ def sandbox_name_for(home: SbxloopHome, kind: VcsKind = "github") -> str:
     the instance identity."""
     digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
     return f"{DAEMON_SANDBOX_PREFIX}-{kind}-{digest}"
+
+
+def generation_name(base: str, generation: int) -> str:
+    """The box's name in its ``generation``-th incarnation: the base name,
+    then ``<base>-g1``, ``<base>-g2``... A generation is taken when the
+    backend will not give the previous one back (#1165): a hung microVM
+    whose ``sbx rm`` never completes, or a name it refuses to re-create
+    over state a crashed backend left behind. The daemon carries on under
+    the next name instead of waiting on the old one every poll."""
+    return base if generation == 0 else f"{base}-g{generation}"
+
+
+def is_generation_of(name: str, base: str) -> bool:
+    """Whether ``name`` is ``base`` or one of its generations."""
+    if name == base:
+        return True
+    suffix = name.removeprefix(f"{base}-g")
+    return suffix != name and suffix.isdigit()
 
 
 class DaemonGithub:
@@ -88,7 +111,14 @@ class DaemonGithub:
         self.worker_python = worker_python
         self.install_workers = install_workers
         kind = config.vcs_kind_for(repo)
-        self.name = name or sandbox_name_for(config.paths, kind)
+        # The base name is the identity; ``name`` is the generation in use,
+        # and moves on when the backend will not give a generation back.
+        self._base_name = name or sandbox_name_for(config.paths, kind)
+        self.name = self._base_name
+        # Generations this process gave up on: a removal that failed, a
+        # create the backend refused. Never retried in this process; the
+        # next daemon start tries the base name again.
+        self._unusable: set[str] = set()
         # The same home's box under every other forge: what a `[vcs] kind`
         # switch (in any direction) or a pre-forge-naming upgrade leaves
         # behind. A caller-named box (doctor, init-repo) owns no such names.
@@ -113,32 +143,73 @@ class DaemonGithub:
         return self.config.paths.github_workspace.resolve()
 
     def remove_stale(self) -> None:
-        """Remove only this instance's stale box; uncertainty must propagate.
+        """Remove this instance's stale boxes and settle on the name to create.
 
         Inventory, rather than a generic 'not found' exception, proves
         absence: Docker authentication errors can say 'secret not found'.
         Run this before every provision so a failed cleanup is retried when
         authentication or the sandbox service recovers.
 
-        Only this box's own name: create would collide with it. A previous
-        forge's box has a different name and is cleared after the new box is
-        ready (:meth:`_clear_previous_forges`), so a wedged old box can never
-        keep the configured forge from being polled.
+        Only this instance's own names, base and generations: create would
+        collide with the one it picks. A box the backend cannot remove (a
+        hung microVM whose ``sbx rm`` times out) is reported once and left
+        to the backend, and the daemon carries on under the next generation
+        of the name (#1165): the field failure was a poll that waited out
+        that timeout every half hour for a day. A previous forge's box has
+        a different name and is cleared after the new box is ready
+        (:meth:`_clear_previous_forges`).
         """
-        if not self._listed():
-            log.debug("github_sandbox.no_stale", sandbox=self.name)
-            return
-        try:
-            Sandbox(self.sbx, self.name).rm()
-        except SbxNotFoundError:
-            # Listed a moment ago, "not found" now: a teardown already in
-            # flight (seen while sandboxd recovered). Absent is what this
-            # wanted, but only the inventory proves it (see close).
-            if not self._absent():
+        listed = [
+            info.name for info in self.sbx.ls() if is_generation_of(info.name, self._base_name)
+        ]
+        if not listed:
+            log.debug("github_sandbox.no_stale", sandbox=self._base_name)
+        for name in listed:
+            if name in self._unusable:
+                continue
+            try:
+                Sandbox(self.sbx, name).rm()
+            except SbxNotFoundError:
+                # Listed a moment ago, "not found" now: a teardown already in
+                # flight (seen while sandboxd recovered). Absent is what this
+                # wanted, but only the inventory proves it (see close).
+                if not self._absent(name):
+                    raise
+                log.info("github_sandbox.stale_already_gone", sandbox=name)
+                continue
+            except SbxAuthError:
+                # Nobody is signed in: every name fails alike, nothing is
+                # wedged, and the next poll retries once someone is.
                 raise
-            log.info("github_sandbox.stale_already_gone", sandbox=self.name)
+            except SbxError as exc:
+                self._give_up_on(name, exc, reason="remove_failed")
+                continue
+            log.info("github_sandbox.stale_removed", sandbox=name)
+        self.name = self._free_name()
+
+    def _free_name(self) -> str:
+        """The lowest generation this process has not given up on."""
+        generation = 0
+        while generation_name(self._base_name, generation) in self._unusable:
+            generation += 1
+        return generation_name(self._base_name, generation)
+
+    def _give_up_on(self, name: str, exc: BaseException, *, reason: str) -> None:
+        """Retire ``name`` for this process, reporting it the first time."""
+        if name in self._unusable:
             return
-        log.info("github_sandbox.stale_removed", sandbox=self.name)
+        self._unusable.add(name)
+        log.error(
+            "github_sandbox.wedged",
+            sandbox=name,
+            reason=reason,
+            kind=self.kind,
+            error=str(exc),
+            hint="the sandbox backend would not remove or re-create this box, so the "
+            "daemon carries on under the next generation of its name and the box is "
+            "left to the backend; restart sbx-sandboxd, then `sbxloop sandbox rm "
+            "<name>` clears it — a backend that wedges repeatedly is the host, not an item",
+        )
 
     def _clear_previous_forges(self) -> None:
         """Best effort, once per instance: remove this home's box under any
@@ -163,8 +234,8 @@ class DaemonGithub:
                 error=str(exc),
             )
             return
-        for name in self._previous_forge_names:
-            if name not in listed:
+        for name in sorted(listed):
+            if not any(is_generation_of(name, base) for base in self._previous_forge_names):
                 continue
             try:
                 # settle=False: nothing re-creates this name while the
@@ -184,9 +255,10 @@ class DaemonGithub:
             else:
                 log.info("github_sandbox.previous_forge_removed", sandbox=name, kind=self.kind)
 
-    def _listed(self) -> bool:
-        """Whether ``sbx ls`` lists this instance's box right now."""
-        return any(info.name == self.name for info in self.sbx.ls())
+    def _listed(self, name: str | None = None) -> bool:
+        """Whether ``sbx ls`` lists this instance's box (or ``name``) right now."""
+        target = self.name if name is None else name
+        return any(info.name == target for info in self.sbx.ls())
 
     def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
@@ -265,18 +337,24 @@ class DaemonGithub:
                     log.info("github_sandbox.already_gone", sandbox=self.name)
                     return
                 log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
-            except SbxError:
+            except SbxError as exc:
                 log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+                # A box that will not go away is not worth another 120s
+                # timeout at the next provision; that one starts a new
+                # generation. A sign-in failure is the host, not the box.
+                if not isinstance(exc, SbxAuthError):
+                    self._give_up_on(sandbox.name, exc, reason="remove_failed")
             else:
                 log.info("github_sandbox.removed", sandbox=self.name)
 
-    def _absent(self) -> bool:
-        """Whether the inventory confirms this instance's box is gone.
+    def _absent(self, name: str | None = None) -> bool:
+        """Whether the inventory confirms this instance's box (or ``name``)
+        is gone.
 
         Fails closed: an inventory that cannot be read confirms nothing.
         """
         try:
-            return not self._listed()
+            return not self._listed(name)
         except SbxError:
             return False
 
@@ -313,22 +391,40 @@ class DaemonGithub:
         )
         try:
             self.remove_stale()
-            sandbox = self.provisioner.ensure_github_only(
-                self.name, self.workspace, post_create=install, repo=self.repo
-            )
+            sandbox = self._ensure(install)
         except SbxloopError as exc:
             # ProvisionError, WorkerError, SbxError alike: one daemon-level
-            # error, and nothing left behind.
+            # error, and nothing left behind. The prose names the configured
+            # forge: under GitLab this box is sbxloop-daemon-gitlab-..., and
+            # a report that said "GitHub" sent its reader to the wrong place.
+            forge = _FORGE_NAMES.get(self.kind, self.kind)
+            if caused_by_sbx_auth(exc):
+                hint = (
+                    "the sandbox backend refused every call because nobody is signed in "
+                    "to Docker on the host (a session that expired, or a host that never "
+                    "ran `sbx login`), so polling and delivery cannot run; `sbx login` as "
+                    "the daemon's user through the home's sbx wrapper, then restart the "
+                    "daemon — `sbxloop doctor` checks it"
+                )
+            else:
+                hint = (
+                    f"the long-lived sandbox the daemon makes its {forge} calls from "
+                    "could not be created, so polling and delivery cannot run; the sandbox "
+                    "backend, its image and the host's disk are what to check — "
+                    "`sbxloop doctor`"
+                )
+            # With its traceback: the report groups by where it failed, and
+            # the poll that logs the DaemonError wrapping this one is then
+            # the same failure seen twice, not a second report (#1168).
             log.error(
                 "github_sandbox.provision_failed",
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
-                hint="the long-lived sandbox the daemon makes its GitHub calls from "
-                "could not be created, so polling and delivery cannot run; the sandbox "
-                "backend, its image and the host's disk are what to check — `sbxloop doctor`",
+                hint=hint,
+                exc_info=True,
             )
-            raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
+            raise DaemonError(f"cannot provision the daemon {forge} sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]
         log.info(
             "github_sandbox.ready",
@@ -337,6 +433,39 @@ class DaemonGithub:
         )
         self._clear_previous_forges()
         return self.backend(clients[0])
+
+    def _ensure(self, install: Callable[[Sandbox, str], None]) -> Sandbox:
+        """Provision under the current name, once more under the next
+        generation when the backend refused the create itself.
+
+        The field failure: a crashed backend came back without the box but
+        with its volume, and refused the name on every create for hours
+        while the inventory showed nothing to remove. A create refused for
+        any reason but a sign-in failure costs one more attempt under a
+        fresh name; a failure later in provisioning (secrets, the worker
+        install) is not the name's fault and is not retried here.
+        """
+        try:
+            return self.provisioner.ensure_github_only(
+                self.name, self.workspace, post_create=install, repo=self.repo
+            )
+        except ProvisionError as exc:
+            cause = exc.__cause__
+            refused_create = isinstance(cause, SbxError) and "create" in cause.argv[:4]
+            if not refused_create or caused_by_sbx_auth(exc):
+                raise
+            refused = self.name
+            self._give_up_on(refused, exc, reason="create_refused")
+            self.name = self._free_name()
+            log.warning(
+                "github_sandbox.create_retried",
+                sandbox=self.name,
+                refused=refused,
+                error=str(exc),
+            )
+            return self.provisioner.ensure_github_only(
+                self.name, self.workspace, post_create=install, repo=self.repo
+            )
 
     @property
     def kind(self) -> VcsKind:

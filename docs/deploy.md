@@ -381,7 +381,7 @@ each item id and issue URL, so you can clear the in-progress label and re-add
 
 Everything under `[[github.repos]]` is per repository; the `[daemon]`
 guardrails — the daily run cap, the per-item attempt and resume caps, the
-consecutive-failure circuit breaker, and one run at a time — stay
+consecutive-failure circuit breaker, and the concurrency cap — stay
 **daemon-wide** and are shared across all of them. Polling health is the
 one per-repository guardrail (#516): a repository that fails to poll is
 backed off on its own (doubling, capped at an hour) and, after

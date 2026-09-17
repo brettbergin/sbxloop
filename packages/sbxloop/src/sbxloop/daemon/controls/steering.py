@@ -16,7 +16,7 @@ heard last, and the record shows what each one did.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -169,17 +169,24 @@ class SteeringStore:
             )
             return int(getattr(result, "rowcount", 0) or 0)
 
-    def settle_orphans(self, current_run_id: str | None, now: float) -> int:
+    def settle_orphans(self, live_run_ids: str | Collection[str] | None, now: float) -> int:
         """Rows still waiting on a run that is not in flight (a restart):
-        nothing will answer them."""
+        nothing will answer them. ``live_run_ids`` names the runs in flight
+        (one id, several, or none)."""
+        if live_run_ids is None:
+            live: list[str] = []
+        elif isinstance(live_run_ids, str):
+            live = [live_run_ids]
+        else:
+            live = sorted(live_run_ids)
         with self.dstore.transaction() as session:
             stmt = (
                 update(SteeringRow)
                 .where(SteeringRow.status.in_(("accepted", "delivered")))
                 .values(status="undelivered", handled_at=now)
             )
-            if current_run_id is not None:
-                stmt = stmt.where(SteeringRow.run_id != current_run_id)
+            if live:
+                stmt = stmt.where(SteeringRow.run_id.not_in(live))
             result = session.execute(stmt)
             return int(getattr(result, "rowcount", 0) or 0)
 

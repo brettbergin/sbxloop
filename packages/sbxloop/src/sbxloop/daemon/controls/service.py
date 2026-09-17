@@ -22,14 +22,17 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any, Literal, TypeVar
 
+from sbxloop.agents.registry import AgentRegistry, default_registry
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.controls.intake import (
     AdmitRequest,
     IssueAdmission,
     admit_issue,
     build_item,
+    resolve_assignment_request,
     target_key,
     upsert,
+    with_assignment_request,
 )
 from sbxloop.daemon.controls.operations import OperationRunner, OperationSpec, OperationStore
 from sbxloop.daemon.controls.principal import Capability, Principal
@@ -112,6 +115,13 @@ class ControlService:
             if isinstance(operations, OperationStore)
             else None
         )
+
+    def _agents(self) -> AgentRegistry:
+        """The loop's agent registry; the configured agents for a loop
+        that keeps none (a test double)."""
+        loop: Any = self.loop
+        registry: AgentRegistry | None = getattr(loop, "agents", None)
+        return registry if registry is not None else default_registry(loop.config)
 
     def _record(self, spec: OperationSpec, fn: Callable[[str | None], OutcomeT]) -> OutcomeT:
         """Run ``fn`` under a durable operation when the loop keeps them;
@@ -617,10 +627,14 @@ class ControlService:
         loop: Any = self.loop
 
         def apply(_: str | None) -> AdmitOutcome:
+            # Checked before the source is touched: a refused agent must
+            # not leave a labelled issue behind.
+            lead, roles = resolve_assignment_request(self._agents(), request)
             if isinstance(request, IssueAdmission):
                 item = admit_issue(loop, request)
             else:
                 item = build_item(loop.config, request, item_id=key, requested_by=None)
+            item = with_assignment_request(item, request, lead, roles)
             stored, fresh = upsert(loop, item, by=principal.attribution())
             return AdmitOutcome(item=stored, fresh=fresh)
 
@@ -910,6 +924,13 @@ def _request_fields(request: AdmitRequest) -> dict[str, Any]:
     asked, never a secret."""
     fields = asdict(request)
     fields.pop("key", None)
+    # Recorded only when asked for, so a request made before admission
+    # could name agents fingerprints as it always did.
+    for name in ("lead", "roles", "channel_id"):
+        if name in fields and not fields[name]:
+            del fields[name]
+    if "roles" in fields:
+        fields["roles"] = dict(fields["roles"])
     return {"form": type(request).__name__.removesuffix("Admission").lower(), **fields}
 
 

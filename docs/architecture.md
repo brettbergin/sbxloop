@@ -760,13 +760,19 @@ named per state dir (`sbxloop-daemon-<forge>-<digest>`,
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
   with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
   failure at most once per five minutes, removed before provisioning and
-  at daemon stop. Each provision checks inventory and removes only this
-  instance's stale box. Inventory or removal failures stop that attempt;
-  polling backoff retries cleanup after authentication or the sandbox
-  service recovers, while daemon control stays available. The same home's
-  box under any other forge (left by a `[vcs] kind` switch in either
-  direction) is removed once per daemon process, after the new box is
-  ready and best effort: a wedged old box is logged
+  at daemon stop. Each provision checks inventory and removes this
+  instance's stale boxes. A box the backend cannot remove (a hung microVM
+  whose `sbx rm` times out), or a name it refuses to re-create (a volume
+  a crashed backend left behind), is reported once
+  (`github_sandbox.wedged`, with the restart-sandboxd hint) and left to
+  the backend, and the daemon carries on under the next generation of the
+  name (`<name>-g1`, `-g2`, ...). An inventory that cannot be read or a
+  sign-in failure still stops that attempt; polling backoff retries after
+  authentication or the sandbox service recovers, while daemon control
+  stays available. The same home's box under any other forge (left by a
+  `[vcs] kind` switch in either direction), generations included, is
+  removed once per daemon process, after the new box is ready and best
+  effort: a wedged old box is logged
   (`github_sandbox.previous_forge_remove_failed`) and never keeps the
   configured forge from being polled;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
@@ -963,6 +969,11 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   by `[landing] max_followups_per_run`, and the label is
   `followup_label`, **never** the trigger label — the 1.0 rule that the
   loop files no work of its own stands; a human promotes a follow-up.
+  `FollowupFiler` does the filing for the engine and the daemon alike: a
+  parked run the daemon lands with gh ops alone (an approved merge gate or
+  review wait) files its follow-ups once the merge succeeds, and the phase
+  rows and markers keep a second pass from filing anything twice (or
+  reporting them again: a pass with nothing new emits no event).
   Before proposing an issue, the reviewer calls the read-only
   `lookup_followup` host tool (`engine/issue_lookup.py`), searching open and
   closed issues with up to three symptom/component queries. The existing
@@ -1607,7 +1618,8 @@ key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
 operator console's mailbox, the schedules and the pause holds) plus the six
 `api_*` tables behind the remote API (operations, the public chronology,
-clients, refresh tokens, revoked tokens, public ids).
+clients, refresh tokens, revoked tokens, public ids), and `workspace_usage`,
+the budget pool's ledger of what runs and chat turns spent.
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
@@ -2453,10 +2465,24 @@ The split is deliberate and worth stating plainly:
 - **Daemon-wide** — the calendar-day run cap (`max_runs_per_day`), the
   per-item attempt cap (`max_attempts_per_item`) and resume cap, the
   consecutive-failure circuit breaker (`max_consecutive_failures`,
-  `breaker_cooldown_s`), and **one run at a time**. A failing repository
-  spends the shared budget and can trip the breaker for every repository;
-  that is the point — the guardrails bound what this host does, not what
-  one project does.
+  `breaker_cooldown_s`), and the **concurrency cap**
+  (`max_concurrent_runs`, one run at a time by default). A failing
+  repository spends the shared budget and can trip the breaker for every
+  repository; that is the point — the guardrails bound what this host
+  does, not what one project does. Two code runs never work one repository
+  at once, whatever the cap.
+
+`DaemonLoop` keeps the runs in flight in `_runs`, keyed by run id, oldest
+first. `_launch` claims nothing itself: it marks the item running, builds
+the engine, registers the handle and starts the engine thread. `_reap`,
+at the start of every tick, settles each run whose thread has ended on the
+loop thread (the same `_settle` / `_settle_cancelled` paths) and asks a run
+whose row an operator changed from another process to stop. With the cap
+at 1 the tick awaits the run it launched and reaps it before returning, so
+the loop behaves as it always has; above 1 the tick launches until the cap
+is reached and returns. Controls address a run by id (`cancel_run`,
+`steer_run`); a bare `cancel` means the oldest run, which is also what
+`status()["current"]` reports beside the full `runs` list.
 
 Discovery polls each enabled repository in turn, and every work item
 carries the `owner/name` it came from, so a run's clone, branch, draft PR,

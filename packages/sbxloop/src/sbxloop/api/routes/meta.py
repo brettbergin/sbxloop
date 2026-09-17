@@ -9,6 +9,7 @@ from sbxloop.api.auth.deps import Authenticated, current, get_ctx
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.context import PAGE_DEFAULT, PAGE_MAX, ApiContext
 from sbxloop.api.models import Capabilities, Limits, Me, Retention, rfc3339
+from sbxloop.config import Config
 from sbxloop.daemon.controls.principal import CAPABILITIES
 
 router = APIRouter(prefix="/v1", tags=["meta"])
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/v1", tags=["meta"])
 #: What this release serves; a later stage appends to it.
 FEATURES: tuple[str, ...] = (
     "status",
+    "status.runs",
     "operations",
     "auth.client_credentials",
     "auth.refresh",
@@ -25,6 +27,7 @@ FEATURES: tuple[str, ...] = (
     "intake.issue",
     "intake.workload",
     "intake.tool",
+    "intake.assignment",
     "events",
     "events.stream",
     "ws",
@@ -33,6 +36,7 @@ FEATURES: tuple[str, ...] = (
     "gates",
     "artifacts",
     "usage",
+    "usage.pool",
     "diagnostics.logs",
     "diagnostics.configuration",
     "daemon.holds",
@@ -47,7 +51,25 @@ FEATURES: tuple[str, ...] = (
     "collaboration.preferences",
     "collaboration.workflows",
     "collaboration.connections.read",
+    "collaboration.message_artifacts",
+    "collaboration.message_authors",
+    "agents.registry",
+    "agents.memory",
+    "users.directory",
+    "workspace.members",
+    "collaboration.participants",
+    "collaboration.channel_members",
+    "events.scoped",
 )
+
+
+def features(config: Config) -> list[str]:
+    """What this daemon serves as configured: the release's features plus
+    the ones an operator switches on."""
+    served = list(FEATURES)
+    if config.api.oidc.enabled:
+        served.append("auth.oidc")
+    return served
 
 
 @router.get("/capabilities", response_model=Capabilities)
@@ -59,7 +81,7 @@ async def capabilities(
     limiter = FailureLimiter()
     return Capabilities(
         server_version=__version__,
-        features=list(FEATURES),
+        features=features(ctx.config),
         capabilities=list(CAPABILITIES),
         limits=Limits(
             page_default=PAGE_DEFAULT,

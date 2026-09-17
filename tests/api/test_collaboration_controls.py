@@ -46,7 +46,7 @@ def test_progress_and_stop_preserve_running_result_but_skip_queued_members(api: 
         stopped_queued = api.client.post(route + "/" + second["id"] + "/cancel", headers=headers)
         assert stopped_queued.json()["status"] == "cancelled"
         concierge.first.set_result(ConciergeReply("Actual running result"))
-        api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+        assert api.ctx.turns.wait_idle(timeout=5)
         done = api.client.get(route + "/" + first["id"], headers=headers).json()
         assert done["status"] == "cancelled"
         assert [p["status"] for p in done["participants"]] == ["completed", "cancelled"]

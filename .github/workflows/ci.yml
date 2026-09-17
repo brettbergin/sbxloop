@@ -65,6 +65,7 @@ jobs:
   # inference credentials, model calls or real Codex runtime are involved.
   codex-sdk:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -84,6 +85,7 @@ jobs:
   # beyond the loopback stub are involved.
   openai-sdk:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -142,8 +144,14 @@ jobs:
   # per-account cap of 20 on the Free plan. If jobs start queuing rather than
   # all starting at once, that is the cap, not the runners — drop `fast` back
   # to one slice before touching anything else.
+  #
+  # A slice takes about three minutes. The timeout is for a wedged test: the
+  # suite's own per-test limit (`timeout` in pyproject.toml) should fail it
+  # first, with a stack; this catches whatever that cannot, well short of
+  # GitHub's six-hour default.
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -197,6 +205,7 @@ jobs:
   # the Free plan (see the pytest job's comment).
   windows-host:
     runs-on: windows-latest
+    timeout-minutes: 25
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

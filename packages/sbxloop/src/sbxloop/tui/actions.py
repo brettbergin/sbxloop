@@ -379,8 +379,9 @@ def _cancel_decided(deps: Deps, run_id: str, *, retry: bool) -> Outcome:
         )
     if snapshot.starting:
         return Outcome(False, "the daemon is starting; retry in a moment")
-    if snapshot.live and snapshot.current_run == run_id:
-        return ctl_outcome(deps, "cancel --retry" if retry else "cancel")
+    if snapshot.live and run_id in snapshot.live_runs:
+        # By id: with several runs live, the bare `cancel` means the oldest.
+        return ctl_outcome(deps, f"cancel-run {run_id}" + (" --retry" if retry else ""))
     if retry:
         return Outcome(False, "cancel + retry applies to the daemon's current run")
     return _store_cancel(deps, run_id)

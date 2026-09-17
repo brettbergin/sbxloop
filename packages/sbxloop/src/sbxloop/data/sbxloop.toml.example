@@ -356,6 +356,44 @@ service_memory = "2g"
 # roles = ["builder"]
 # description = "forecast lookups for the builder"
 
+# Agents. sbxloop ships Angie (`concierge`, also `@angie`) and the planner,
+# builder, critic and operator; an entry here adds another agent beside
+# them, or adjusts the built-in with the same slug (only the keys it sets
+# to something other than their default). Identity, persona and narrowing
+# only: an agent never carries egress (no hosts, no allow patterns; those
+# stay with [policy] and [[workloads]]). An entry naming a credential, MCP
+# server or tool that does not exist, or another agent's @-name, fails the
+# load.
+# [[agents]]
+# slug = "forecaster"  # the @-name: lowercase letters, digits, '-', '_'; a built-in's slug adjusts it
+# name = "Forecaster"  # shown beside its messages; required for a new agent
+# description = "answers weather questions and runs forecast reports"  # one line for directories
+# avatar = "F"  # an emoji or 1-2 characters, never a URL
+# color = "#0ea5e9"  # "#rrggbb"
+# instructions = "Answer weather questions from the forecast service; say when data is stale."  # its persona
+# model = "auto"  # unset: the model its role gets
+# roles = ["operator"]  # run roles it may take: "lead", "planner", "builder", "critic", "operator"
+# tools = ["load_skill", "call_service", "weather", "memory"]  # unset: the role's tools; a list (host tools or [[mcp]] names) only narrows; "memory" adds remember/recall/forget
+# skills = []  # unset: the role's skills; a list only narrows
+# mcp = ["weather"]  # [[mcp]] names it may use; unset: what its role gets
+# credentials = ["weather"]  # [[credentials]] names it may be granted
+# interests = ["weather", "forecast"]  # topics it may speak up about unprompted
+# can_start = ["workload"]  # run kinds it may start itself: "code", "workload" (needs a role)
+# max_runs_per_day = 4  # cap on the runs it starts itself; unset: no own cap
+# aliases = ["weatherbot"]  # other @-names for it, never another agent's
+# enabled = true  # false hides it and routes nothing to it
+
+# [memory]
+# Each agent's long-term memory: what it, or a person through the API,
+# chose to keep beyond one conversation. A memory learned in a channel is
+# shown only in that channel; one with no channel is shown everywhere.
+# Turning it off stops new memories and keeps stored ones out of recall;
+# they stay listable and deletable.
+# enabled = true
+# max_items_per_agent = 500        # past this, the agent's oldest unpinned memory is dropped
+# max_item_chars = 1000            # one memory's text is cut to this length
+# prompt_budget_chars = 4000       # the most a memory block may add to a prompt
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need
@@ -734,7 +772,9 @@ service_memory = "2g"
 # `sbxloop init-repo owner/name` creates all seven (plus [landing] followup_label)
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
+# max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
+# daily_token_budget = 2000000   # input+output tokens per day across runs and chat turns; unset: no budget
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # claim_stale_after_s = 300        # a claim comment older than this with no run started is reclaimed
@@ -893,6 +933,40 @@ service_memory = "2g"
 # idempotency_retention_s = 86400  # an Idempotency-Key answers the same for a day
 # operation_deadline_s = 300       # an unclaimed command expires after this
 
+# [api.oidc]
+# Sign-in through an OpenID Connect provider (Authentik, Keycloak, ...).
+# The browser client runs Authorization Code + PKCE and hands the code to
+# POST /v1/auth/oidc/token; the daemon redeems it as the confidential
+# client, checks the ID token and signs the person in, creating their
+# account on first sign-in. Local password sign-in keeps working. The
+# client secret goes in secrets.env under the name client_secret_env gives;
+# its value never appears here, in events or in logs.
+# enabled = false
+# id = "authentik"                 # the provider id clients send
+# label = "Authentik"              # the sign-in button's label
+# issuer = "https://auth.example.com/application/o/angie/"  # exact; https only
+# client_id = "angie"              # the confidential client registered there
+# client_secret_env = "SBXLOOP_OIDC_CLIENT_SECRET"  # the variable's NAME
+# redirect_uris = ["https://angie.example.com/auth/callback"]  # exact matches
+# scopes = ["openid", "email", "profile"]  # what the browser asks for
+# audience = ""                    # the ID token's aud; empty = client_id
+# algorithms = ["RS256", "ES256"]  # asymmetric signatures only
+# leeway_s = 60                    # clock skew allowed on exp/iat/nbf
+# discovery_cache_s = 3600         # provider metadata kept this long
+# jwks_cache_s = 3600              # signing keys kept this long
+# username_claim = "preferred_username"  # a new account's username
+# email_claim = "email"             # its email address
+# name_claim = "name"               # its full name
+# groups_claim = "groups"           # the provider groups roles are read from
+# owner_groups = []                # provider groups whose members are owners
+# admin_groups = []                # ... and admins; either set = role follows groups
+# allowed_groups = []              # only these groups may sign in; empty = anyone
+# default_role = "member"          # a new person's role: member or admin
+# auto_provision = true            # create an account on first sign-in
+# link_verified_email = false      # link a local account with the same verified
+#                                  # email; only if users cannot edit their email
+# request_timeout_s = 10           # each call to the provider
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
@@ -907,6 +981,9 @@ service_memory = "2g"
 # max_tool_result_chars = 6000     # what one host tool may hand back to the model
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
+# max_concurrent_turns = 1         # chat turns that may run at once (1-16); one
+#                                  # channel's turns still run in order, and
+#                                  # host tools still run one at a time
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
 # create_issues = true             # file (queued at once)/list/comment/label/close issues
 #                                  # (a close needs your yes)

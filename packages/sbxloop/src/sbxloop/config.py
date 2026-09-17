@@ -46,6 +46,7 @@ from pydantic import (
     model_validator,
 )
 
+from sbxloop.agents.definition import AgentSpec
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
 from sbxloop.chatservices import CHAT_SERVICES, service_named
 from sbxloop.endpoint import parse_endpoint
@@ -73,6 +74,10 @@ from sbxloop_worker.protocol import (
 log = get_logger(__name__)
 
 ENV_PREFIX = "SBXLOOP_"
+#: The environment variable ``[api.oidc] client_secret_env`` names by
+#: default. It carries the ``SBXLOOP_`` prefix, so the env config layer is
+#: told (``RESERVED_ENV_KEYS``) that it is a credential, never a setting.
+OIDC_CLIENT_SECRET_ENV = "SBXLOOP_OIDC_CLIENT_SECRET"  # nosec B105 - env var name
 
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
@@ -87,6 +92,7 @@ RESERVED_ENV_KEYS = frozenset(
         *(
             name[len(ENV_PREFIX) :].lower()
             for name in (
+                OIDC_CLIENT_SECRET_ENV,
                 OPENAI_KEY_NAME_ENV,
                 OPENAI_TIMEOUT_ENV,
                 OPENAI_RETRIES_ENV,
@@ -1841,9 +1847,19 @@ class DaemonConfig(_ConfigModel):
     # `trigger_label` is refused, named.
     workload_label: str = "sbxloop:workload"
     max_runs_per_day: int = 12
+    # How many runs execute at once. One (the default) is the serial loop:
+    # a tick dispatches a run and settles it before the next. Above one, a
+    # tick launches runs up to this many and returns; the next tick settles
+    # what finished. Two code runs never share a repository.
+    max_concurrent_runs: int = Field(default=1, ge=1, le=4)
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"
+    # The workspace's daily token budget: input plus output tokens reported
+    # by every run and every chat turn since 00:00 in `run_cap_timezone`.
+    # Once reached, no new run starts (and a chat guardrail may refuse a
+    # turn) until the next day. Unset: tokens never refuse work.
+    daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
     # fresh engine wall clock; past this many per item the interrupted run is
@@ -2208,6 +2224,7 @@ DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
     "credentials",
     "registries",
     "vcs",
+    "agents",
     "github.repos.token_env",
     "telemetry.dsn_env",
 )
@@ -2238,6 +2255,12 @@ class ConciergeConfig(_ConfigModel):
     # The SDK session is resumed message after message; after this many
     # turns a fresh session is started so context does not grow forever.
     session_turns: int = Field(default=40, ge=1, le=500)
+    # How many chat turns may run at once, each on its own worker client in
+    # the concierge sandbox. Turns in one channel still run one after
+    # another; each turn keeps its own speaker, session and provider
+    # recovery; host tools still run one at a time. Chat bridge turns share
+    # one session and are not serialized by it, so this stays 1 by default.
+    max_concurrent_turns: int = Field(default=1, ge=1, le=16)
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
     github_tools: bool = True
@@ -2692,6 +2715,144 @@ class TelemetryConfig(_ConfigModel):
         return value
 
 
+#: Signature algorithms an ID token may use: asymmetric only, so neither
+#: ``none`` nor a MAC keyed with a shared secret can pass for a signature.
+OidcAlgorithm = Literal[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"
+]
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_OIDC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _oidc_url(value: str, key: str) -> str:
+    """An https URL, or plain http to this machine only."""
+    raw = value.strip()
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+    except ValueError:
+        raise ValueError(f"{key}: {raw!r} is not a URL") from None
+    if not host or parts.scheme not in ("http", "https"):
+        raise ValueError(f"{key}: {raw!r} must be an https:// URL")
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        raise ValueError(f"{key}: {raw!r} must carry no credential or fragment")
+    loopback = host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+    if parts.scheme == "http" and not loopback:
+        raise ValueError(f"{key}: {raw!r} must use https (plain http is for localhost only)")
+    return raw
+
+
+class ApiOidcConfig(_ConfigModel):
+    """`[api.oidc]`: sign-in through an OpenID Connect provider.
+
+    The browser client runs Authorization Code + PKCE and hands the code to
+    ``POST /v1/auth/oidc/token``; the daemon redeems it as the confidential
+    client, validates the ID token and answers with its own token pair.
+    Off by default, and an existing file without the section loads as
+    before. The client secret is read at exchange time from the
+    environment variable ``client_secret_env`` names (``secrets.env``);
+    the value never enters the config, an event or a log line.
+    """
+
+    enabled: bool = False
+    #: The provider's id in ``GET /v1/auth/providers`` and the exchange body.
+    id: str = "authentik"
+    label: str = Field(default="Authentik", min_length=1, max_length=80)
+    #: The issuer exactly as the provider's discovery document states it.
+    issuer: str | None = None
+    client_id: str = ""
+    client_secret_env: str = OIDC_CLIENT_SECRET_ENV
+    #: Exact-match allowlist for the ``redirect_uri`` a client presents.
+    redirect_uris: list[str] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
+    #: The ID token's expected ``aud``; empty means ``client_id``.
+    audience: str | None = None
+    algorithms: list[OidcAlgorithm] = Field(
+        default_factory=lambda: cast(list[OidcAlgorithm], ["RS256", "ES256"]), min_length=1
+    )
+    leeway_s: int = Field(default=60, ge=0, le=600)
+    discovery_cache_s: int = Field(default=3600, ge=0)
+    jwks_cache_s: int = Field(default=3600, ge=0)
+    username_claim: str = Field(default="preferred_username", min_length=1)
+    email_claim: str = Field(default="email", min_length=1)
+    name_claim: str = Field(default="name", min_length=1)
+    groups_claim: str = Field(default="groups", min_length=1)
+    #: Provider groups whose members are workspace owners / admins. With
+    #: either set, every sign-in re-derives the member's role from groups.
+    owner_groups: list[str] = Field(default_factory=list)
+    admin_groups: list[str] = Field(default_factory=list)
+    #: When set, only people in one of these groups may sign in.
+    allowed_groups: list[str] = Field(default_factory=list)
+    default_role: Literal["admin", "member"] = "member"
+    #: Create an account on a first sign-in; off, only linked or existing
+    #: accounts may sign in.
+    auto_provision: bool = True
+    #: Link a first sign-in to the local account holding the same email when
+    #: the provider says the address is verified. Off by default: a provider
+    #: that lets people edit their email, or asserts ``email_verified`` for
+    #: any address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified, the person gets an account of their own.
+    link_verified_email: bool = False
+    request_timeout_s: float = Field(default=10.0, gt=0, le=60)
+
+    @property
+    def expected_audience(self) -> str:
+        return self.audience or self.client_id
+
+    @property
+    def maps_roles(self) -> bool:
+        return bool(self.owner_groups or self.admin_groups)
+
+    @field_validator("id")
+    @classmethod
+    def _id_is_a_slug(cls, value: str) -> str:
+        if not _OIDC_ID_RE.match(value):
+            raise ValueError("api.oidc.id must be a lowercase slug")
+        return value
+
+    @field_validator("issuer")
+    @classmethod
+    def _issuer_is_https(cls, value: str | None) -> str | None:
+        return None if value is None or not value.strip() else _oidc_url(value, "api.oidc.issuer")
+
+    @field_validator("redirect_uris")
+    @classmethod
+    def _redirects_are_https(cls, value: list[str]) -> list[str]:
+        return [_oidc_url(uri, "api.oidc.redirect_uris") for uri in value]
+
+    @field_validator("client_secret_env")
+    @classmethod
+    def _secret_env_name(cls, value: str) -> str:
+        if value == OIDC_CLIENT_SECRET_ENV:
+            return value
+        return _check_api_key_env(value, "api.oidc.client_secret_env")
+
+    @field_validator("scopes")
+    @classmethod
+    def _scopes_ask_for_openid(cls, value: list[str]) -> list[str]:
+        if "openid" not in value:
+            raise ValueError("api.oidc.scopes must include openid")
+        if any(not scope or any(ch.isspace() for ch in scope) for scope in value):
+            raise ValueError("api.oidc.scopes must be single words")
+        return value
+
+    @model_validator(mode="after")
+    def _enabled_is_complete(self) -> ApiOidcConfig:
+        if self.enabled:
+            missing = [
+                key
+                for key, present in (
+                    ("issuer", self.issuer),
+                    ("client_id", self.client_id.strip()),
+                    ("redirect_uris", self.redirect_uris),
+                )
+                if not present
+            ]
+            if missing:
+                raise ValueError("[api.oidc] enabled = true needs " + ", ".join(missing))
+        return self
+
+
 class ApiConfig(_ConfigModel):
     """The remote operations API, served by ``sbxloop daemon`` in-process.
 
@@ -2730,6 +2891,7 @@ class ApiConfig(_ConfigModel):
     # A command accepted but not claimed within this expires rather than
     # applying stale intent later.
     operation_deadline_s: int = Field(default=300, ge=10)
+    oidc: ApiOidcConfig = Field(default_factory=ApiOidcConfig)
 
     @field_validator("bind")
     @classmethod
@@ -2745,6 +2907,23 @@ class ApiConfig(_ConfigModel):
         if "*" in value:
             raise ValueError("api.cors_origins must list origins; '*' is refused")
         return value
+
+
+class MemoryConfig(_ConfigModel):
+    """Each agent's long-term memory: what it (or a person) chose to keep
+    beyond one conversation, scoped by the channel it was learned in.
+
+    ``enabled = false`` stops new memories and keeps them out of recall and
+    prompts; what is already stored stays listable and deletable.
+    """
+
+    enabled: bool = True
+    # Past this many live memories an agent's oldest unpinned one is dropped.
+    max_items_per_agent: int = Field(default=500, ge=1)
+    # One memory's text is cut to this many characters.
+    max_item_chars: int = Field(default=1000, ge=1)
+    # The most a memory block may add to an agent's prompt.
+    prompt_budget_chars: int = Field(default=4000, ge=0)
 
 
 class Config(_ConfigModel):
@@ -2816,6 +2995,13 @@ class Config(_ConfigModel):
     # Legacy (#818): schedules live in the daemon's database; an entry here
     # is imported into it once on daemon start and then ignored.
     schedules: list[ScheduleConfig] = Field(default_factory=list)
+    # Agents: an entry adds one beside the built-ins, or adjusts the
+    # built-in with its slug (the keys it sets to a non-default value).
+    # Identity, persona and narrowing only; egress stays with `[policy]`
+    # and `[[workloads]]`.
+    agents: list[AgentSpec] = Field(default_factory=list)
+    # Each agent's long-term memory (bounds and the on/off switch).
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:
@@ -2973,6 +3159,24 @@ class Config(_ConfigModel):
                     "registers one secret per env var, so give them separate credentials"
                 )
             by_env[entry.env] = server.name
+        return self
+
+    @model_validator(mode="after")
+    def _check_agents(self) -> Config:
+        """``[[agents]]`` slugs are unique, and each entry names only
+        credentials, MCP servers and tools that exist, without shadowing
+        another agent's slug or alias."""
+        seen: set[str] = set()
+        for agent in self.agents:
+            if agent.slug in seen:
+                raise ValueError(f"two [[agents]] entries are both named {agent.slug!r}")
+            seen.add(agent.slug)
+        if self.agents:
+            from sbxloop.agents.registry import config_agent_problems
+
+            problems = config_agent_problems(self)
+            if problems:
+                raise ValueError("; ".join(problems))
         return self
 
     def mcp_for(self, role: str) -> list[McpConfig]:

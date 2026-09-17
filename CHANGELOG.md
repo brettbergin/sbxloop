@@ -2,6 +2,229 @@
 
 ### Added
 
+- **Agents use their long-term memory in chat and in runs.** A mentioned
+  agent's chat persona now carries the memories it may see in that channel
+  (nothing changes for an agent with none). An agent whose `tools` list
+  names `memory`, or a person's own agent with no `tools` list, can call
+  `remember`, `recall` and `forget`; what it keeps is written as
+  `agent:<slug>` in the turn's channel, `recall` returns only what that
+  channel may see, and a read-only peer turn gets `recall` alone. A run's
+  agent assignment snapshots each agent's memory block when it is planned
+  and keeps it across a resume, and an agent in a run whose `tools` names
+  `memory` gets the same three tools, writing with the run's id and
+  channel; a read-only session, and a critic whatever its session, gets
+  `recall` alone there too. A run with no channel keeps what its agents
+  remember for the whole workspace, so it is recalled in every channel —
+  `remember` says so in its own description when the agent is working
+  without one. A memory's text never reaches the daemon log, which every
+  agent can read from any channel. Built-in agents are given no memory
+  tools, so the shipped team's prompts and tools are unchanged.
+  `[memory] enabled = false` turns all of it off.
+
+- **Owners and admins can manage the workspace's people.** `GET /v1/users`
+  lists every member with role, standing, sign-in source and last-seen time
+  for any member to read. `PATCH` and `DELETE /v1/workspace/members/{user_id}`
+  change a role, deactivate or reactivate a user, or end a membership, and
+  `POST`, `GET` and `DELETE /v1/workspace/invites` create, list and withdraw
+  invites (72 hours by default, at most 720); the raw token appears only in
+  the creation response. Only an owner acts on the owner role, nobody
+  deactivates or removes themselves, and the workspace keeps an active owner.
+  A deactivated user's tokens are refused at once and their refresh tokens
+  revoked in the same transaction as the change. An invite addressed to an
+  email now admits only that email, in any case; the email is trimmed, and a
+  blank one means the invite is not addressed. An invite an operator client
+  creates names `client:<id>` as its creator. `GET /v1/users/me` gains `role`, `avatar_url` and `auth_source`.
+  Every change is audited, and the routes are advertised as
+  `users.directory` and `workspace.members`. A plain API client acts as an
+  owner only with `daemon:manage`.
+
+- **People can sign in through an OpenID Connect provider such as
+  Authentik.** A new `[api.oidc]` section (off by default) names the provider's
+  issuer, the confidential client's id, the environment variable that holds
+  its secret (`SBXLOOP_OIDC_CLIENT_SECRET` in `secrets.env` by default) and
+  the exact redirect URIs a browser client may use. The public
+  `GET /v1/auth/providers` tells a signed-out client what to offer. The
+  client then posts its authorization code, PKCE verifier and nonce to
+  `POST /v1/auth/oidc/token`. The daemon redeems the code, checks the ID
+  token (the provider's published keys with RS256 or ES256, issuer,
+  audience, expiry and nonce) and answers with the same token pair a local
+  login returns. The installation's first user becomes its owner. Anyone
+  later gets an account on first sign-in, with a role taken from optional
+  owner and admin groups (the last owner is never demoted).
+  `allowed_groups` can limit who may sign in at all. Deactivated or removed
+  members are refused. An existing local account is never taken over by
+  default: a person whose email matches one gets a new account. Linking it
+  instead, when the provider says the email is verified, is opt-in
+  (`link_verified_email`), because a provider that lets people edit their
+  email would otherwise hand out any account, the owner's included.
+  `auth.oidc` is advertised only while the
+  section is enabled. Local password sign-in is unchanged, and the secret
+  never appears in config, events or logs.
+
+- **Work can be admitted for named agents.** `POST /v1/items` takes an
+  optional `lead`, a `roles` map from run role to agent slug and a
+  `channel_id` on issue and workload bodies (advertised as
+  `intake.assignment`); an agent that does not exist, is disabled or
+  archived, or does not declare the role is refused with a 422 naming it,
+  and naming a channel takes `collaboration:write`.
+  Dispatch plans each run's agent assignment from what was asked (the
+  built-in team otherwise), stores it with the item and hands it to the
+  engine, and a later attempt reuses it (work asked for again after it
+  finished is planned afresh). Items read back with `lead_agent`
+  and `assignment`. A chat turn passes its channel and the run roles of the
+  agents it mentioned to the work it starts (spending that request on the
+  item it fills, so it is never replayed later), finished work is delivered
+  to the channel the item names, issues included, and a result is credited
+  to the item's lead. A channel with no turn yet has nowhere to put a
+  result, and the daemon log says so. Each planned agent carries what it
+  remembers in that channel. Revision 0027 adds the channel, lead,
+  assignment and agent-chain columns to work items; polled issues run
+  exactly as before.
+
+- **A workspace can hold more than one person.** Local users now belong to
+  the installation's workspace as an owner, admin or member, and the
+  database upgrade makes every existing local user an owner. A second user
+  still cannot register on their own: `POST /v1/auth/local/register` takes
+  an optional `invite_token`, and a valid, unexpired, unspent invite admits
+  the new user with the invite's role. The invite keeps only a hash of its
+  token. A role decides what the user's API client holds: an owner holds
+  every capability, an admin all but `credentials:manage`, and a member
+  `runs:read`, `runs:steer`, `items:create` and the three collaboration
+  capabilities. The workspace always keeps at least one owner. Users also
+  gain provider-identity, avatar and last-seen columns for sign-in work that
+  follows; no route reads them yet, and a single-user installation behaves as
+  before.
+
+- **Members see only the events they may.** Public events now record the
+  channel they belong to (a channel's own events, an agent memory's source
+  channel, or the channel that asked for a run) and, for a person's own
+  teams, preferences, workflows and profile, the person they are for. `GET /v1/events`,
+  `GET /v1/runs/{id}/events`, the SSE stream and the WebSocket show a
+  workspace member only the events of channels they can open, events for
+  them, and events with no channel; a run's events follow the channel that
+  asked for the run, and a run no channel asked for is shown to workspace
+  owners and admins only. Owners and admins see every channel's events,
+  and a plain API client sees everything as before. The filter runs in the
+  query, so pages are never short, and a live stream moves past what it
+  hides. `GET /v1/events` and the stream accept `channel_id`. Revision 0026
+  adds the two columns and an index, and fills the channel of every
+  collaboration event, and of every agent memory event, already recorded. Advertised as `events.scoped`.
+
+- **Channels can be shared with the workspace.** A channel is private to its
+  members or visible to the whole workspace, and every channel route now
+  decides access by those rules instead of by the channel's creator alone: a
+  private channel does not exist for anyone outside it (404), any workspace
+  member may read and post to a workspace channel (posting joins it), and
+  renaming, changing visibility, deleting or managing members takes the
+  channel's owner or a workspace admin (otherwise 403 `channel_forbidden`).
+  Channels report `visibility`, `created_by`, `silenced_until` and the
+  caller's `my_role`, and `PATCH /v1/channels/{id}` accepts `visibility`.
+  New routes list, add and remove channel members; adding a current member
+  with an explicit, different role changes that role in place (200), so an
+  owner can hand over ownership (the last owner cannot leave while others
+  remain, nor step down); and list, add, update and remove the agents
+  taking part; mentioning an agent adds it. Participants report whether they
+  are idle, thinking or working, and member, participant and activity
+  changes are recorded as events; an agent that cannot answer goes idle at
+  the moment it stops, never at the time the turn began. Advertised as
+  `collaboration.channel_members` and `collaboration.participants`. A
+  single-user installation behaves as before.
+
+- **Every chat message says who wrote it.** Messages carry an optional
+  `author` (`human`, `agent` or `system`, with an id and a display name) and
+  turns an `author_id`, `trigger` and `parent_turn_id`, advertised as the
+  `collaboration.message_authors` feature; `collaboration.message.created`
+  events name the author too. Revision 0021 records the author on every
+  existing message and turn by the rules the transport always implied, adds
+  a channel's visibility (private by default), creator and silence fields,
+  and adds channel member and agent participant tables, with each channel's
+  user as its owner member. Existing fields and who may open a channel are
+  unchanged.
+
+- **People can save their own agents through the API.** `POST /v1/agents`
+  stores an agent beside the built-ins and `[[agents]]`, `PATCH /v1/agents/{slug}` edits it against the revision last read (409
+  `agent_revision_conflict` otherwise), and `POST /v1/agents/{slug}/archive` retires it. A saved agent never takes a name a
+  built-in or configured agent has, carries no egress keys, and is checked
+  against the declared tools, credentials and MCP servers and, when the
+  backend's model catalog is cached, its models. Built-in and configured
+  agents stay read-only (409 `agent_read_only`). A saved agent can be
+  @mentioned, targeted and put in a team, and answers in its own persona;
+  an archived one cannot. `GET /v1/agents` entries gain the agent's
+  identity, narrowing, `source`, `editable` and `revision` as defaulted
+  fields, and the `agents.registry` feature advertises all of it. A saved
+  agent that sets `model` answers its turns with that model, peers can hand
+  work to any enabled agent, `GET /v1/agents?include_disabled=true`
+  (`collaboration:write`) finds agents that were switched off, and an agent
+  and a team can no longer share a name (409 `slug_taken`). The new
+  `agents` table is additive (migration 0022).
+
+- **Each agent has a long-term memory that people can review and edit.**
+  `GET/POST /v1/agents/{slug}/memories` and `PATCH/DELETE .../{id}` list,
+  add, revise (at an expected revision) and forget an agent's memories,
+  advertised as `agents.memory`. A memory is scoped by the channel it was
+  learned in: global memories, the current channel's and those from
+  channels whose visibility is `workspace` are shown. `include_private`
+  shows the rest to an owner or admin; any other member sees only memories
+  from channels they can read. The `agent_memories` table is additive
+  (migration 0023). The new
+  `[memory]` section bounds how many each agent keeps (the oldest unpinned
+  is dropped), how long one may be and how much a prompt may carry, and can
+  turn the feature off. Changes are recorded as `agent.memory.*` events
+  without the text.
+
+- **A run can be given named agents.** The engine takes an optional agent
+  assignment (a lead, the agent in each run role, and optionally the agent
+  for a single task), stores it with the run and picks it up again on
+  resume. A custom agent's persona and memory are added to the system
+  message of the sessions it takes, its tool and credential lists narrow
+  what those sessions get (a call to a tool or credential it was not given
+  is refused on the host), and its model sits below `--model` and the
+  repository's per-phase model and above `[agent].models`. Its slug and
+  name are stamped on the agent events of its jobs (names a worker supplies
+  itself are removed), task, review, chat, follow-up and delivery events are
+  credited to it, and tasks and phase attempts record who took them
+  (migration 0024). A run with no assignment, or with the built-in team, is
+  unchanged. Nothing starts a run with an assignment yet.
+
+- **Runs and chat turns share one daily token budget.** `[daemon] daily_token_budget` (unset by default) caps the input and output tokens
+  every run and every chat turn reports in a calendar day in
+  `run_cap_timezone`. Once reached, no new run starts until the next day:
+  the daemon idles as `budget` and says so once that day. The run cap is
+  checked first and still idles as `daily_cap`. What runs and turns spend is
+  recorded in a new `workspace_usage` table (revision 0025), and
+  `GET /v1/usage/pool` (feature `usage.pool`, `runs:read`) reports the day's
+  runs against `max_runs_per_day` and tokens against the budget, split by
+  runs and turns. With more than one run allowed at once, the next slot goes
+  to the oldest queued item whose requester has no run in flight, before
+  the oldest item overall; one run at a time keeps plain FIFO order.
+
+- **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
+  agent beside Angie and the planner, builder, critic and operator, or
+  adjusts the built-in with the same slug: its name, aliases, persona,
+  avatar, colour, model, roles, and the tools, skills, MCP servers and
+  credentials it is narrowed to. An entry on a retired agent name (such as
+  `github` or `weather`) is a new, listed agent rather than an adjustment of
+  the hidden one. An entry carries no egress (host or allow
+  keys are refused), and one that names an undeclared credential, MCP
+  server or tool, or an @-name another agent already has, fails the load.
+  The built-in catalogue and every chat persona are unchanged, `agents` is
+  locked from chat by default, and nothing yet routes turns or runs to a
+  declared agent.
+
+- **The daemon can run several items at once.** `[daemon] max_concurrent_runs` (1 to 4, default 1) sets how many runs execute
+  together. Above 1, a tick starts runs up to the cap and returns while
+  they work, and the next tick settles each one that finished on the loop's
+  own thread; cancel and steer address a run by its id, a bare `cancel`
+  still means the oldest, and a stop, restart or shutdown covers every run.
+  A circuit breaker past its cooldown, or a provider hold past its wait,
+  still lets exactly one probe run through, and the other slots wait until
+  it settles. The chat bridge relays and steers each run in its own thread,
+  and the console's cancel names the run it was opened on.
+  Two code runs never work the same repository at once, and a repository's
+  checkout is not refreshed while a run is using it. `status` (and
+  `GET /v1/status`, feature `status.runs`) lists every run in flight beside
+  `current`. At the default of 1 the loop behaves as before.
+
 - **A GitLab backend for the read paths.** `[vcs] kind = "gitlab"` with
   `[vcs] api_url` now selects a backend that answers the repository,
   issue, checks and policy roles against GitLab's REST API from the
@@ -111,7 +334,132 @@
   `breaker_cooldown_s`. The reply names any hold still standing, since a
   reset breaker releases none.
 
+- **The concierge can run chat turns side by side.**
+  `[concierge] max_concurrent_turns` (default 1, at most 16) sets how
+  many turns run at once. What a turn's tools read about it (speaker, message, channel
+  session, handoff and activity callbacks, role) now travels with the turn
+  instead of living in one shared slot, including onto the thread that
+  answers its host tools, so overlapping turns never see each other's.
+  Each product channel session also records interrupted provider calls
+  under its own run id (`concierge:<digest>`), so a call interrupted in one
+  channel no longer parks recovery for another; chat bridge turns keep the
+  `concierge` run id, so a call they left pending still resumes. A channel
+  call an earlier release left pending under `concierge` is retried under
+  that id once, so it resumes and stops gating bridge turns. Host tools
+  still run one at a time.
+
+- **Overlapping chat turns each get their own worker in the concierge
+  sandbox.** A turn now leases a worker client from a pool of up to
+  `[concierge] max_concurrent_turns` clients over the one concierge
+  sandbox, made as needed and reused once returned; a turn that finds them
+  all busy waits for one. Each lease remembers which incarnation of the
+  sandbox it was handed out for, so a failure from a turn that ran on a
+  sandbox already replaced no longer removes the replacement, and a failed
+  sandbox that other turns are still using is removed only after the last
+  of them finishes. With the default of one turn at a time nothing changes.
+
+### Changed
+
+- **Chat turns wait in a queue per channel instead of one daemon-wide
+  queue.** Accepted product-channel turns now run over a shared pool of
+  `[concierge] max_concurrent_turns` workers, so turns in one channel still
+  run strictly in the order they were accepted, while with a width above 1
+  a slow turn in one channel no longer holds up the others. Turns that
+  resume the same concierge session run one at a time in the order they
+  arrived, whatever the width: every chat bridge turn (Discord, Slack,
+  Mattermost, the TUI) resumes the one default session, so raising the
+  width never lets two of them interleave over its session id, turn
+  counter and model. The default stays 1 for now. Turns
+  recovered at startup are queued in each channel's message order. Queued
+  turns left at shutdown stay accepted and run after the next start, as
+  before. Cancelling a channel's lane settles its queued turns even when
+  the channel was already stopped or deleted.
+
+- **Every request now knows which workspace member is calling.** The
+  authenticated principal carries the caller's workspace membership, or none
+  for a plain API client, which keeps the reach its capabilities give it.
+  The collaboration routes take the member from one shared dependency, so a
+  client without an active local profile is still refused with
+  `403 local_profile_required`, and a user removed from the workspace is now
+  refused the same way. A member's last-seen time is recorded at most once a
+  minute, and a database error while recording it never fails the request
+  or a stream's access re-check. The single local user sees no change.
+
 ### Fixed
+
+- **A runner's result in a conversation is credited to Angie.** A code
+  or workload turn names no participant, so the `work_result` message and
+  its work snapshot were stored with no author and clients showed an
+  unattributed result. Those results are now written as `concierge`'s, a
+  mentioned agent keeps the credit for its own work, and results already
+  stored without an author read back as `concierge`'s without rewriting
+  them.
+
+- **A channel's work result names the files the run delivered.** The
+  projector wrote a finished workload run's `work_result` before it catalogued the
+  run's files, so the one result a channel ever got listed none of them. The
+  catalog is now built first, and delivery catalogues a finished run itself
+  when it gets there first. The result's `work.artifacts` lists up to 50
+  available files by catalog id, public run id, path, media type and size,
+  the message text ends with a `Files:` list for text-only surfaces, and
+  `collaboration.message_artifacts` advertises it. A code run's checkout is
+  never listed. A run whose files cannot be catalogued still gets its
+  result, without a file list, and delivery to other channels carries on.
+
+- **Runs merged through the daemon file their follow-ups.** A run parked
+  at the merge gate or on a review wait was landed by the daemon with gh
+  ops alone, and the out-of-scope notes its reviews left were only filed
+  if the engine's pass at the park had succeeded. The filing now lives in
+  `FollowupFiler`, shared by the engine and the daemon, and the daemon runs
+  it once an approved landing merges. `[landing] followups`,
+  `followup_label` and `max_followups_per_run` apply as before, and the
+  run's recorded filings and the issue markers keep a repeated approval
+  from filing anything twice. A pass that finds every follow-up already
+  recorded emits no `run.followups` event, so a run reports its follow-ups
+  once rather than a second time as "already tracked".
+
+- **A failed `sbx create` says what sbx said.** Every create failure was
+  rewrapped as "check host capacity and that `sbx create --help` supports
+  --cpus and --memory", whatever the cause. On a host with memory to spare
+  the cause was the backend refusing a name whose volume an earlier
+  teardown had left behind, and the report sent its reader to the wrong
+  place. The message now leads with sbx's own error line, keeps the
+  resource-limit wording for the one shape where sbx rejected the flags,
+  and names `sbx rm --force <name>` when the backend still holds state
+  under the name. The daemon's provisioning error and hint name the
+  configured forge, so a GitLab box no longer reports as "the daemon
+  github sandbox".
+
+- **A missing Docker session is reported as one.** When nobody was signed
+  in to Docker on the host (a session that expired), every sbx call failed
+  with "401 Unauthorized: user is not authenticated to Docker: secret not
+  found", the wrapper read the trailing "not found" as a missing sandbox,
+  and the provisioning report told the operator to check the image and the
+  disk. sbx failures of that shape now raise `SbxAuthError`, and the
+  daemon's and the concierge's provisioning hints name `sbx login` and a
+  restart as the remedy.
+
+- **One failure, one GlitchTip report.** A provisioning failure was
+  reported twice: once by the daemon's `provision_failed` event and again
+  by the poll that logged the `DaemonError` wrapping it, and because the
+  second report grouped by its full cause chain, one code path opened a
+  GlitchTip issue per underlying sbx failure. The telemetry processor now
+  remembers the exceptions it has sent, causes included, and skips a
+  record whose exception it already reported. The two `provision_failed`
+  events carry their traceback, so the report that remains groups by where
+  it failed and still carries the operator hint.
+
+- **A wedged daemon box no longer keeps its forge from being polled.** When
+  the daemon's forge sandbox hung mid-job, every later poll ran `sbx rm`
+  against it, waited out the 120s timeout and failed the provision, so
+  polling stayed down until someone restarted sandboxd: three episodes in
+  four days, 7 to 31 hours each. A box the backend cannot remove, or a
+  name it refuses to re-create (a volume a crashed backend left behind),
+  is now reported once as `github_sandbox.wedged` with the
+  restart-sandboxd hint and left to the backend, and the daemon carries on
+  under the next generation of its name (`-g1`, `-g2`, ...).
+  `sandbox prune` and the concierge's sandbox tools treat every generation
+  as daemon-owned.
 
 - **An upgrade no longer leaves a refused-request provider hold blocking
   every call.** A request the endpoint refused (HTTP 400 or 422, such as

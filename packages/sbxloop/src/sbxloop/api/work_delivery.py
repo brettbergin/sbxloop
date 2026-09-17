@@ -9,10 +9,21 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 
+from sbxloop.api.agents import ANGIE_SLUG
 from sbxloop.api.projections import Views
+from sbxloop.api.publicids import run_public_id
 from sbxloop.db.collaboration_models import ChannelRow, MessageRow, TurnRow
 from sbxloop.db.daemon_models import WorkItemRow
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunRecord
 from sbxloop.errors import SbxloopError
+from sbxloop.log import get_logger
+
+log = get_logger(__name__)
+
+#: Files named on one work result; the run's own catalog lists the rest.
+WORK_ARTIFACTS_MAX = 50
+#: Run kinds whose catalogued files are what a sink delivered.
+DELIVERING_KINDS = frozenset({"workload", "tool"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,9 +37,17 @@ class WorkLink:
     participants: tuple[dict[str, Any], ...]
     code_title: str | None = None
     code_agent: str | None = None
+    #: The lead the item was admitted with; credited before anyone else.
+    lead_agent: str | None = None
+    #: Linked by the item's channel alone: its key names no message there.
+    detached: bool = False
 
 
 def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
+    """Work linked to the conversation that asked for it: by the item's own
+    channel when it names one, and by the message its key names otherwise.
+    A key that names a message in a channel other than the item's does not
+    link it there."""
     boundary = or_(
         WorkItemRow.source_key == MessageRow.id,
         func.substr(WorkItemRow.source_key, 1, func.length(MessageRow.id) + 1)
@@ -36,6 +55,7 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     )
     conditions = [
         boundary,
+        or_(WorkItemRow.channel_id.is_(None), WorkItemRow.channel_id == MessageRow.channel_id),
         MessageRow.role == "user",
         TurnRow.input_message_id == MessageRow.id,
         TurnRow.channel_id == MessageRow.channel_id,
@@ -55,25 +75,103 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                 MessageRow.id,
                 TurnRow.targets_json,
                 TurnRow.participants_json,
+                WorkItemRow.lead_agent,
             ).where(and_(*conditions))
         ).all()
-    return [
-        WorkLink(
-            item_id=str(row[0]),
-            source_key=str(row[1]),
-            channel_id=str(row[2]),
-            turn_id=str(row[3]),
-            input_message_id=str(row[4]),
-            targets=tuple(json.loads(row[5] or "[]")),
-            participants=tuple(json.loads(row[6] or "[]")),
-        )
-        for row in rows
+        links = [
+            WorkLink(
+                item_id=str(row[0]),
+                source_key=str(row[1]),
+                channel_id=str(row[2]),
+                turn_id=str(row[3]),
+                input_message_id=str(row[4]),
+                targets=tuple(json.loads(row[5] or "[]")),
+                participants=tuple(json.loads(row[6] or "[]")),
+                lead_agent=row[7],
+            )
+            for row in rows
+        ]
+        links.extend(_channel_links(session, channel_id, {link.item_id for link in links}))
+    return links
+
+
+def _channel_links(
+    session: Any,
+    channel_id: str | None,
+    linked: set[str],
+    kinds: tuple[str, ...] = ("workload", "tool"),
+) -> list[WorkLink]:
+    """Items of ``kinds`` that name their channel but no message in it:
+    delivered as part of the latest turn the channel had when the item was
+    admitted."""
+    conditions = [
+        WorkItemRow.channel_id.is_not(None),
+        WorkItemRow.run_kind.in_(kinds),
+        ChannelRow.id == WorkItemRow.channel_id,
+        ChannelRow.state == "active",
     ]
+    if channel_id is not None:
+        conditions.append(WorkItemRow.channel_id == channel_id)
+    rows = session.execute(
+        select(
+            WorkItemRow.item_id,
+            WorkItemRow.source_key,
+            WorkItemRow.channel_id,
+            WorkItemRow.created_at,
+            WorkItemRow.lead_agent,
+        ).where(and_(*conditions))
+    ).all()
+    links: list[WorkLink] = []
+    for item_id, source_key, item_channel, created_at, lead in rows:
+        if str(item_id) in linked:
+            continue
+        turns = select(TurnRow).where(TurnRow.channel_id == item_channel)
+        turn = (
+            session.scalars(
+                turns.where(TurnRow.created_at <= created_at)
+                .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
+                .limit(1)
+            ).first()
+            or session.scalars(
+                turns.order_by(TurnRow.created_at.asc(), TurnRow.id.asc()).limit(1)
+            ).first()
+        )
+        if turn is None:
+            # A result is part of a turn; a channel with none has nowhere
+            # to put it yet. Say so: the work ran and finished, and the
+            # only sign of it in the channel would otherwise be silence.
+            log.info(
+                "api.work_delivery_skipped",
+                item=str(item_id),
+                channel=str(item_channel),
+                reason="channel has no turn to deliver into",
+            )
+            continue
+        links.append(
+            WorkLink(
+                item_id=str(item_id),
+                source_key=str(source_key),
+                channel_id=str(item_channel),
+                turn_id=str(turn.id),
+                input_message_id=str(turn.input_message_id),
+                targets=tuple(json.loads(turn.targets_json or "[]")),
+                participants=tuple(json.loads(turn.participants_json or "[]")),
+                lead_agent=lead,
+                detached=True,
+            )
+        )
+    return links
 
 
-def _agent(link: WorkLink) -> str | None:
+def _agent(link: WorkLink) -> str:
+    """Credit the lead the item was admitted with, then the participant that
+    asked; a runner turn with none is Angie's own."""
+    if link.lead_agent:
+        return link.lead_agent
+    if link.detached:
+        return ANGIE_SLUG
     if link.code_title is not None:
-        return link.code_agent
+        return link.code_agent or ANGIE_SLUG
     suffix = link.source_key[len(link.input_message_id) :]
     index = 0
     if suffix.startswith(":"):
@@ -82,8 +180,8 @@ def _agent(link: WorkLink) -> str | None:
             index = int(first)
     if index < len(link.participants):
         slug = link.participants[index].get("agent_slug")
-        return str(slug) if slug else None
-    return link.targets[index] if index < len(link.targets) else None
+        return str(slug) if slug else ANGIE_SLUG
+    return link.targets[index] if index < len(link.targets) else ANGIE_SLUG
 
 
 def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
@@ -109,16 +207,28 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                     if key in seen:
                         continue
                     seen.add(key)
-                    item_id = session.scalar(
-                        select(WorkItemRow.item_id).where(
+                    found = session.execute(
+                        select(
+                            WorkItemRow.item_id,
+                            WorkItemRow.lead_agent,
+                            WorkItemRow.channel_id,
+                        ).where(
                             WorkItemRow.repo == ref["repo"],
                             WorkItemRow.source_key == ref["source_key"],
                             WorkItemRow.run_kind == "code",
                         )
-                    )
+                    ).first()
+                    if found is not None and found[2] and found[2] != turn.channel_id:
+                        # The admission named a channel, and it is not this
+                        # one: the result belongs there, not wherever the
+                        # issue happened to be mentioned (_channel_links
+                        # below delivers it).
+                        continue
+                    item_id = found[0] if found is not None else None
                     links.append(
                         WorkLink(
                             item_id=item_id or f"pending_code:{turn.id}:{index}:{ref_index}",
+                            lead_agent=found[1] if found is not None else None,
                             source_key=ref["source_key"],
                             channel_id=turn.channel_id,
                             turn_id=turn.id,
@@ -126,10 +236,55 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                             targets=tuple(json.loads(turn.targets_json)),
                             participants=participants,
                             code_title=ref["title"],
-                            code_agent=participant.get("agent_slug"),
+                            code_agent=participant.get("agent_slug") or ANGIE_SLUG,
                         )
                     )
+        # A code admission that named a channel is delivered to that
+        # channel, whether or not any turn there mentioned the issue.
+        links.extend(
+            _channel_links(
+                session,
+                channel_id,
+                {link.item_id for link in links},
+                kinds=("code",),
+            )
+        )
     return links
+
+
+def _artifacts(ctx: Any, run: RunRecord) -> list[dict[str, Any]]:
+    """The files a workload or tool run delivered, catalogued first when it
+    has finished so the first result written already names them. A code
+    run delivers a pull request; its checkout is not handed to the channel.
+
+    A catalog that fails costs this result its file list, never the
+    delivery of every other channel's work: it names whatever is already
+    on record."""
+    if run.kind not in DELIVERING_KINDS:
+        return []
+    if run.state in TERMINAL_RUN_STATES:
+        try:
+            ctx.artifacts.catalog_run(run)
+        except Exception:
+            log.warning("api.catalog_failed", run=run.run_id, exc_info=True)
+    return [
+        {
+            "id": artifact.id,
+            "run_id": run_public_id(artifact.run_id),
+            "relpath": artifact.relpath,
+            "media_type": artifact.media_type,
+            "size": artifact.size,
+        }
+        for artifact in ctx.artifacts.for_run(run.run_id)
+        if artifact.available
+    ][:WORK_ARTIFACTS_MAX]
+
+
+def _with_files(content: str, artifacts: list[dict[str, Any]]) -> str:
+    """Name the files in the text too: a bridge shows only the text."""
+    if not artifacts:
+        return content
+    return content + "\n\nFiles:\n" + "\n".join(f"- {a['relpath']}" for a in artifacts)
 
 
 def _result(ctx: Any, run_id: str, state: str, fallback: str | None) -> str:
@@ -170,6 +325,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
                         "run_revision": None,
                         "item_actions": [],
                         "run_actions": [],
+                        "artifacts": [],
                     }
                 )
             continue
@@ -191,6 +347,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
         message_id = f"msg_work_{digest}"
         if channel_id is None and (not terminal or ctx.collaboration.message_exists(message_id)):
             continue
+        artifacts = _artifacts(ctx, run) if run is not None else []
         snapshot = {
             "item_id": public_item.id,
             "turn_id": link.turn_id,
@@ -204,6 +361,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             "run_revision": public_run.revision if public_run else None,
             "item_actions": public_item.available_actions,
             "run_actions": public_run.available_actions if public_run else [],
+            "artifacts": artifacts,
         }
         snapshots.append(snapshot)
         if not terminal:
@@ -213,7 +371,9 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             channel_id=link.channel_id,
             turn_id=link.turn_id,
             content=(
-                _result(ctx, run.run_id, state, item.last_error or run.reason)
+                _with_files(
+                    _result(ctx, run.run_id, state, item.last_error or run.reason), artifacts
+                )
                 if run is not None
                 else item.last_error or f"Work ended with state: {state}."
             ),

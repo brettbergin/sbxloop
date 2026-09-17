@@ -27,6 +27,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.fake_gitlab import FakeGitlab
 from tests.fakes.ops_stub import OpsStub
 from tests.fakes.rawdb import exec_raw
 
@@ -993,7 +994,7 @@ class TestDoctor:
         env["COPILOT_GITHUB_TOKEN"] = "tok"
         (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
         assert row.ok and "180s per message" in row.detail
-        assert "config edits: on (7 prefix(es) locked)" in row.detail
+        assert "config edits: on (8 prefix(es) locked)" in row.detail
         (workdir / "sbxloop.toml").write_text(
             "[discord]\nchannel_id = 42\n[concierge]\nedit_config = false\n"
         )
@@ -4214,3 +4215,84 @@ class TestInitRepo:
         result = runner.invoke(app, ["init-repo", "alpha"])
         assert result.exit_code == 1
         assert "expected owner/name" in result.output
+
+
+class TestInitRepoGitlab:
+    """``sbxloop init-repo`` against a GitLab-hosted repository (#630): the
+    same label plumbing as GitHub, but a GitLab-flavored sandbox banner and
+    permission hint when a label cannot be created."""
+
+    def _patch_box(self, mp: pytest.MonkeyPatch, fake: FakeGitlab) -> list[str]:
+        import sbxloop.daemon.github as github_module
+
+        closed: list[str] = []
+
+        class Box:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                self.repo = kw.get("repo")
+
+            def ops(self) -> Any:
+                return fake
+
+            def close(self) -> None:
+                closed.append(str(self.repo))
+
+        mp.setattr(github_module, "DaemonGithub", Box)
+        return closed
+
+    def test_creates_every_label_on_a_gitlab_project(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[vcs]\nkind = "gitlab"\n[github]\nrepo = "acme/widgets"\n'
+        )
+        fake = FakeGitlab(repo="acme/widgets")
+        with pytest.MonkeyPatch.context() as mp:
+            closed = self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/widgets"])
+        assert result.exit_code == 0, result.output
+        assert fake.label_creates == [
+            "sbxloop:run",
+            "sbxloop:in-progress",
+            "sbxloop:failed",
+            "sbxloop:completed",
+            "sbxloop:blocked",
+            "sbxloop:awaiting-merge",
+            "sbxloop:workload",
+            "sbxloop:follow-up",
+        ]
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "8 label(s) created, 0 already present" in plain
+        assert closed == ["acme/widgets"], "the sandbox is torn down"
+
+    def test_the_boot_banner_names_gitlab_not_github(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[vcs]\nkind = "gitlab"\n[github]\nrepo = "acme/widgets"\n'
+        )
+        fake = FakeGitlab(repo="acme/widgets")
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/widgets"])
+        assert result.exit_code == 0, result.output
+        assert "GitLab" in result.output
+        assert "github-ops sandbox" not in result.output
+
+    def test_a_label_the_token_cannot_write_fails_with_a_gitlab_hint(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[vcs]\nkind = "gitlab"\n[github]\nrepo = "acme/widgets"\n'
+        )
+
+        class Forbidden(FakeGitlab):
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                if method == "POST" and path.endswith("/labels"):
+                    raise GithubOpsError("403 Forbidden", http_status=403)
+                return super().raw(method, path, body)
+
+        fake = Forbidden(repo="acme/widgets")
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/widgets"])
+        assert result.exit_code == 1
+        plain = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).split())
+        assert "8 label(s) could not be created" in plain
+        assert "GitHub App" not in plain
+        assert "classic PAT" not in plain
+        assert "api" in plain and "scope" in plain

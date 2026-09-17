@@ -26,6 +26,7 @@ cannot reconstruct from an id survive longest.
 from __future__ import annotations
 
 import time
+from collections.abc import Collection
 from typing import Any, ClassVar, NamedTuple
 
 from rich.text import Text
@@ -34,6 +35,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.widgets import Input
 
+from sbxloop.daemon.model import live_run_ids
 from sbxloop.engine.model import RunRecord
 from sbxloop.tui import actions
 from sbxloop.tui.data import ConsoleState, RunsSnapshot
@@ -147,14 +149,15 @@ class RunsScreen(ConsoleScreen):
 
     # -- rows --------------------------------------------------------------------
 
-    def order(self, runs: RunsSnapshot, live: str | None) -> list[RunRecord]:
-        """Most recently touched first, with the run in flight pinned on
-        top: observing wants the live one, reviewing wants what moved."""
+    def order(self, runs: RunsSnapshot, live: str | Collection[str] | None) -> list[RunRecord]:
+        """Most recently touched first, with the runs in flight pinned on
+        top: observing wants the live ones, reviewing wants what moved."""
         rows = sorted(runs.runs, key=lambda r: -r.updated_at)
-        if live is None:
+        if not live:
             return rows
-        current = [r for r in rows if r.run_id == live]
-        return current + [r for r in rows if r.run_id != live]
+        pinned = {live} if isinstance(live, str) else set(live)
+        current = [r for r in rows if r.run_id in pinned]
+        return current + [r for r in rows if r.run_id not in pinned]
 
     def cells(self, record: RunRecord, runs: RunsSnapshot, now: float) -> dict[str, Any]:
         turns, active = runs.cost_for(record.run_id)
@@ -185,11 +188,11 @@ class RunsScreen(ConsoleScreen):
             self._columns = columns
             table.set_columns(*(c.title for c in columns))
         status = (state.daemon.status if state.daemon and state.daemon.live else None) or {}
-        live = ((status.get("current") or {}) or {}).get("run_id")
+        live = live_run_ids(status)
         now = time.time()
         needle = self.filter_text.lower()
         rows = []
-        for record in self.order(runs, str(live) if live else None):
+        for record in self.order(runs, live):
             item = runs.item_for(record.run_id) or ""
             hay = (
                 f"{record.run_id} {record.state} {item} {run_title(record)} {record.reason or ''}"

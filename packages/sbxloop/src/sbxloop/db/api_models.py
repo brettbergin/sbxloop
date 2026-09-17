@@ -91,6 +91,7 @@ class ApiEventRow(Base):
     __table_args__ = (
         Index("idx_api_events_run", "run_id", "seq"),
         Index("idx_api_events_recorded", "recorded_at"),
+        Index("idx_api_events_channel", "channel_id", "seq"),
         {"sqlite_autoincrement": True},
     )
 
@@ -105,6 +106,11 @@ class ApiEventRow(Base):
     source_seq: Mapped[int | None] = mapped_column(Integer)
     data_json: Mapped[str | None] = mapped_column(Text)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    #: The channel the event belongs to (its own, or the one that asked for
+    #: its run); a member who cannot open the channel does not see it.
+    channel_id: Mapped[str | None] = mapped_column(Text)
+    #: The one person the event is for; ``NULL`` for everyone.
+    audience_user_id: Mapped[str | None] = mapped_column(Text)
 
 
 class ClientRow(Base):

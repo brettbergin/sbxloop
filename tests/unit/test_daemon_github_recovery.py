@@ -192,3 +192,98 @@ def test_close_keeps_reporting_a_not_found_the_inventory_does_not_confirm(
     failed = next(r for r in caplog.records if "github_sandbox.remove_failed" in r.getMessage())
     assert failed.levelno == logging.WARNING
     assert fake_sbx.sandbox_fs(github.name).is_dir()  # nothing was torn down behind the report
+
+
+def test_a_box_the_backend_cannot_remove_is_left_behind_and_the_daemon_moves_on(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Field failure (#1165): the box hung mid-job, and every later poll ran
+    `sbx rm` against it, waited out the timeout and failed the provision,
+    for a day. The wedged box is reported once and left to the backend; the
+    daemon carries on under the next generation of the name."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    base = github.name
+    github.sbx.create(SandboxSpec(name=base, role="github", workspace=tmp_path))
+    # The fake matches scripted prefixes on the joined argv, so carve the next
+    # generations out before scripting the base name's failure.
+    fake_sbx.script(f"rm --force {base}-g", passthrough=True)
+    fake_sbx.script(f"rm --force {base}", returncode=1, stderr="ERROR: context deadline exceeded")
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.ops()
+
+    assert github.name == f"{base}-g1"
+    assert {base, github.name} <= {info.name for info in github.sbx.ls()}
+    wedged = [r for r in caplog.records if "github_sandbox.wedged" in r.getMessage()]
+    assert len(wedged) == 1 and wedged[0].levelno == logging.ERROR
+    assert "sbx-sandboxd" in wedged[0].getMessage()
+    # Once per process: a re-provision never waits on the wedged box again.
+    github.close()
+    github.ops()
+    assert github.name == f"{base}-g1"
+    assert [c for c in fake_sbx.invocations("rm") if c[-1] == base] == [["rm", "--force", base]]
+
+
+def test_a_create_the_backend_refuses_is_retried_under_the_next_generation(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The backend came back from a crash without the box but with its
+    volume, and refused the name on every create while the inventory had
+    nothing to remove. One retry under a fresh name, not an outage."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    base = github.name
+    fake_sbx.fail_next(f"create --name={base}", stderr="ERROR: failed to run sandbox container")
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.ops()
+
+    assert github.name == f"{base}-g1"
+    assert [c[1] for c in fake_sbx.invocations("create")] == [
+        f"--name={base}",
+        f"--name={base}-g1",
+    ]
+    assert any("github_sandbox.create_retried" in r.getMessage() for r in caplog.records)
+    assert len([r for r in caplog.records if "github_sandbox.wedged" in r.getMessage()]) == 1
+
+
+def test_a_sign_in_failure_at_create_is_not_a_wedged_box(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nobody signed in fails every name alike: no generation is spent on it."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    base = github.name
+    fake_sbx.fail_next("create", stderr=AUTH_ERROR)
+
+    with pytest.raises(DaemonError, match="401 Unauthorized"):
+        github.ops()
+
+    assert len(fake_sbx.invocations("create")) == 1
+    assert github.name == base
+
+
+def test_a_close_that_cannot_remove_the_box_starts_a_new_generation_next_time(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A job timeout drops the box; when that removal hangs too, the next
+    provision must not pay for the same hang again before creating."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.ops()
+    base = github.name
+    fake_sbx.script(f"rm --force {base}", returncode=1, stderr="ERROR: context deadline exceeded")
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.close()
+        github.ops()
+
+    assert github.name == f"{base}-g1"
+    assert [c for c in fake_sbx.invocations("rm") if c[-1] == base] == [["rm", "--force", base]]
+    assert any("github_sandbox.remove_failed" in r.getMessage() for r in caplog.records)

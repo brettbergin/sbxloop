@@ -12,7 +12,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.github import DaemonGithub, sandbox_name_for
-from sbxloop.errors import GithubOpsError
+from sbxloop.errors import DaemonError, GithubOpsError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
@@ -127,14 +127,15 @@ class TestTheDaemonsBox:
         (prune leaves daemon-owned boxes alone)."""
         box = self._switched_box(fake_sbx, tmp_path, monkeypatch, configured)
         old = sandbox_name_for(box.config.paths, previous)  # type: ignore[arg-type]
-        for name in (old, "sbxloop-daemon-gitlab-0badf00d"):  # the second: another home's
+        # A later generation of the old box goes too; another home's box stays.
+        for name in (old, f"{old}-g2", "sbxloop-daemon-gitlab-0badf00d"):
             box.sbx.create(SandboxSpec(name=name, role="github", workspace=tmp_path))
 
         box.ops()
 
         listed = {info.name for info in box.sbx.ls()}
         assert box.name in listed
-        assert old not in listed
+        assert old not in listed and f"{old}-g2" not in listed
         assert "sbxloop-daemon-gitlab-0badf00d" in listed
 
     def test_a_wedged_previous_forge_box_does_not_keep_the_new_forge_down(
@@ -167,6 +168,63 @@ class TestTheDaemonsBox:
         box.close()
         box.ops()
         assert len([c for c in fake_sbx.invocations("rm") if old in c]) == 1
+
+    def test_a_provisioning_failure_names_the_configured_forge(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The report an operator reads under GitLab said "GitHub": the
+        DaemonError and the provision_failed hint name the forge the box
+        actually serves."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
+        # Every create, not just the first: a refused create is retried once
+        # under the next generation of the name (#1165).
+        fake_sbx.script("create", returncode=1, stderr="ERROR: failed to run sandbox container")
+
+        with (
+            caplog.at_level(logging.ERROR, logger="sbxloop.daemon.github"),
+            pytest.raises(DaemonError, match="cannot provision the daemon GitLab sandbox"),
+        ):
+            box.ops()
+
+        (failed,) = [
+            r for r in caplog.records if "github_sandbox.provision_failed" in r.getMessage()
+        ]
+        assert "GitLab calls" in failed.getMessage()
+        assert "GitHub" not in failed.getMessage()
+
+    def test_a_missing_docker_session_names_sbx_login(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Field failure: a Docker session that expired made every sbx call
+        fail with 401 for two hours, and each report told the operator to
+        check the image and the disk."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
+        fake_sbx.fail_next(
+            "ls",
+            stderr="ERROR: list sandboxes: request failed: 401 Unauthorized: user is not "
+            "authenticated to Docker: secret not found\nno valid user session found, "
+            "please sign in to Docker to proceed",
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="sbxloop.daemon.github"),
+            pytest.raises(DaemonError, match="not authenticated to Docker"),
+        ):
+            box.ops()
+
+        (failed,) = [
+            r for r in caplog.records if "github_sandbox.provision_failed" in r.getMessage()
+        ]
+        assert "`sbx login`" in failed.getMessage()
+        assert "disk" not in failed.getMessage()
 
     def test_a_repository_on_its_own_forge(self, fake_sbx: FakeSbx, tmp_path: str) -> None:
         config = Config.model_validate(

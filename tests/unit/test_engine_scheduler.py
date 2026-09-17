@@ -316,3 +316,41 @@ class TestBuilderContinuityWiring:
         )
         task = engine.store.get_tasks(run_id)[0]
         assert engine._prior_attempt_report(run_id, task) == ""
+
+
+class TestDefaultAssignment:
+    @pytest.mark.parametrize("assigned", [False, True], ids=["none", "default"])
+    def test_a_default_assignment_schedules_and_emits_the_same(
+        self, tmp_path: Path, assigned: bool
+    ) -> None:
+        """The scheduler under the default assignment: the same lane order and
+        the same task events, with no agent credited on any of them."""
+        from sbxloop.agents.assignment import plan_assignment
+        from sbxloop.agents.registry import ConfigAgentRegistry
+        from sbxloop.events import HostEventTypes
+
+        sched = Scheduler(tmp_path, [spec("t1"), spec("t2", deps=["t1"])], lanes=1)
+        if assigned:
+            sched.engine._assignment = plan_assignment(
+                ConfigAgentRegistry(sched.engine.config),
+                kind="code",
+                lead=None,
+                requested={},
+                channel_id=None,
+            )
+        events: list[Any] = []
+        sched.engine.bus.subscribe(events.append)
+
+        def body(task: TaskRecord) -> None:
+            sched.engine.bus.emit(
+                HostEventTypes.TASK_START, sched.run_id, task_id=task.spec.id, title="x"
+            )
+            done(task)
+
+        with sched.engine._assignment_stamps(sched.run_id, "code"):
+            sched.run(body)
+        assert sched.started == ["t1", "t2"]
+        assert [e.data for e in events] == [
+            {"task_id": "t1", "title": "x"},
+            {"task_id": "t2", "title": "x"},
+        ]

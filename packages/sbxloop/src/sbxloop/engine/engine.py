@@ -52,17 +52,18 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
 from sbxloop import hostgit, repofiles
 from sbxloop.agentmodels import model_for_phase, refreshed_models, run_model_repo
+from sbxloop.agents.assignment import AgentAssignment
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -82,14 +83,8 @@ from sbxloop.deliver import (
 )
 from sbxloop.engine import sinks
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader
-from sbxloop.engine.followups import (
-    Candidate,
-    checklist_comment,
-    collect_followups,
-    issue_body,
-    marker_key,
-)
-from sbxloop.engine.issue_lookup import IssueLookup, LookupUnavailable
+from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
+from sbxloop.engine.issue_lookup import IssueLookup
 from sbxloop.engine.landing import (
     AwaitingReview,
     Blocked,
@@ -192,7 +187,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
-from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
+from sbxloop.vcs.github.labels import ensure_label
 from sbxloop.vcs.github.ops import (
     FailedCheck,
     Identity,
@@ -208,6 +203,9 @@ from sbxloop.vcs.protocol import VcsOps
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
+
+if TYPE_CHECKING:
+    from sbxloop.agents.memory import MemoryService
 
 log = get_logger(__name__)
 
@@ -310,6 +308,24 @@ class Pipeline:
     issues_enabled: bool | None = None
 
 
+#: The prompt whose session does a task's work, per run kind: a task's
+#: events and its assignee belong to the agent taking it. A tool run has no
+#: agent doing anything.
+_WORKING_PHASE: dict[str, str] = {"code": "build", "workload": "operator_execute"}
+#: The prompt behind each phase-attempt name that an agent session fills;
+#: every other attempt (verify, gate, setup, a tool run's commands) is
+#: mechanical and belongs to nobody.
+_PROMPT_BY_RECORDED_PHASE: dict[str, str] = {
+    "decompose": "decompose",
+    "plan": "operator_plan",
+    "build": "build",
+    "execute": "operator_execute",
+    "judge": "operator_judge",
+    "review": "review",
+    "steer": "steer",
+}
+
+
 class LoopEngine:
     def __init__(
         self,
@@ -325,6 +341,7 @@ class LoopEngine:
         github_ops: GithubOpsFactory | None = None,
         service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         # Library parity with the CLI: the home's secrets.env supplies tokens
         # and settings even when the caller passes a prebuilt Config (real
@@ -337,6 +354,9 @@ class LoopEngine:
         # daemon watches the repository and the instruction would mislead.
         self.trigger_label = trigger_label
         self.store = store or StateStore(self.config.paths.state_db)
+        # Every agent's long-term memory, for the memory tools of an agent
+        # whose `tools` name `memory` (the daemon's store). None offers none.
+        self.memory = memory
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
         self.worker_python = (
@@ -398,6 +418,10 @@ class LoopEngine:
         # A restart's offer of the previous attempt's pushed branch/PR
         # (#600); empty for an ordinary run and for a resume.
         self._prior = PriorArtifacts()
+        # The named agents this run was given, persisted with the
+        # run and read back on resume. None: the run was started without an
+        # assignment and every phase is the built-in's.
+        self._assignment: AgentAssignment | None = None
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -433,6 +457,7 @@ class LoopEngine:
         kind: RunKind = "code",
         profile: str | None = None,
         expects_mount: bool | None = None,
+        assignment: AgentAssignment | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -482,6 +507,10 @@ class LoopEngine:
         profile at all may declare no needs. It is pinned into the run's
         persisted config with its budget overrides applied, so a resume
         runs under the same bounds.
+
+        ``assignment`` names the agents taking the run's phases, decided by
+        the host. It is persisted with the run; a default assignment (the
+        built-in team) changes no prompt and no event.
         """
         run_id = run_id or new_run_id()
         if profile is not None and kind != "workload":
@@ -507,8 +536,12 @@ class LoopEngine:
         self.store.create_run(
             run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
         )
+        self._assignment = assignment
+        if assignment is not None:
+            self.store.set_run_assignment(run_id, assignment.to_json())
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
+            self._record_assignees(run_id, kind, [spec.id for spec in tasks])
         if kind != "code":
             # The data dir is cut at provisioning (`sandbox.workspace_mount`
             # names it); the start event says only that no checkout is in
@@ -591,6 +624,7 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
+        self._assignment = self._stored_assignment(run_id)
         recovery = ProviderRecovery(self.store, self.config.agent.backend)
         if release_provider_hold and recovery.pending(run_id):
             recovery.release()
@@ -758,7 +792,10 @@ class LoopEngine:
         # config was narrowed to its repository, not an operator setting: it
         # differs from the live config by construction and says nothing about
         # drift.
+        # `agents` is the live agent catalogue, not a setting a run is pinned
+        # to.
         ignore = {
+            "agents",
             "github.enabled_repo_count",
             "run_model_override",
             "run_model_repo",
@@ -770,9 +807,100 @@ class LoopEngine:
             if key not in ignore and stored_flat.get(key) != current_flat.get(key)
         ]
 
+    # -- named agents ------------------------------------------------------
+
+    def _stored_assignment(self, run_id: str) -> AgentAssignment | None:
+        """The assignment the run was started with, with any task handed
+        to another of its agents since."""
+        raw = self.store.get_run_assignment(run_id)
+        if raw is None:
+            return None
+        return AgentAssignment.from_json(raw).with_tasks(self.store.task_assignees(run_id))
+
+    def _credited(self) -> AgentAssignment | None:
+        """The assignment when it credits anyone; a default one does not."""
+        assignment = self._assignment
+        return None if assignment is None or assignment.is_default() else assignment
+
+    def _record_assignees(self, run_id: str, kind: RunKind, task_ids: Sequence[str]) -> None:
+        """Write down which agent does each task's work."""
+        phase = _WORKING_PHASE.get(kind)
+        if self._assignment is None or phase is None:
+            return
+        assignees: dict[str, str] = {}
+        for task_id in task_ids:
+            binding = self._assignment.binding_for(phase, task_id)
+            if binding is not None:
+                assignees[task_id] = binding.slug
+        self.store.set_task_assignees(run_id, assignees)
+
+    def _record_phase(self, run_id: str, phase: str, **values: Any) -> None:
+        """``store.record_phase``, naming the agent that took an agent phase."""
+        prompt = _PROMPT_BY_RECORDED_PHASE.get(phase)
+        if self._assignment is not None and prompt is not None:
+            binding = self._assignment.binding_for(prompt, values.get("task_id"))
+            if binding is not None:
+                values["agent_slug"] = binding.slug
+        self.store.record_phase(run_id, phase, **values)
+
+    @contextlib.contextmanager
+    def _assignment_stamps(self, run_id: str, kind: RunKind) -> Iterator[None]:
+        """While the run is driven, credit the host events emitted within a
+        task or a phase to the agent taking it. Nothing is stamped without
+        an assignment, or with a default one."""
+        assignment = self._credited()
+        if assignment is None:
+            yield
+            return
+        working = _WORKING_PHASE.get(kind)
+
+        def stamp(event_type: str, data: dict[str, Any]) -> None:
+            if "agent_slug" in data:
+                return
+            binding = None
+            if event_type.startswith("task."):
+                task_id = data.get("task_id")
+                if working is not None:
+                    binding = assignment.binding_for(
+                        working, task_id if isinstance(task_id, str) else None
+                    )
+            elif event_type == HostEventTypes.REVIEW_VERDICT:
+                binding = assignment.binding_for("review")
+            elif event_type == HostEventTypes.CHAT_REPLY:
+                binding = assignment.binding_for("steer")
+            elif event_type in (HostEventTypes.RUN_FOLLOWUPS, HostEventTypes.RUN_DELIVER):
+                binding = assignment.lead_binding()
+            if binding is not None:
+                data["agent_slug"] = binding.slug
+
+        unstamp = self.bus.stamp_run(run_id, stamp)
+        try:
+            yield
+        finally:
+            unstamp()
+
     # -- run driver --------------------------------------------------------
 
     def _drive(
+        self,
+        run_id: str,
+        outcome: str,
+        *,
+        workspace: Path | None = None,
+        stage: str | None = None,
+        expects_mount: bool | None = None,
+    ) -> RunResult:
+        kind = self.store.get_run(run_id).kind
+        with self._assignment_stamps(run_id, kind):
+            return self._drive_run(
+                run_id,
+                outcome,
+                workspace=workspace,
+                stage=stage,
+                expects_mount=expects_mount,
+            )
+
+    def _drive_run(
         self,
         run_id: str,
         outcome: str,
@@ -951,6 +1079,11 @@ class LoopEngine:
                         bus=self.bus if kind == "workload" else None,
                         session_models=self.store.session_models(run_id),
                         store=self.store,
+                        assignment=self._assignment,
+                        memory=self.memory,
+                        narrow_service=(
+                            service.narrowed_tool_spec if service is not None else None
+                        ),
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -1246,7 +1379,7 @@ class LoopEngine:
         attempt = 1 + sum(
             1 for row in self.store.phase_attempts(run_id) if row.phase == "dependencies"
         )
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "dependencies",
             task_id=None,
@@ -1813,7 +1946,7 @@ class LoopEngine:
             else []
         )
         status = "ok" if failed is None and not missing else "failed"
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "execute",
             task_id=spec.id,
@@ -2150,10 +2283,11 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
+            self._record_assignees(run_id, p.kind, [spec.id for spec in ordered])
             if title:
                 self.store.set_run_title(run_id, title)
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 phase,
                 task_id=None,
@@ -2643,7 +2777,7 @@ class LoopEngine:
             if result.exit_code != 0
         ]
         status = "ok" if not failed else "failed"
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "judge",
             task_id=None,
@@ -2931,7 +3065,7 @@ class LoopEngine:
                 if not gate
                 else 'verify_mode = "ci-only": the pull request\'s checks are the gate'
             )
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "gate",
                 task_id=None,
@@ -2958,7 +3092,7 @@ class LoopEngine:
         # `failed`: it blocked nothing, and `_verification_note` reads the
         # rows back to tell the review and the pull request what stood.
         status = "ok" if passed else ("advisory" if mode == "advisory" else "failed")
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "gate",
             task_id=None,
@@ -3341,7 +3475,7 @@ class LoopEngine:
         if verdict.verdict == "approve":
             self._note_nonblocking(p, round_no, posted_findings, posting)
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "review",
             task_id=None,
@@ -3781,30 +3915,9 @@ class LoopEngine:
             return None
 
     def _review_rounds(self, run_id: str) -> list[ReviewRound]:
-        """Earlier review rounds paired with the fix round each led to.
-
-        Read from ``phase_attempts`` in order: a ``review`` row opens a
-        round; the build report of the fix task recorded after it is that
-        round's response. Chronology, not bookkeeping, so a resume sees the
-        same history a live run would.
-        """
-        rounds: list[ReviewRound] = []
-        for row in self.store.phase_attempts(run_id):
-            if row.phase == "review":
-                try:
-                    data = json.loads(row.output_json or "{}")
-                    verdict = ReviewVerdict.model_validate(data.get("verdict") or data)
-                except (ValueError, ValidationError):
-                    continue
-                rounds.append(ReviewRound(len(rounds) + 1, verdict, ""))
-            elif row.phase == "build" and rounds and row.task_id and is_fix_task(str(row.task_id)):
-                try:
-                    report = json.loads(row.output_json or "{}").get("report") or ""
-                except ValueError:
-                    report = ""
-                last = rounds[-1]
-                rounds[-1] = ReviewRound(last.round, last.verdict, str(report))
-        return rounds
+        """Earlier review rounds paired with the fix round each led to
+        (:func:`recorded_review_rounds`)."""
+        return recorded_review_rounds(self.store, run_id)
 
     def _undrafted(self, run_id: str) -> bool:
         """Whether this run's landing has already taken its PR out of draft
@@ -3995,6 +4108,7 @@ class LoopEngine:
             failed_checks=failed_checks,
         )
         task = self.store.append_task(run_id, spec)
+        self._record_assignees(run_id, p.kind, [spec.id])
         p.fix_kinds[spec.id] = kind
         self.bus.emit(
             HostEventTypes.FIX_ROUND,
@@ -4285,261 +4399,30 @@ class LoopEngine:
         return outcome
 
     def _file_followups(self, p: Pipeline, run: RunRecord) -> None:
-        """File the run's follow-ups on its repository after the merge (#517).
-
-        Best-effort and idempotent: the PR is merged, so a GitHub failure
-        here is logged, never raised. Each filed issue is recorded as a
-        ``followup`` phase row before the next is filed, and the body carries
-        a run/key marker, so a resume between filing and recording finds the
-        issue on the repository rather than filing it twice. Never queued for
-        the loop: the follow-up label, not the trigger label.
-
-        A repository with Issues disabled cannot take them (#631): the mode
-        downgrades to ``comment`` — one checklist on the PR — and the
-        ``run.followups`` event records the downgrade. Decided up front from
-        the repository payload, or on the spot from the 410 GitHub answers
-        the first filing with.
-        """
-        ops, repo, run_id = p.ops, p.repo, p.run_id
-        cfg = self.config.landing
-        if ops is None or repo is None or cfg.followups == "off" or run.pr_number is None:
+        """File the run's follow-ups on its repository after the merge (#517):
+        :meth:`FollowupFiler.file` over this run's review rounds, with the
+        repository's up-front Issues probe (#631)."""
+        filer = self._followup_filer(p)
+        if filer is None:
             return
-        candidates = collect_followups(self._review_rounds(run_id))[: cfg.max_followups_per_run]
-        if not candidates:
-            return
-        already = self._recorded_followups(run_id)
-        filed: list[tuple[str, str]] = []
-        listed: list[str] = []
-        reused: list[tuple[str, str]] = []
-        started = time.time()
-        mode: str = cfg.followups
-        downgraded = False
-        if mode == "issues" and p.issues_enabled is False:
-            mode, downgraded = "comment", True
-        try:
-            if mode == "issues":
-                try:
-                    self._file_followup_issues(
-                        p, run, candidates, already, filed, listed, reused, started
-                    )
-                except GithubOpsError as exc:
-                    if exc.http_status != 410:
-                        raise
-                    # "Issues are disabled for this repo" — the probe had
-                    # no `has_issues` to go on; downgrade now.
-                    log.info("run.followups_issues_gone", run=run_id, repo=repo, error=str(exc))
-                    mode, downgraded = "comment", True
-            if mode == "comment":
-                if "(comment)" not in already:
-                    ops.pr_issue_comment(
-                        repo,
-                        run.pr_number,
-                        checklist_comment(
-                            candidates,
-                            run_id=run_id,
-                            reason=(
-                                "Issues are disabled on this repository" if downgraded else None
-                            ),
-                        ),
-                    )
-                    self._record_followup_comment(
-                        run_id, len(already) + 1, len(candidates), started
-                    )
-                listed = [c.followup.title.strip() for c in candidates]
-        except GithubOpsError:
-            log.warning("run.followups_failed", run=run_id, pr=run.pr_number, exc_info=True)
-        if not filed and not listed:
-            return
-        extra: dict[str, Any] = {}
-        if reused:
-            extra["reused"] = [{"title": t, "url": u} for t, u in reused]
-        if downgraded:
-            extra.update(downgraded_from="issues", reason="issues_disabled")
-        log.info(
-            "run.followups",
-            run=run_id,
-            pr=run.pr_number,
-            mode=mode,
-            filed=[url for _, url in filed],
-            listed=len(listed),
-            **extra,
+        filer.file(run, self._review_rounds(p.run_id), issues_enabled=p.issues_enabled)
+
+    def _followup_filer(self, p: Pipeline) -> FollowupFiler | None:
+        if p.ops is None or p.repo is None:
+            return None
+        return FollowupFiler(
+            p.ops, p.repo, self.store, self.bus, self.config, trigger_label=self.trigger_label
         )
-        self.bus.emit(
-            HostEventTypes.RUN_FOLLOWUPS,
-            run_id,
-            pr=run.pr_number,
-            mode=mode,
-            filed=[{"title": t, "url": u} for t, u in filed],
-            listed=listed,
-            **extra,
-        )
-
-    def _file_followup_issues(
-        self,
-        p: Pipeline,
-        run: RunRecord,
-        candidates: Sequence[Candidate],
-        already: dict[str, str],
-        filed: list[tuple[str, str]],
-        listed: list[str],
-        reused: list[tuple[str, str]],
-        started: float,
-    ) -> None:
-        """The ``issues`` mode of :meth:`_file_followups`: one issue per
-        candidate (recorded as filed as it goes) and one pointer comment on
-        the PR. ``filed`` is appended in place so a 410 midway leaves the
-        caller knowing what landed."""
-        ops, repo, run_id = p.ops, p.repo, p.run_id
-        assert ops is not None and repo is not None and run.pr_number is not None
-        cfg = self.config.landing
-        try:
-            on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
-            lookup_error = ""
-        except (GithubOpsError, LookupUnavailable):
-            on_repo = {}
-            lookup_error = "existing follow-up issues could not be read"
-        lookup = IssueLookup(ops, repo, run_id, self.store)
-        held: list[tuple[Candidate, str]] = []
-        label_ready = False
-        url: str | None
-        for cand in candidates:
-            title = cand.followup.title.strip()
-            if cand.key in already:
-                filed.append((title, already[cand.key]))
-                reused.append((title, already[cand.key]))
-                continue
-            existing = True
-            regression_of_match = cand.followup.decision == "regression" and on_repo.get(
-                cand.key, ""
-            ).endswith(f"/issues/{cand.followup.existing_issue}")
-            if cand.key in on_repo and not regression_of_match:
-                url = on_repo[cand.key]
-            else:
-                try:
-                    if lookup_error:
-                        raise LookupUnavailable(lookup_error)
-                    url = lookup.check(cand.followup)
-                except (GithubOpsError, LookupUnavailable) as exc:
-                    held.append((cand, str(exc)))
-                    listed.append(title)
-                    continue
-                if url is None:
-                    if not label_ready:
-                        self._ensure_label(ops, repo, cfg.followup_label)
-                        label_ready = True
-                    ref = ops.issue_create(
-                        repo,
-                        title,
-                        issue_body(
-                            cand,
-                            run_id=run_id,
-                            repo=repo,
-                            pr_number=run.pr_number,
-                            pr_url=run.pr_url or "",
-                            closes=self.config.github.deliver_closes,
-                            trigger_label=self.trigger_label,
-                        ),
-                        labels=[cfg.followup_label],
-                    )
-                    url = ref.url
-                    on_repo[cand.key] = url
-                    existing = False
-            filed.append((title, url))
-            if existing:
-                reused.append((title, url))
-            self.store.record_phase(
-                run_id,
-                "followup",
-                task_id=None,
-                attempt=len(already) + len(filed),
-                status="reused" if existing else "filed",
-                output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
-                started_at=started,
-            )
-            already[cand.key] = url
-        if (filed or held) and "(comment)" not in already:
-            # One pointer on the PR, so the human sees them without opening
-            # the tracker.
-            ops.pr_issue_comment(
-                repo,
-                run.pr_number,
-                checklist_comment(candidates, run_id=run_id, filed=filed, held=held),
-            )
-            self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
-
-    def _record_followup_comment(
-        self, run_id: str, attempt: int, count: int, started: float
-    ) -> None:
-        self.store.record_phase(
-            run_id,
-            "followup",
-            task_id=None,
-            attempt=attempt,
-            status="listed",
-            output_json=json.dumps({"key": "(comment)", "count": count}),
-            started_at=started,
-        )
-
-    def _recorded_followups(self, run_id: str) -> dict[str, str]:
-        """``{key: url}`` of the follow-ups this run already filed (or
-        ``"(comment)"`` when the checklist comment was posted)."""
-        out: dict[str, str] = {}
-        for row in self.store.phase_attempts(run_id):
-            if row.phase != "followup":
-                continue
-            try:
-                data = json.loads(row.output_json or "{}")
-            except ValueError:
-                continue
-            key = str(data.get("key") or "")
-            if key:
-                out[key] = str(data.get("url") or "")
-        return out
-
-    @staticmethod
-    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
-        """Follow-ups across runs, by key; this run wins for crash recovery.
-        Read from the
-        label's issue list, which unlike search is not eventually consistent."""
-        out: dict[str, str] = {}
-        data: list[Any] = []
-        for page in range(1, 101):
-            try:
-                chunk = ops.issues_list(repo, labels=[label], state="all", page=page)
-            except MalformedResponse as exc:
-                raise LookupUnavailable("follow-up listing was malformed") from exc
-            data.extend(chunk)
-            if len(chunk) < 100:
-                break
-        else:
-            raise LookupUnavailable("follow-up listing was incomplete")
-        for issue in data:
-            # The issues endpoint lists pull requests too (#631): a labelled
-            # PR carrying an old marker in its body must not read as "this
-            # follow-up was filed" and suppress the issue.
-            if not isinstance(issue, dict):
-                raise LookupUnavailable("follow-up listing contained a malformed issue")
-            if "pull_request" in issue:
-                continue
-            found = marker_key(str(issue.get("body") or ""))
-            if found:
-                url = str(issue.get("html_url") or "")
-                if not url:
-                    raise LookupUnavailable("existing follow-up has no issue URL")
-                if found[0] == run_id:
-                    out[found[1]] = url
-                else:
-                    out.setdefault(found[1], url)
-        return out
 
     @staticmethod
     def _ensure_label(ops: VcsOps, repo: str, label: str) -> None:
-        """Make sure the repository carries the follow-up label (best-effort:
-        a refusal must not stop the filing — GitHub accepts an issue whose
-        label it cannot find). See :func:`sbxloop.vcs.github.labels.ensure_label`;
-        ``sbxloop init-repo`` creates this and the lifecycle labels up front
-        (#630)."""
-        ensure_label(ops, repo, LabelSpec(label, *FOLLOWUP_DESCRIPTOR))
+        """See :meth:`FollowupFiler.ensure_label`."""
+        FollowupFiler.ensure_label(ops, repo, label)
+
+    @staticmethod
+    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
+        """See :meth:`FollowupFiler.filed_on_repo`."""
+        return FollowupFiler.filed_on_repo(ops, repo, label, run_id)
 
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive.
@@ -4735,7 +4618,7 @@ class LoopEngine:
                     task_id=task.spec.id,
                     anchors=unanswered,
                 )
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "build",
             task_id=task.spec.id,
@@ -4813,7 +4696,7 @@ class LoopEngine:
             self._live_sessions.add(result.session_id)
         report = clip(result.output_text)
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "execute",
             task_id=task.spec.id,
@@ -4943,7 +4826,7 @@ class LoopEngine:
             )
         except InvalidOutputTwice as exc:
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "judge",
                 task_id=task.spec.id,
@@ -4975,7 +4858,7 @@ class LoopEngine:
             self._set_task_state(run_id, task, "failed")
             return
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "judge",
             task_id=task.spec.id,
@@ -5038,7 +4921,7 @@ class LoopEngine:
             # the work in landing, on a runner that has the services. The
             # row and the event keep the skip visible — a resumed run and a
             # reader of the chronology both see that nothing ran.
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "verify",
                 task_id=task.spec.id,
@@ -5074,7 +4957,7 @@ class LoopEngine:
         # run reads the evidence from phase_attempts rather than in-memory
         # state (#61). An advisory failure (#682) gets its own status: it
         # blocked nothing, and `_verification_note` reads the rows back.
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "verify",
             task_id=task.spec.id,
@@ -5397,7 +5280,7 @@ class LoopEngine:
                     exc_info=True,
                 )
                 spend = phases.drain_spend()
-                self.store.record_phase(
+                self._record_phase(
                     run_id,
                     "steer",
                     task_id=task.spec.id if task else None,
@@ -5417,7 +5300,7 @@ class LoopEngine:
                 continue
             action = self._apply_steer(run_id, task, verdict, phases)
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "steer",
                 task_id=task.spec.id if task else None,

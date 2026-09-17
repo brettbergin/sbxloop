@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI, _exec_failed_at_sbx_level, redacted_argv
 from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
@@ -233,6 +233,70 @@ class TestErrors:
         result = cli.run("ls", check=False)
         assert result.returncode == 3
 
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "ERROR: list sandboxes: list local runtimes: list runtimes: request failed: "
+            "401 Unauthorized: user is not authenticated to Docker: secret not found\n"
+            "no valid user session found, please sign in to Docker to proceed",
+            "Error: please sign in to Docker to proceed",
+        ],
+    )
+    def test_a_missing_docker_session_is_an_auth_failure(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, stderr: str
+    ) -> None:
+        """The field shape ends in "secret not found": without a class of its
+        own it read as a missing sandbox, and the daemon told its operator to
+        check the image and the disk."""
+        fake_sbx.fail_next("ls", stderr=stderr)
+        with pytest.raises(SbxAuthError):
+            cli.ls()
+
+
+class TestCreateFailureMessages:
+    """A failed `sbx create` is told in sbx's own words. The capacity wording
+    is for the one shape where the resource flags are the story; the field
+    failure that wore it was the backend refusing a name whose volume an
+    earlier teardown had left behind."""
+
+    def test_the_backends_own_error_leads(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next(
+            "create", stderr="WARN: mcp gateway teardown\nERROR: failed to run sandbox container"
+        )
+        with pytest.raises(SbxError) as excinfo:
+            cli.create(spec("boxa", tmp_path))
+        text = str(excinfo.value)
+        assert text.startswith("cannot create boxa: ERROR: failed to run sandbox container")
+        assert "check host capacity" not in text
+
+    def test_a_name_the_backend_still_holds_names_the_cleanup(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next("create", stderr='ERROR: volume "boxa-docker" already exists')
+        with pytest.raises(SbxError) as excinfo:
+            cli.create(spec("boxa", tmp_path))
+        assert "still holds state under that name" in str(excinfo.value)
+        assert "`sbx rm --force boxa`" in str(excinfo.value)
+
+    def test_rejected_resource_flags_keep_the_capacity_wording(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next("create", stderr="Error: unknown flag: --memory")
+        with pytest.raises(SbxError, match="will not retry without resource limits"):
+            cli.create(spec("boxa", tmp_path))
+
+    def test_a_timeout_has_no_stderr_and_says_so(
+        self, cli: SbxCLI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def never_returns(argv: list[str], **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(argv, 600.0)
+
+        monkeypatch.setattr("sbxloop.sbx.cli.subprocess.run", never_returns)
+        with pytest.raises(SbxError, match="cannot create boxa: sbx invocation timed out after"):
+            cli.create(spec("boxa", tmp_path))
+
 
 class TestPolicy:
     def test_policy_allow_global_and_scoped(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
@@ -401,6 +465,8 @@ class TestExecFailureClassification:
             "bash: cargo: command not found",
             "curl: (22) The requested URL returned error: 404 Not Found",
             "npm ERR! 404 Not Found - GET https://registry.npmjs.org/nope",
+            "curl: (22) The requested URL returned error: 401 Unauthorized",
+            "error: no valid user session; run `acme login`",
         ],
     )
     def test_inner_command_not_found_is_not_infra(self, stderr: str) -> None:
@@ -413,6 +479,7 @@ class TestExecFailureClassification:
             "Error: no such sandbox: sbxloop-r1-agent",
             "Error: sandbox is not running",
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            "ERROR: user is not authenticated to Docker: secret not found",
         ],
     )
     def test_sbx_level_failures_still_raise(self, stderr: str) -> None:

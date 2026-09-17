@@ -53,6 +53,32 @@ class SbxNotFoundError(SbxError):
     """The sbx binary is missing, or a referenced sandbox does not exist."""
 
 
+class SbxAuthError(SbxError):
+    """sbx refused because nobody is signed in to Docker on the host: a
+    session that expired, or a host that never ran ``sbx login``. Every
+    command fails the same way until someone signs in again."""
+
+
+def caused_by_sbx_auth(error: BaseException | None) -> bool:
+    """Whether ``error`` or anything in its cause chain is an :class:`SbxAuthError`.
+
+    An sbx failure is wrapped twice on its way up the daemon (a
+    ProvisionError, then a DaemonError); the remedy is decided by what sits
+    at the bottom."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, SbxAuthError):
+            return True
+        seen.add(id(error))
+        if error.__cause__ is not None:
+            error = error.__cause__
+        elif error.__suppress_context__:
+            return False
+        else:
+            error = error.__context__
+    return False
+
+
 class ProvisionError(SbxloopError):
     """Sandbox pair provisioning failed."""
 

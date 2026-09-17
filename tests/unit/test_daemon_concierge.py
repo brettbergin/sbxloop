@@ -11,10 +11,15 @@ covered separately (test_worker_client / test_daemon_agentbox).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -22,10 +27,12 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import (
     CONCIERGE_AGENT,
+    CONCIERGE_RUN_ID,
     STATE_SESSION_ID,
     STATE_SESSION_TURNS,
     Concierge,
     ConciergeReply,
+    concierge_run_id,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
@@ -97,6 +104,8 @@ class FakeHost:
     def __init__(self, client: FakeClient) -> None:
         self._client = client
         self.failures: list[BaseException] = []
+        self.failure_generations: list[int | None] = []
+        self.generation = 0
         self.drop = True
         self.closed = False
         self.client_calls = 0
@@ -105,8 +114,16 @@ class FakeHost:
         self.client_calls += 1
         return self._client
 
-    def note_failure(self, exc: BaseException) -> bool:
+    @contextmanager
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
+        yield self.client()
+
+    def lease_generation(self, client: object) -> int | None:
+        return self.generation
+
+    def note_failure(self, exc: BaseException, generation: int | None = None) -> bool:
         self.failures.append(exc)
+        self.failure_generations.append(generation)
         return self.drop
 
     def close(self) -> None:
@@ -189,6 +206,7 @@ class LoopWithRuns(FakeLoop):
         super().__init__(dstore)
         self.reports: dict[str, RunReport] = {}
         self.current = None
+        self.runs: list[Any] = []
 
     def report_for(self, run_id: str) -> RunReport:
         return self.reports.get(run_id, RunReport(run_id, "completed", "1/1 tasks done"))
@@ -359,6 +377,44 @@ class TestJobShape:
         assert "work you complete in this response" in handoff.description
         assert "exact completed artifact" in handoff.description
         assert handoff.parameters["required"] == ["agent_slug", "message", "work_product"]
+
+    def test_a_turn_can_name_its_model_and_handoff_targets(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{"text": "one"}, {"text": "two"}])
+        concierge.submit_turn(
+            "find the facts",
+            author="owner",
+            session_key="channel-a:scout",
+            allow_actions=True,
+            agent_role="planner",
+            model="scout-model",
+            handoff=lambda agent, message: f"queued @{agent}",
+            handoff_agents=("concierge", "critic", "scout"),
+        ).result(timeout=10)
+        concierge.submit_turn(
+            "and again",
+            author="owner",
+            session_key="channel-a:planner",
+            allow_actions=True,
+            agent_role="planner",
+            handoff=lambda agent, message: f"queued @{agent}",
+        ).result(timeout=10)
+        first, second = client.jobs
+        assert first.model == "scout-model"
+        assert second.model == concierge.config.model
+        offered = next(t for t in first.host_tools if t.name == "handoff_agent")
+        assert offered.parameters["properties"]["agent_slug"]["enum"] == [
+            "concierge",
+            "critic",
+            "scout",
+        ]
+        default = next(t for t in second.host_tools if t.name == "handoff_agent")
+        assert default.parameters["properties"]["agent_slug"]["enum"] == [
+            "concierge",
+            "planner",
+            "builder",
+            "critic",
+            "operator",
+        ]
 
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
@@ -1979,6 +2035,14 @@ class TestFailures:
         assert client.jobs[2].resume_session_id is None
         assert dstore.get_value(STATE_SESSION_ID) == "s1"
 
+    def test_a_failure_names_the_box_generation_the_turn_ran_on(self, tmp_path: Path) -> None:
+        concierge, _client, host, *_ = make(
+            tmp_path, [{"raise": WorkerError("worker died")}, {"text": "back"}]
+        )
+        host.generation = 7
+        assert turn(concierge).text == "back"
+        assert host.failure_generations == [7]
+
     def test_worker_error_without_drop_is_reported(self, tmp_path: Path) -> None:
         concierge, client, host, *_ = make(tmp_path, [{"raise": WorkerError("worker died")}])
         host.drop = False
@@ -2064,7 +2128,11 @@ class TestQueueing:
         import threading
 
         gate = threading.Event()
-        concierge, client, *_ = make(tmp_path, [{"text": "one"}, {"text": "two"}])
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"text": "one"}, {"text": "two"}],
+            config={"concierge": {"max_concurrent_turns": 1}},
+        )
         original = client.submit
 
         def slow_submit(job: JobRequest, **kwargs: Any) -> JobResult:
@@ -2246,6 +2314,75 @@ class TestDaemonLogTool:
         assert "daemon_log" in specs
         properties = specs["daemon_log"].parameters["properties"]
         assert {"tail", "level", "grep"} <= set(properties)
+
+
+class TestMemoryStaysOutOfTheDaemonLog:
+    """A memory belongs to one channel; the daemon log belongs to none.
+
+    ``daemon_log`` quotes the same process-wide ring buffer to whoever asks,
+    from whatever channel, so a note an agent kept in one channel would be
+    readable from every other one if its text were logged. What the call did
+    is logged by length instead, which is enough to follow it.
+    """
+
+    SECRET = "Marisol keeps the launch date in her head until legal signs"
+
+    @pytest.fixture(autouse=True)
+    def _buffer(self) -> Any:
+        from sbxloop.log import log_buffer
+
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    @pytest.fixture(autouse=True)
+    def _logging(self) -> Any:
+        import io
+
+        from sbxloop.log import configure_logging
+
+        configure_logging("DEBUG", fmt="console", stream=io.StringIO())
+        yield
+        configure_logging("DEBUG")
+
+    def _kept(self, tmp_path: Path, calls: list[tuple[str, dict[str, Any]]]) -> tuple[str, Any]:
+        """One turn in ``chan-a`` making ``calls``, and what an agent asking
+        ``daemon_log`` from anywhere else would be quoted afterwards."""
+        from sbxloop.agents.memory import MemoryService, NoWorkspaceVisibility
+        from sbxloop.agents.tools import memory_tools
+        from sbxloop.config import MemoryConfig
+
+        concierge, client, _, _, dstore = make(tmp_path, [{"calls": calls}])
+        service = MemoryService(dstore, NoWorkspaceVisibility(), MemoryConfig(), lambda: 1_000.0)
+        concierge.submit_turn(
+            "@ada note that",
+            author="Discord user `brett`",
+            agent_tools=memory_tools(
+                service, "ada", channel_id="chan-a", run_id=None, message_id="m1"
+            ),
+        ).result(timeout=10)
+        assert all(response.ok for response in client.responses), client.responses
+        reader, reading, *_ = make(tmp_path / "elsewhere", [{"calls": [("daemon_log", {})]}])
+        turn(reader, "what has the daemon been doing?")
+        (quoted,) = reading.responses
+        assert quoted.ok
+        return quoted.text or "", service
+
+    def test_what_an_agent_remembers_is_logged_by_length_not_by_text(self, tmp_path: Path) -> None:
+        quoted, service = self._kept(tmp_path, [("remember", {"content": self.SECRET})])
+        (stored,) = service.list("ada", channel_id="chan-a", include_private=True)
+        assert stored.content == self.SECRET
+        assert "concierge.tool" in quoted and "remember" in quoted
+        assert self.SECRET not in quoted
+        for word in ("Marisol", "launch", "legal"):
+            assert word not in quoted
+        assert f"{len(self.SECRET)} chars" in quoted
+
+    def test_a_recall_query_is_not_logged_either(self, tmp_path: Path) -> None:
+        quoted, _ = self._kept(tmp_path, [("recall", {"query": self.SECRET})])
+        assert "concierge.tool" in quoted and "recall" in quoted
+        assert self.SECRET not in quoted and "Marisol" not in quoted
+        assert "redacted query" in quoted
 
 
 class TestWatchRun:
@@ -3596,3 +3733,326 @@ class TestSetConfig:
         turn(concierge, "policy?")
         (resp,) = client.responses
         assert "locked by `[concierge] config_locked` (`policy`)" in resp.text
+
+
+class BlockingClient:
+    """A WorkerClient stand-in that holds every job until ``width`` jobs are in
+    flight at once, then answers each job's one host-tool call from a separate
+    thread, the way ``HostToolBroker`` does."""
+
+    def __init__(self, width: int) -> None:
+        self.gate = threading.Barrier(width, timeout=10)
+        self.jobs: list[JobRequest] = []
+        self.responses: list[HostToolResponse] = []
+
+    def submit(
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
+        tool_handler: Callable[[HostToolCall], HostToolResponse] | None = None,
+    ) -> JobResult:
+        self.jobs.append(job)
+        self.gate.wait()
+        assert tool_handler is not None and job.prompt is not None
+        ask = job.prompt.rsplit("\n---\n", 1)[1]
+        call = HostToolCall(
+            call_id="c0", name="handoff_agent", arguments={"agent_slug": "critic", "message": ask}
+        )
+        answers: list[HostToolResponse] = []
+        broker = threading.Thread(target=lambda: answers.append(tool_handler(call)))
+        broker.start()
+        broker.join(timeout=10)
+        self.responses.extend(answers)
+        return JobResult(job_id=job.job_id, status="ok", output_text=f"done {ask}")
+
+
+class PairedClient:
+    """A WorkerClient stand-in that answers only once every client sharing
+    ``gate`` has a job in flight."""
+
+    def __init__(self, name: str, gate: threading.Barrier) -> None:
+        self.name, self.gate = name, gate
+        self.jobs: list[JobRequest] = []
+
+    def submit(self, job: JobRequest, **kwargs: Any) -> JobResult:
+        self.jobs.append(job)
+        self.gate.wait()
+        return JobResult(job_id=job.job_id, status="ok", output_text=self.name, session_id="s")
+
+
+class LeasingHost(FakeHost):
+    """A host whose leases hand each concurrent turn its own client."""
+
+    def __init__(self, clients: list[Any]) -> None:
+        super().__init__(clients[0])
+        self.free = list(clients)
+        self.lock = threading.Lock()
+
+    @contextmanager
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
+        with self.lock:
+            client = self.free.pop(0)
+        try:
+            yield client
+        finally:
+            with self.lock:
+                self.free.append(client)
+
+
+class TestConcurrentTurns:
+    def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
+        assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+        assert (
+            Config.model_validate(
+                {"concierge": {"max_concurrent_turns": 16}}
+            ).concierge.max_concurrent_turns
+            == 16
+        )
+        for bad in (0, 17):
+            with pytest.raises(ValueError):
+                Config.model_validate({"concierge": {"max_concurrent_turns": bad}})
+
+    def test_overlapping_turns_each_see_their_own_speaker_handoff_and_session(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        seen: dict[str, tuple[str, str | None, str | None, str | None]] = {}
+
+        def handoff_for(owner: str) -> Callable[[str, str], str]:
+            def handoff(agent: str, message: str) -> str:
+                seen[message] = (
+                    owner,
+                    concierge._turn_author_id,
+                    concierge._turn_session_key,
+                    concierge._turn_message_id,
+                )
+                return "queued"
+
+            return handoff
+
+        try:
+            futures = [
+                concierge.submit_turn(
+                    f"ask {name}",
+                    author=name,
+                    author_id=f"id-{name}",
+                    message_id=f"m-{name}",
+                    session_key=f"channel-{name}",
+                    handoff=handoff_for(name),
+                )
+                for name in ("a", "b")
+            ]
+            replies = [future.result(timeout=20) for future in futures]
+        finally:
+            concierge.close()
+        assert [reply.text for reply in replies] == ["done ask a", "done ask b"]
+        assert all(response.ok for response in client.responses)
+        assert seen == {
+            "ask a": ("a", "id-a", "channel-a", "m-a"),
+            "ask b": ("b", "id-b", "channel-b", "m-b"),
+        }
+        # Outside a turn nothing is left behind.
+        assert concierge._turn_author_id is None and concierge._turn_session_key is None
+
+    def test_overlapping_turns_each_run_on_their_own_leased_client(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}})
+        gate = threading.Barrier(2, timeout=10)
+        clients = [PairedClient("one", gate), PairedClient("two", gate)]
+        concierge.host = LeasingHost(clients)
+        try:
+            futures = [
+                concierge.submit_turn(f"ask {name}", author=name, session_key=name)
+                for name in ("a", "b")
+            ]
+            replies = sorted(future.result(timeout=20).text for future in futures)
+        finally:
+            concierge.close()
+        assert replies == ["one", "two"]
+        assert [len(client.jobs) for client in clients] == [1, 1]
+
+    def test_bridge_turns_share_one_lane_however_wide_the_pool(self, tmp_path: Path) -> None:
+        """Discord, Slack, Mattermost and the TUI send turns with no
+        ``session_key``, so they all resume the one default session and share
+        its ``resume_session_id``, turn counter and model. They run one at a
+        time, in the order they arrived, whatever the width is set to."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 4}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        futures: list[Future[ConciergeReply]] = []
+        try:
+            futures = [
+                concierge.submit_turn(f"ask {name}", author=name, via=via)
+                for name, via in (("a", "discord"), ("b", "slack"))
+            ]
+            with pytest.raises(TimeoutError):
+                futures[1].result(timeout=0.5)
+            # Only the first is on a worker; the second is still in the lane.
+            assert len(client.jobs) == 1
+        finally:
+            client.gate.abort()
+            for future in futures:
+                future.exception(timeout=20)
+            concierge.close()
+        # The ask is the last line of the prompt the concierge builds.
+        asked = [job.prompt.splitlines()[-1] for job in client.jobs if job.prompt]
+        assert asked == ["ask a", "ask b"]
+
+    def test_turns_for_different_sessions_still_overlap(self, tmp_path: Path) -> None:
+        """The lane is per session, so a product channel's turn is not held
+        up by a bridge turn (or by another channel's)."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn("ask bridge", author="a", handoff=lambda agent, message: "q"),
+                concierge.submit_turn(
+                    "ask channel",
+                    author="b",
+                    session_key="channel-1:angie",
+                    handoff=lambda agent, message: "q",
+                ),
+            ]
+            # BlockingClient holds each job until two are in flight at once:
+            # it only answers because the two lanes overlap.
+            replies = sorted(future.result(timeout=20).text for future in futures)
+        finally:
+            concierge.close()
+        assert replies == ["done ask bridge", "done ask channel"]
+
+    def test_turns_run_one_at_a_time_at_width_one(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 1}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn(
+                    f"ask {name}", author=name, session_key=name, handoff=lambda a, m: "q"
+                )
+                for name in ("a", "b")
+            ]
+            with pytest.raises(TimeoutError):
+                futures[1].result(timeout=0.5)
+            assert len(client.jobs) == 1
+        finally:
+            client.gate.abort()
+            for future in futures:
+                future.exception(timeout=20)
+            concierge.close()
+
+    def test_sessions_keep_their_own_provider_run_id_and_bridges_keep_the_legacy_one(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{"text": "a"}, {"text": "b"}])
+        try:
+            concierge.submit_turn("hi", author="x").result(timeout=10)
+            concierge.submit_turn("hi", author="x", session_key="channel-1:angie").result(
+                timeout=10
+            )
+        finally:
+            concierge.close()
+        digest = hashlib.sha256(b"channel-1:angie").hexdigest()[:24]
+        assert [job.run_id for job in client.jobs] == ["concierge", f"concierge:{digest}"]
+        assert concierge_run_id(None) == CONCIERGE_RUN_ID == "concierge"
+        assert concierge_run_id("channel-1:angie") == f"concierge:{digest}"
+
+    def test_an_interrupted_call_in_one_session_does_not_block_another(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.provider import ProviderRecovery
+        from sbxloop.worker.client import WorkerClient
+        from tests.unit.test_provider_recovery import rejected
+
+        concierge, _, host, _, _ = make(tmp_path, [], config={"agent": {"backend": "claude"}})
+        now = [1000.0]
+        manager = ProviderRecovery(concierge.store, "claude", clock=lambda: now[0])
+        client = WorkerClient(SimpleNamespace(name="agent"))  # type: ignore[arg-type]
+        client.provider_recovery = manager
+        host._client = client  # type: ignore[assignment]
+        jobs: list[JobRequest] = []
+
+        def submit(request: JobRequest, **_: Any) -> JobResult:
+            jobs.append(request)
+            if len(jobs) == 1:
+                return rejected()
+            return JobResult(job_id=request.job_id, status="ok", output_text=f"answer {len(jobs)}")
+
+        monkeypatch.setattr(client, "_submit_once", submit)
+        try:
+            first = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert not first.result(timeout=10).ok
+            now[0] = manager.hold().next_at  # type: ignore[union-attr]
+            other = concierge.submit_turn("other ask", author="b", session_key="channel-b")
+            assert other.result(timeout=10).text == "answer 2"
+            again = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert again.result(timeout=10).text == "answer 3"
+        finally:
+            concierge.close()
+        assert jobs[1].prompt is not None and jobs[1].prompt.endswith("other ask")
+        assert jobs[2].resume_session_id == "s1"
+        assert not manager.pending(concierge_run_id("channel-a"))
+
+    def test_a_session_call_left_pending_under_the_legacy_run_id_still_recovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A release that recorded every interrupted call under "concierge"
+        # may leave a channel session's call pending across the upgrade.
+        # Retrying that request must resume and clear it, or every later
+        # bridge turn parks the provider for everyone.
+        from sqlalchemy import update
+
+        from sbxloop.db.engine_models import ProviderJobRow
+        from sbxloop.provider import ProviderRecovery
+        from sbxloop.worker.client import WorkerClient
+        from tests.unit.test_provider_recovery import rejected
+
+        concierge, _, host, _, _ = make(tmp_path, [], config={"agent": {"backend": "claude"}})
+        now = [1000.0]
+        manager = ProviderRecovery(concierge.store, "claude", clock=lambda: now[0])
+        client = WorkerClient(SimpleNamespace(name="agent"))  # type: ignore[arg-type]
+        client.provider_recovery = manager
+        host._client = client  # type: ignore[assignment]
+        jobs: list[JobRequest] = []
+
+        def submit(request: JobRequest, **_: Any) -> JobResult:
+            jobs.append(request)
+            if len(jobs) == 1:
+                return rejected()
+            return JobResult(job_id=request.job_id, status="ok", output_text=f"answer {len(jobs)}")
+
+        monkeypatch.setattr(client, "_submit_once", submit)
+        try:
+            first = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert not first.result(timeout=10).ok
+            # Re-key the row the way the earlier release wrote it.
+            with manager._write() as session:
+                session.execute(
+                    update(ProviderJobRow)
+                    .where(ProviderJobRow.run_id == concierge_run_id("channel-a"))
+                    .values(run_id=CONCIERGE_RUN_ID)
+                )
+            assert manager.pending(CONCIERGE_RUN_ID)
+            now[0] = manager.hold().next_at  # type: ignore[union-attr]
+            again = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert again.result(timeout=10).text == "answer 2"
+            bridge = concierge.submit_turn("bridge ask", author="c")
+            assert bridge.result(timeout=10).text == "answer 3"
+        finally:
+            concierge.close()
+        assert jobs[1].resume_session_id == "s1"
+        assert not manager.pending(CONCIERGE_RUN_ID)
+        assert manager.hold() is None
+        assert jobs[2].prompt is not None and jobs[2].prompt.endswith("bridge ask")

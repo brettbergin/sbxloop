@@ -11,6 +11,10 @@ work item abandoned, a sandbox that could not be provisioned — has no
 traceback to explain it, so the report carries the three things that do:
 the call site (``culprit``), the event's static operator ``hint`` as the
 report's title line, and the record's reportable fields.
+
+A failure is reported once. An exception that has been sent is marked, causes
+included, and a later record whose exception — or any cause of it — carries
+the mark is the same failure seen again on its way up, not a new one.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ import sys
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import sentry_sdk
     from sentry_sdk._types import Event
     from structlog.typing import EventDict
@@ -63,6 +69,43 @@ _PLUMBING = ("structlog", "logging", "sbxloop.log", "sbxloop.telemetry")
 
 #: A single free-text field is worth a paragraph of context, not a payload.
 _MAX_FIELD_LENGTH = 2_000
+
+#: Set on an exception, and on every member of its chain, once it has been
+#: reported. A failure is logged with its traceback where it happened, then
+#: again by each caller that wraps it on the way up (a DaemonError from a
+#: ProvisionError from an SbxError); the layers group differently and
+#: opened one GlitchTip issue each (#1168). A mark on the object itself
+#: needs no registry and dies with the exception (which takes no weakref).
+_REPORTED_MARK = "_sbxloop_reported"
+
+
+def _chain(error: BaseException) -> Iterator[BaseException]:
+    """``error`` and everything it wraps: causes, unsuppressed contexts, and
+    an exception group's members."""
+    seen: set[int] = set()
+    stack = [error]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        elif not current.__suppress_context__ and current.__context__ is not None:
+            stack.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            stack.extend(current.exceptions)
+
+
+def _already_reported(error: BaseException) -> bool:
+    return any(getattr(link, _REPORTED_MARK, False) for link in _chain(error))
+
+
+def _remember(error: BaseException) -> None:
+    for link in _chain(error):
+        with contextlib.suppress(AttributeError, TypeError):
+            setattr(link, _REPORTED_MARK, True)
 
 
 def _before_send(event: Event, _hint: dict[str, Any]) -> Event:
@@ -218,9 +261,10 @@ def _fields(event: EventDict) -> dict[str, Any]:
 
 def capture_exception(error: BaseException) -> None:
     """Report an unhandled CLI exception without changing its exit behavior."""
-    if _client is not None:
+    if _client is not None and not _already_reported(error):
         with contextlib.suppress(Exception):
             _client.capture_event({"level": "error", "exception": _exception_event(error)})
+            _remember(error)
 
 
 def capture_log(_logger: Any, method: str, event: EventDict) -> EventDict:
@@ -249,6 +293,10 @@ def capture_log(_logger: Any, method: str, event: EventDict) -> EventDict:
         )
         if method == "warning" and error is None:
             return event
+        if isinstance(error, BaseException) and _already_reported(error):
+            # Sent from the frame that raised, or a layer below: this record
+            # is the same failure seen again on its way up.
+            return event
         fields = _fields(event)
         # The event name stays the grouping key; ``formatted`` is what a
         # human reads. The hint is static per call site, so a report that
@@ -271,6 +319,8 @@ def capture_log(_logger: Any, method: str, event: EventDict) -> EventDict:
         if fields:
             payload[_FIELDS_KEY] = fields
         _client.capture_event(cast("Event", payload))
+        if isinstance(error, BaseException):
+            _remember(error)
     return event
 
 

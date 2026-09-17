@@ -232,7 +232,7 @@ def test_run_verbs_go_through_confirmations_and_ctl(seeded: SbxloopHome) -> None
             await pilot.pause(0.3)
             await pilot.press("y")
             await pilot.pause(1.0)
-            assert "cancel --retry" in ctl.commands
+            assert "cancel-run r_live --retry" in ctl.commands
             await pilot.press("plus")
             # Not `until` on the screen: a worker fills this page after mount and
             # the assertions below read what it wrote.
@@ -273,7 +273,7 @@ def test_read_only_refuses_every_verb(seeded: SbxloopHome) -> None:
             await pilot.press("c")
             await pilot.pause(0.5)
             assert isinstance(app.screen, RunDetailScreen), "no dialog opens"
-            assert "cancel" not in ctl.commands
+            assert not [c for c in ctl.commands if c.startswith("cancel")]
             await pilot.press("s")
             await pilot.pause(0.5)
             runner = app.deps.runner

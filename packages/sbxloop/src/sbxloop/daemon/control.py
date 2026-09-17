@@ -37,6 +37,7 @@ from sbxloop.daemon.controls.results import ControlError
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.daemon.discord_format import _one_line, code, items_lines, queue_lines
 from sbxloop.daemon.holds import OPERATOR_HOLD
+from sbxloop.daemon.model import live_runs
 from sbxloop.ghids import normalize_item_id
 from sbxloop.log import LogLevel, get_logger, log_buffer
 from sbxloop.paths import SbxloopHome
@@ -457,6 +458,14 @@ def _dispatch_verb(
         holds = list(s.get("holds") or ([OPERATOR_HOLD] if s["paused"] else []))
         lines = [
             f"**current:** {current}",
+            *(
+                [
+                    "**in flight:** "
+                    + "; ".join(f"{run['run_id']} — {run.get('title', '')}" for run in live)
+                ]
+                if len(live := live_runs(s)) > 1
+                else []
+            ),
             f"**queued:** {s['queued']} · **runs today ({_tz(s)}):** "
             f"{s['runs_today']}/{s['max_runs_per_day']}, resets at 00:00 {_tz(s)}"
             f" (resumes {s.get('resumes_today', 0)})",

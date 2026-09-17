@@ -15,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from sbxloop.chatservices import CHAT_SERVICES
-from sbxloop.config import Config, load_config, load_secrets_env
+from sbxloop.config import RESERVED_ENV_KEYS, Config, load_config, load_secrets_env
 from sbxloop.data import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -102,6 +102,44 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         assert key in guide, key
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
     assert '[agent] backend = "openai"' in secrets.read_text()
+
+
+def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[concierge] max_concurrent_turns`."""
+    assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+    (line,) = [
+        line
+        for line in DEFAULT_CONFIG_TOML.splitlines()
+        if line.startswith("# max_concurrent_turns = ")
+    ]
+    assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 1}
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
+    assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
+
+
+def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[api.oidc]`, plus the secrets
+    template that carries the client secret."""
+    oidc = Config.model_validate({}).api.oidc
+    fields = set(type(oidc).model_fields)
+    (start,) = [
+        i for i, line in enumerate(DEFAULT_CONFIG_TOML.splitlines()) if line == "# [api.oidc]"
+    ]
+    section: set[str] = set()
+    for line in DEFAULT_CONFIG_TOML.splitlines()[start + 1 :]:
+        if not line.startswith("#"):
+            break
+        match = re.match(r"# ([a-z_]+) = ", line)
+        if match:
+            section.add(match.group(1))
+    assert section == fields
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    documented: set[str] = set()
+    for row in re.findall(r"\| `\[api\.oidc\] ([^|]+)\|", guide):
+        documented |= set(re.findall(r"`(?:\[api\.oidc\] )?([a-z_]+)`", "`" + row))
+    assert documented == fields
+    secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
+    assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
 
 
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
@@ -302,6 +340,7 @@ CREDENTIAL_ENVS = {
     "GITLAB_TOKEN",
     "GITEA_TOKEN",
     "DISCORD_BOT_TOKEN",
+    "SBXLOOP_OIDC_CLIENT_SECRET",
 }
 
 
@@ -348,6 +387,8 @@ def test_env_example_sbxloop_overrides_name_real_config_keys() -> None:
         if not name.startswith("SBXLOOP_"):
             continue
         remainder = name[len("SBXLOOP_") :].lower()
+        if remainder in RESERVED_ENV_KEYS:
+            continue  # a credential or worker variable, never a setting
         dotted = remainder.replace("__", ".")
         assert dotted in known, f"{name} is not a config key ({dotted})"
         seen += 1
@@ -492,7 +533,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials", "workloads", "schedules", "mcp"):
+        if section in ("registries", "credentials", "workloads", "schedules", "mcp", "agents"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -521,7 +562,10 @@ def test_every_commented_key_is_a_real_config_key() -> None:
                 "slack": {"channel_id": "C0123ABCDEF"},
             }
         else:
-            doc = {section: parsed}
+            # A nested table such as `[api.oidc]` nests the same way.
+            doc = parsed
+            for part in reversed(section.split(".")):
+                doc = {part: doc}
         Config.model_validate(doc)
         checked += 1
     assert checked > 50, f"expected the example to document many keys, saw {checked}"
@@ -634,6 +678,40 @@ def test_example_mcp_entry_loads_with_its_credential() -> None:
     assert config.mcp_specs_for("critic") == []
 
 
+def test_example_agent_entry_loads_with_its_credential_and_server() -> None:
+    """The commented `[[agents]]` entry loads as one block beside the
+    `[[credentials]]` and `[[mcp]]` entries it names, and joins the
+    built-in agents under its slug and alias."""
+    from sbxloop.agents.registry import ConfigAgentRegistry
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and not line.strip():
+                break
+        return tomllib.loads(text)
+
+    agent = block_after("[[agents]]")
+    config = Config.model_validate(
+        {
+            "credentials": [block_after("[[credentials]]")],
+            "mcp": [block_after("[[mcp]]")],
+            "agents": [agent],
+        }
+    )
+    (spec,) = config.agents
+    assert spec.slug == agent["slug"] and spec.credentials == agent["credentials"]
+    resolved = ConfigAgentRegistry(config).get(agent["aliases"][0])
+    assert resolved is not None and resolved.slug == agent["slug"]
+    assert resolved.source == "config"
+
+
 def test_example_credential_entry_loads() -> None:
     """The commented `[[credentials]]` entry loads as one block: its keys
     are coupled (a bare `X-Api-Key` header wants `scheme = ""`), so it is
@@ -655,3 +733,50 @@ def test_example_credential_entry_loads() -> None:
     assert cred.host == entry["host"]
     assert cred.header == entry["header"]
     assert cred.scheme == entry["scheme"]
+
+
+def test_example_documents_concurrent_runs_at_the_model_default() -> None:
+    """`[daemon] max_concurrent_runs` is shown commented at the default the
+    model ships, so uncommenting it changes nothing until it is edited."""
+    text = EXAMPLE.read_text()
+    daemon = text[text.index("# [daemon]") :]
+    match = re.search(r"^# max_concurrent_runs = (\d+)", daemon, re.MULTILINE)
+    assert match is not None, "[daemon] max_concurrent_runs is not in the example"
+    assert int(match.group(1)) == Config().daemon.max_concurrent_runs == 1
+
+
+def test_example_memory_section_documents_the_defaults() -> None:
+    """The commented `[memory]` block (read from the packaged copy
+    `sbxloop init` writes), uncommented whole, loads and equals the model's
+    defaults, so the example never advertises a stale value."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[memory]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "enabled",
+        "max_items_per_agent",
+        "max_item_chars",
+        "prompt_budget_chars",
+    }
+    assert Config.model_validate({"memory": block}).memory == Config().memory
+
+
+def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:
+    """`[daemon] daily_token_budget` is shown commented (the model ships it
+    unset, so no budget applies until an operator picks one), and the value
+    it suggests loads."""
+    text = EXAMPLE.read_text()
+    daemon = text[text.index("# [daemon]") :]
+    match = re.search(r"^# daily_token_budget = (\d+)", daemon, re.MULTILINE)
+    assert match is not None, "[daemon] daily_token_budget is not in the example"
+    assert Config().daemon.daily_token_budget is None
+    loaded = Config.model_validate({"daemon": {"daily_token_budget": int(match.group(1))}})
+    assert loaded.daemon.daily_token_budget == int(match.group(1))

@@ -137,8 +137,13 @@ class FakeMessage:
         self.edits = getattr(self, "edits", 0) + 1
 
     async def create_thread(self, name: str) -> FakeChannel:
-        thread = FakeChannel(self.channel.client, self.channel.id * 10 + 1, name=name)
-        self.channel.client.channels[thread.id] = thread
+        # Each thread is its own channel (the first under control 42 is 421).
+        channels = self.channel.client.channels
+        tid = self.channel.id * 10 + 1
+        while tid in channels:
+            tid += 1000
+        thread = FakeChannel(self.channel.client, tid, name=name)
+        channels[thread.id] = thread
         return thread
 
 
@@ -502,6 +507,38 @@ class TestBridge:
         finally:
             bridge.close()
 
+    def test_two_live_runs_each_keep_their_relay_and_steering(self, tmp_path: Path) -> None:
+        """With two runs in flight, each thread steers its own run, and the
+        older run finishing leaves the newer run's relay and steering intact."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item_a = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
+            item_b = WorkItem(item_id="inbox:b.md", source_key="b.md", title="Do B")
+            engine_a, engine_b = FakeEngine(), FakeEngine()
+            bus_a, bus_b = EventBus(), EventBus()
+            bridge.run_started(item_a, "r1", engine_a, bus_a)  # type: ignore[arg-type]
+            bridge.run_started(item_b, "r2", engine_b, bus_b)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            assert wait_for(lambda: bridge.dstore.discord_thread("r2") is not None)
+            thread_a = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            thread_b = client.channels[bridge.dstore.discord_thread("r2").thread_id]  # type: ignore[union-attr]
+            bridge._handle_message(steer_msg("A: auth first", thread_a, mid=801))
+            assert engine_a.posted == ["A: auth first"] and engine_b.posted == []
+
+            bridge.run_finished(item_a, RunReport("r1", "completed", "done"))
+            assert wait_for(lambda: any(s.startswith("**finished") for s in thread_a.sent))
+            bus_b.emit("agent.message", "r2", content="B still going", agent="planner", model="m")
+            assert wait_for(lambda: any("B still going" in s for s in thread_b.sent))
+            bridge._handle_message(steer_msg("B: tests first", thread_b, mid=802))
+            assert engine_b.posted == ["B: tests first"]
+            assert not any("has finished" in s for s in thread_b.sent)
+            bridge._handle_message(steer_msg("A: too late", thread_a, mid=803))
+            assert engine_a.posted == ["A: auth first"]
+            assert wait_for(lambda: any("has finished" in s for s in thread_a.sent))
+        finally:
+            bridge.close()
+
     def test_message_in_finished_thread_gets_finished_reply(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
@@ -609,7 +646,8 @@ class TestBridge:
     def test_bot_messages_and_unknown_channels_are_ignored(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         engine = FakeEngine()
-        bridge._engine = engine
+        item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
+        bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
         other = FakeChannel(client, 999)
         bridge._handle_message(FakeMessage("hi", other))
         bridge._handle_message(FakeMessage("hi", client.channels[42], bot=True))
