@@ -46,8 +46,9 @@ from sbxloop.agents.assignment import (
     RunRole,
     plan_assignment,
 )
+from sbxloop.agents.chronicle import RunChronicle
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
-from sbxloop.agents.posts import ChannelPoster
+from sbxloop.agents.posts import ChannelPoster, RunArtifacts
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
@@ -2517,6 +2518,22 @@ class DaemonLoop:
         bus.subscribe(event_log_subscriber)
         # What the run's agents report spending is charged to the pool.
         bus.subscribe(self.usage_pool.subscriber(getattr(item, "channel_id", None)))
+        # What the run does is told in the channel that asked for it, under
+        # the names of the agents doing it. A resume re-attaches it: the
+        # posts a run already made are keyed, so nothing is said twice.
+        # The poster the API listener supplies also lists a run's files;
+        # one that does not simply posts without them.
+        posts: object = self.poster
+        chronicle = RunChronicle.for_item(
+            self.poster,
+            _item_assignment(item),
+            item,
+            item_config,
+            self.clock,
+            artifacts=posts if isinstance(posts, RunArtifacts) else None,
+        )
+        if chronicle is not None:
+            bus.subscribe(chronicle.on_event)
         engine = LoopEngine(
             item_config,
             store=self.store,

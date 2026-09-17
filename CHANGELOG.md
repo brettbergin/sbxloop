@@ -123,6 +123,22 @@ a code run's checkout, is `404` like any other id from elsewhere.
   run from. An ask that genuinely needs work is still started without
   asking for confirmation, and nothing is ever refused as out of scope.
 
+- **A run tells the channel that asked for it what it is doing.** The new
+  `RunChronicle` turns a run's events into short posts under the name of
+  the agent that did the work: the plan by the planner ("Split the ask
+  into 5 tasks"), each finished task by its agent ("Finished task 2 of 5:
+  ..."), the verdict by the critic ("2 findings, 1 blocking"), a steering
+  reply by the agent that was asked, and the delivery (with the run's
+  files and the pull request link) or a notice by the lead. It is
+  attached to a run whose item names a channel, and re-attached on a
+  resume; each post carries a key naming its moment, so a resumed or
+  replayed run says each thing once. `[agent_team] chronicle` (`normal`,
+  `quiet`, `off`), `max_posts_per_run` (12) and `progress_interval_s`
+  (120) bound it: progress is coalesced to one post per interval and a
+  run is capped, but the delivery and a terminal notice are always
+  posted. A run no channel asked for posts nothing, and nothing about a
+  run with the built-in team changes.
+
 - **A run can say what it is doing in the channel that asked for it.** A
   run linked to a channel posts under the name of the agent doing the
   work: an `agent_update` message with that agent as its author, the kind

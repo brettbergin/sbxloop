@@ -64,6 +64,14 @@ class ChannelPost:
 
 
 @runtime_checkable
+class RunArtifacts(Protocol):
+    """Where a run's catalogued files come from. The platform's poster
+    answers it; the engine side never opens the catalog itself."""
+
+    def artifacts_for_run(self, run_id: str) -> tuple[ArtifactRef, ...]: ...
+
+
+@runtime_checkable
 class ChannelPoster(Protocol):
     """How a run reaches a channel. Every call is best-effort: a run never
     fails because a channel could not be written to."""
@@ -85,4 +93,5 @@ __all__ = [
     "ChannelPost",
     "ChannelPoster",
     "PostKind",
+    "RunArtifacts",
 ]

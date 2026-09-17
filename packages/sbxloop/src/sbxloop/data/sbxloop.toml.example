@@ -404,6 +404,16 @@ service_memory = "2g"
 # moment it is made rather than from when a poll discovers it.
 # max_chain_depth = 2              # how deep a chain of agent-started work may go
 # max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+#
+# What a run says in the channel that asked for it. Each post is made
+# under the name of the agent that did the work: the plan by the planner,
+# each finished task by its agent, the verdict by the critic, the delivery
+# and any notice by the lead. `quiet` keeps only what ends a run; `off`
+# posts nothing. The delivery and a terminal notice are posted whatever
+# the cap says.
+# chronicle = "normal"             # normal | quiet | off
+# max_posts_per_run = 12           # the most one run says, deliveries and notices aside
+# progress_interval_s = 120.0      # progress is coalesced to at most one this often
 
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a

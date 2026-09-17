@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+#: Files named on one post; the run's own catalog lists the rest.
+ARTIFACTS_MAX = 50
+
 
 def _artifacts(refs: Sequence[ArtifactRef]) -> list[dict[str, Any]]:
     """The run's files as a channel reads them: the run id is public."""
@@ -70,6 +73,21 @@ class ApiChannelPoster:
                 exc_info=True,
             )
             return None
+
+    def artifacts_for_run(self, run_id: str) -> tuple[ArtifactRef, ...]:
+        """The files ``run_id`` delivered and still has, by path, at most
+        :data:`ARTIFACTS_MAX`."""
+        return tuple(
+            ArtifactRef(
+                id=artifact.id,
+                run_id=artifact.run_id,
+                relpath=artifact.relpath,
+                media_type=artifact.media_type,
+                size=artifact.size,
+            )
+            for artifact in self.ctx.artifacts.for_run(run_id)
+            if artifact.available
+        )[:ARTIFACTS_MAX]
 
     def channel_for_item(self, item_id: str) -> str | None:
         try:
