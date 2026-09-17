@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     Text,
     UniqueConstraint,
     text,
@@ -100,6 +101,53 @@ class ChannelRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
     deleted_at: Mapped[float | None] = mapped_column(REAL)
+    visibility: Mapped[str] = mapped_column(
+        Text,
+        CheckConstraint("visibility IN ('private', 'workspace')", name="visibility"),
+        nullable=False,
+        server_default=text("'private'"),
+    )
+    created_by: Mapped[str | None] = mapped_column(Text)
+    silenced_until: Mapped[float | None] = mapped_column(REAL)
+    settings_json: Mapped[str | None] = mapped_column(Text)
+
+
+class ChannelMemberRow(Base):
+    """A person in a channel. The channel's creator is its first owner."""
+
+    __tablename__ = "collaboration_channel_members"
+    __table_args__ = (
+        PrimaryKeyConstraint("channel_id", "user_id"),
+        CheckConstraint("role IN ('owner', 'member')", name="role"),
+        Index("idx_collaboration_channel_members_user", "user_id"),
+    )
+
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'member'"))
+    added_by: Mapped[str | None] = mapped_column(Text)
+    joined_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    last_read_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+
+
+class ChannelParticipantRow(Base):
+    """An agent in a channel: answering when mentioned, or listening in."""
+
+    __tablename__ = "collaboration_channel_participants"
+    __table_args__ = (
+        PrimaryKeyConstraint("channel_id", "agent_slug"),
+        CheckConstraint("mode IN ('mention', 'ambient')", name="mode"),
+    )
+
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    agent_slug: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'mention'"))
+    added_by_kind: Mapped[str | None] = mapped_column(Text)
+    added_by_id: Mapped[str | None] = mapped_column(Text)
+    muted_until: Mapped[float | None] = mapped_column(REAL)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
 class MessageRow(Base):
@@ -123,6 +171,8 @@ class MessageRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     work_json: Mapped[str | None] = mapped_column(Text)
     reactions_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'[]'"))
+    author_kind: Mapped[str | None] = mapped_column(Text)
+    author_id: Mapped[str | None] = mapped_column(Text)
 
 
 class TurnRow(Base):
@@ -147,6 +197,12 @@ class TurnRow(Base):
     participants_json: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'[]'")
     )
+    author_kind: Mapped[str | None] = mapped_column(Text)
+    author_id: Mapped[str | None] = mapped_column(Text)
+    trigger: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'human'"))
+    parent_turn_id: Mapped[str | None] = mapped_column(Text)
+    source_message_id: Mapped[str | None] = mapped_column(Text)
+    chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
 
 class TeamRow(Base):

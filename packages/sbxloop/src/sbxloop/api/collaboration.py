@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -33,6 +33,7 @@ from sbxloop.daemon.controls.principal import (
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow
 from sbxloop.db.collaboration_models import (
+    ChannelMemberRow,
     ChannelRow,
     LocalUserRow,
     MessageRow,
@@ -58,6 +59,23 @@ class CollaborationError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+AuthorKind = Literal["human", "agent", "system"]
+
+
+@dataclass(frozen=True, slots=True)
+class Author:
+    """Who wrote a message or started a turn."""
+
+    kind: AuthorKind
+    id: str | None
+    display_name: str | None = None
+
+
+SYSTEM_AUTHOR = Author("system", None)
+#: Kinds of assistant message the transport writes on its own behalf.
+SYSTEM_MESSAGE_KINDS = frozenset({"turn_error", "turn_cancelled"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +128,8 @@ class Channel:
     created_at: float
     updated_at: float
     deleted_at: float | None
+    visibility: str = "private"
+    created_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +146,9 @@ class Message:
     created_at: float
     work: dict[str, Any] | None = None
     reactions: tuple[str, ...] = ()
+    author: Author = SYSTEM_AUTHOR
+    artifacts: tuple[Any, ...] = ()
+    origin: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +165,11 @@ class Turn:
     completed_at: float | None
     intent: str = "conversation"
     participants: tuple[dict[str, Any], ...] = ()
+    author: Author | None = None
+    trigger: str = "human"
+    parent_turn_id: str | None = None
+    source_message_id: str | None = None
+    chain_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,10 +270,46 @@ def _channel(row: ChannelRow) -> Channel:
         created_at=float(row.created_at),
         updated_at=float(row.updated_at),
         deleted_at=None if row.deleted_at is None else float(row.deleted_at),
+        visibility=str(row.visibility or "private"),
+        created_by=None if row.created_by is None else str(row.created_by),
     )
 
 
-def _message(row: MessageRow) -> Message:
+def message_author(role: str, kind: str, agent_slug: str | None, owner_id: str | None) -> Author:
+    """The author of a message stored without one: the rules the authorship
+    migration backfilled with, for rows an older release wrote since."""
+    if role == "user":
+        return Author("human", owner_id)
+    if kind in SYSTEM_MESSAGE_KINDS:
+        return SYSTEM_AUTHOR
+    return Author("agent", agent_slug or ANGIE_SLUG)
+
+
+def _human_name(session: Any, user_id: str | None) -> str | None:
+    if user_id is None:
+        return None
+    user = session.get(LocalUserRow, user_id)
+    if user is None:
+        return None
+    return str(user.full_name or user.username)
+
+
+def _author(session: Any, kind: str | None, author_id: str | None) -> Author | None:
+    if kind == "human":
+        return Author("human", author_id, _human_name(session, author_id))
+    if kind == "agent":
+        return Author("agent", author_id)
+    if kind == "system":
+        return Author("system", author_id)
+    return None
+
+
+def _owner_id(session: Any, channel_id: str) -> str | None:
+    channel = session.get(ChannelRow, channel_id)
+    return None if channel is None else str(channel.user_id)
+
+
+def _message(session: Any, row: MessageRow) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
     if row.kind == "work_result":
@@ -253,6 +317,13 @@ def _message(row: MessageRow) -> Message:
         agent_slug = agent_slug or ANGIE_SLUG
         if isinstance(work, dict) and work.get("agent_slug") is None:
             work["agent_slug"] = ANGIE_SLUG
+    author = _author(session, row.author_kind, row.author_id)
+    if author is None:
+        # Written by a release that recorded no author.
+        derived = message_author(
+            str(row.role), str(row.kind), agent_slug, _owner_id(session, str(row.channel_id))
+        )
+        author = _author(session, derived.kind, derived.id) or derived
     return Message(
         id=str(row.id),
         channel_id=str(row.channel_id),
@@ -266,10 +337,14 @@ def _message(row: MessageRow) -> Message:
         created_at=float(row.created_at),
         work=work,
         reactions=tuple(str(value) for value in json.loads(row.reactions_json or "[]")),
+        author=author,
     )
 
 
-def _turn(row: TurnRow) -> Turn:
+def _turn(session: Any, row: TurnRow) -> Turn:
+    author = _author(session, row.author_kind, row.author_id) or _author(
+        session, "human", _owner_id(session, str(row.channel_id))
+    )
     return Turn(
         id=str(row.id),
         channel_id=str(row.channel_id),
@@ -283,6 +358,11 @@ def _turn(row: TurnRow) -> Turn:
         completed_at=None if row.completed_at is None else float(row.completed_at),
         intent=str(row.intent),
         participants=tuple(json.loads(row.participants_json)),
+        author=author,
+        trigger=str(row.trigger or "human"),
+        parent_turn_id=None if row.parent_turn_id is None else str(row.parent_turn_id),
+        source_message_id=None if row.source_message_id is None else str(row.source_message_id),
+        chain_depth=int(row.chain_depth or 0),
     )
 
 
@@ -710,6 +790,17 @@ class CollaborationStore:
                     revision=1,
                     created_at=now,
                     updated_at=now,
+                    visibility="private",
+                    created_by=user_id,
+                )
+            )
+            session.execute(
+                insert(ChannelMemberRow).values(
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    role="owner",
+                    added_by=user_id,
+                    joined_at=now,
                 )
             )
             row = session.get(ChannelRow, channel_id)
@@ -820,7 +911,7 @@ class CollaborationStore:
                 .where(MessageRow.channel_id == channel_id, MessageRow.sequence > after)
                 .order_by(MessageRow.sequence.asc())
             )
-            return [_message(row) for row in rows]
+            return [_message(session, row) for row in rows]
 
     def accept_turn(
         self,
@@ -864,7 +955,7 @@ class CollaborationStore:
                             "idempotency_conflict",
                             "client_turn_id was already used with a different request",
                         )
-                    return _turn(existing), _message(message), False
+                    return _turn(session, existing), _message(session, message), False
             turn_id = "trn_" + _token(16)
             message_id = "msg_" + _token(16)
             session.execute(
@@ -879,6 +970,8 @@ class CollaborationStore:
                     content=content,
                     reactions_json=json.dumps(["⏳"]),
                     created_at=now,
+                    author_kind="human",
+                    author_id=user_id,
                 )
             )
             session.execute(
@@ -902,6 +995,10 @@ class CollaborationStore:
                         ]
                     ),
                     created_at=now,
+                    author_kind="human",
+                    author_id=user_id,
+                    trigger="human",
+                    chain_depth=0,
                 )
             )
             channel.updated_at = now
@@ -925,9 +1022,11 @@ class CollaborationStore:
                     "channel_id": channel_id,
                     "message_id": message_id,
                     "sequence": message_row.sequence,
+                    "author_kind": "human",
+                    "author_id": user_id,
                 },
             )
-            return _turn(turn_row), _message(message_row), True
+            return _turn(session, turn_row), _message(session, message_row), True
 
     def start_turn(self, turn_id: str, now: float) -> bool:
         with self.dstore.transaction() as session:
@@ -966,6 +1065,7 @@ class CollaborationStore:
                 self._cancel_deleted_channel_turn(session, turn, now)
                 return None
             message_id = "msg_" + _token(16)
+            author_id = agent_slug or ANGIE_SLUG
             session.execute(
                 insert(MessageRow).values(
                     id=message_id,
@@ -977,6 +1077,8 @@ class CollaborationStore:
                     content=content,
                     agent_slug=agent_slug,
                     created_at=now,
+                    author_kind="agent",
+                    author_id=author_id,
                 )
             )
             channel.updated_at = now
@@ -998,9 +1100,11 @@ class CollaborationStore:
                     "message_id": message_id,
                     "sequence": row.sequence,
                     "agent_slug": agent_slug,
+                    "author_kind": "agent",
+                    "author_id": author_id,
                 },
             )
-            return _message(row)
+            return _message(session, row)
 
     def append_work_result(
         self,
@@ -1017,7 +1121,7 @@ class CollaborationStore:
         with self.dstore.immediate_transaction() as session:
             existing = session.get(MessageRow, message_id)
             if existing is not None:
-                return _message(existing)
+                return _message(session, existing)
             channel = session.get(ChannelRow, channel_id)
             turn = session.get(TurnRow, turn_id)
             if (
@@ -1039,6 +1143,8 @@ class CollaborationStore:
                     agent_slug=agent_slug,
                     work_json=json.dumps(work, default=str),
                     created_at=now,
+                    author_kind="agent",
+                    author_id=agent_slug or ANGIE_SLUG,
                 )
             )
             channel.updated_at = now
@@ -1051,7 +1157,7 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "turn_id": turn_id, "message_id": message_id},
             )
-            return _message(row)
+            return _message(session, row)
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:
@@ -1108,13 +1214,13 @@ class CollaborationStore:
                     },
                 )
             session.flush()
-            return _message(row)
+            return _message(session, row)
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
-                return None if row is None else _turn(row)
+                return None if row is None else _turn(session, row)
             cancelled = row.status == "cancelling"
             row.status = "cancelled" if cancelled else ("failed" if error else "completed")
             if cancelled:
@@ -1153,6 +1259,8 @@ class CollaborationStore:
                         kind="turn_cancelled" if cancelled else "turn_error",
                         content=error,
                         created_at=now,
+                        author_kind="system",
+                        author_id=None,
                     )
                 )
                 channel.updated_at = now
@@ -1166,6 +1274,8 @@ class CollaborationStore:
                         "turn_id": turn_id,
                         "message_id": message_id,
                         "sequence": sequence,
+                        "author_kind": "system",
+                        "author_id": None,
                     },
                 )
             session.flush()
@@ -1175,7 +1285,7 @@ class CollaborationStore:
                 now,
                 data={"channel_id": row.channel_id, "turn_id": row.id, "error": error},
             )
-            return _turn(row)
+            return _turn(session, row)
 
     def recover_turns(self, now: float) -> list[tuple[Turn, LocalUser, str]]:
         """Settle interrupted execution and return only work that never started.
@@ -1215,7 +1325,9 @@ class CollaborationStore:
                 user = session.get(LocalUserRow, channel.user_id) if channel else None
                 message = session.get(MessageRow, row.input_message_id)
                 if channel and channel.state == "active" and user and user.active and message:
-                    queued.append((message.sequence, _turn(row), _user(user), message.content))
+                    queued.append(
+                        (message.sequence, _turn(session, row), _user(user), message.content)
+                    )
                 else:
                     interrupted.append((row.id, False))
         for turn_id, answered in interrupted:
@@ -1289,7 +1401,7 @@ class CollaborationStore:
                 or row.role != "assistant"
             ):
                 return None
-            return _message(row)
+            return _message(session, row)
 
     def get_turn(self, user_id: str, channel_id: str, turn_id: str) -> Turn | None:
         with self.dstore.read() as session:
@@ -1303,7 +1415,7 @@ class CollaborationStore:
                 or row.channel_id != channel_id
             ):
                 return None
-            return _turn(row)
+            return _turn(session, row)
 
     def list_turns(self, user_id: str, channel_id: str, *, active_only: bool = False) -> list[Turn]:
         with self.dstore.read() as session:
@@ -1320,7 +1432,7 @@ class CollaborationStore:
                     TurnRow.status.in_(("accepted", "running", "cancelling"))
                 )
             return [
-                _turn(row)
+                _turn(session, row)
                 for row in session.scalars(statement.order_by(MessageRow.sequence).limit(200))
             ]
 
@@ -1436,7 +1548,7 @@ class CollaborationStore:
             ):
                 return None
             if row.status not in {"accepted", "running"}:
-                return _turn(row)
+                return _turn(session, row)
             settle = row.status == "accepted"
             row.status = "cancelling"
             progress = json.loads(row.participants_json)
@@ -1450,7 +1562,7 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "turn_id": turn_id},
             )
-            result = _turn(row)
+            result = _turn(session, row)
         return self.finish_turn(turn_id, error=None, now=now) if settle else result
 
     def queue_handoff(
@@ -1551,6 +1663,8 @@ class CollaborationStore:
                     agent_slug=source_slug,
                     content=f"@{source_slug} asked @{agent_slug}:\n\n{message}",
                     created_at=now,
+                    author_kind="agent",
+                    author_id=source_slug,
                 )
             )
             channel.updated_at = now
