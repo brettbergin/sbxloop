@@ -117,6 +117,31 @@ def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
 
 
+def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[api.oidc]`, plus the secrets
+    template that carries the client secret."""
+    oidc = Config.model_validate({}).api.oidc
+    fields = set(type(oidc).model_fields)
+    (start,) = [
+        i for i, line in enumerate(DEFAULT_CONFIG_TOML.splitlines()) if line == "# [api.oidc]"
+    ]
+    section: set[str] = set()
+    for line in DEFAULT_CONFIG_TOML.splitlines()[start + 1 :]:
+        if not line.startswith("#"):
+            break
+        match = re.match(r"# ([a-z_]+) = ", line)
+        if match:
+            section.add(match.group(1))
+    assert section == fields
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    documented: set[str] = set()
+    for row in re.findall(r"\| `\[api\.oidc\] ([^|]+)\|", guide):
+        documented |= set(re.findall(r"`(?:\[api\.oidc\] )?([a-z_]+)`", "`" + row))
+    assert documented == fields
+    secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
+    assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
+
+
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
     """A bridge's token has to appear in the file an operator actually fills
     in. Generic over the descriptor set, so a fourth service cannot land with

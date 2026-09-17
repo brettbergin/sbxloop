@@ -74,6 +74,10 @@ from sbxloop_worker.protocol import (
 log = get_logger(__name__)
 
 ENV_PREFIX = "SBXLOOP_"
+#: The environment variable ``[api.oidc] client_secret_env`` names by
+#: default. It carries the ``SBXLOOP_`` prefix, so the env config layer is
+#: told (``RESERVED_ENV_KEYS``) that it is a credential, never a setting.
+OIDC_CLIENT_SECRET_ENV = "SBXLOOP_OIDC_CLIENT_SECRET"  # nosec B105 - env var name
 
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
@@ -88,6 +92,7 @@ RESERVED_ENV_KEYS = frozenset(
         *(
             name[len(ENV_PREFIX) :].lower()
             for name in (
+                OIDC_CLIENT_SECRET_ENV,
                 OPENAI_KEY_NAME_ENV,
                 OPENAI_TIMEOUT_ENV,
                 OPENAI_RETRIES_ENV,
@@ -2707,6 +2712,138 @@ class TelemetryConfig(_ConfigModel):
         return value
 
 
+#: Signature algorithms an ID token may use: asymmetric only, so neither
+#: ``none`` nor a MAC keyed with a shared secret can pass for a signature.
+OidcAlgorithm = Literal[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"
+]
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_OIDC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _oidc_url(value: str, key: str) -> str:
+    """An https URL, or plain http to this machine only."""
+    raw = value.strip()
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+    except ValueError:
+        raise ValueError(f"{key}: {raw!r} is not a URL") from None
+    if not host or parts.scheme not in ("http", "https"):
+        raise ValueError(f"{key}: {raw!r} must be an https:// URL")
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        raise ValueError(f"{key}: {raw!r} must carry no credential or fragment")
+    loopback = host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+    if parts.scheme == "http" and not loopback:
+        raise ValueError(f"{key}: {raw!r} must use https (plain http is for localhost only)")
+    return raw
+
+
+class ApiOidcConfig(_ConfigModel):
+    """`[api.oidc]`: sign-in through an OpenID Connect provider.
+
+    The browser client runs Authorization Code + PKCE and hands the code to
+    ``POST /v1/auth/oidc/token``; the daemon redeems it as the confidential
+    client, validates the ID token and answers with its own token pair.
+    Off by default, and an existing file without the section loads as
+    before. The client secret is read at exchange time from the
+    environment variable ``client_secret_env`` names (``secrets.env``);
+    the value never enters the config, an event or a log line.
+    """
+
+    enabled: bool = False
+    #: The provider's id in ``GET /v1/auth/providers`` and the exchange body.
+    id: str = "authentik"
+    label: str = Field(default="Authentik", min_length=1, max_length=80)
+    #: The issuer exactly as the provider's discovery document states it.
+    issuer: str | None = None
+    client_id: str = ""
+    client_secret_env: str = OIDC_CLIENT_SECRET_ENV
+    #: Exact-match allowlist for the ``redirect_uri`` a client presents.
+    redirect_uris: list[str] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
+    #: The ID token's expected ``aud``; empty means ``client_id``.
+    audience: str | None = None
+    algorithms: list[OidcAlgorithm] = Field(
+        default_factory=lambda: cast(list[OidcAlgorithm], ["RS256", "ES256"]), min_length=1
+    )
+    leeway_s: int = Field(default=60, ge=0, le=600)
+    discovery_cache_s: int = Field(default=3600, ge=0)
+    jwks_cache_s: int = Field(default=3600, ge=0)
+    username_claim: str = Field(default="preferred_username", min_length=1)
+    email_claim: str = Field(default="email", min_length=1)
+    name_claim: str = Field(default="name", min_length=1)
+    groups_claim: str = Field(default="groups", min_length=1)
+    #: Provider groups whose members are workspace owners / admins. With
+    #: either set, every sign-in re-derives the member's role from groups.
+    owner_groups: list[str] = Field(default_factory=list)
+    admin_groups: list[str] = Field(default_factory=list)
+    #: When set, only people in one of these groups may sign in.
+    allowed_groups: list[str] = Field(default_factory=list)
+    default_role: Literal["admin", "member"] = "member"
+    #: Create an account on a first sign-in; off, only linked or existing
+    #: accounts may sign in.
+    auto_provision: bool = True
+    request_timeout_s: float = Field(default=10.0, gt=0, le=60)
+
+    @property
+    def expected_audience(self) -> str:
+        return self.audience or self.client_id
+
+    @property
+    def maps_roles(self) -> bool:
+        return bool(self.owner_groups or self.admin_groups)
+
+    @field_validator("id")
+    @classmethod
+    def _id_is_a_slug(cls, value: str) -> str:
+        if not _OIDC_ID_RE.match(value):
+            raise ValueError("api.oidc.id must be a lowercase slug")
+        return value
+
+    @field_validator("issuer")
+    @classmethod
+    def _issuer_is_https(cls, value: str | None) -> str | None:
+        return None if value is None or not value.strip() else _oidc_url(value, "api.oidc.issuer")
+
+    @field_validator("redirect_uris")
+    @classmethod
+    def _redirects_are_https(cls, value: list[str]) -> list[str]:
+        return [_oidc_url(uri, "api.oidc.redirect_uris") for uri in value]
+
+    @field_validator("client_secret_env")
+    @classmethod
+    def _secret_env_name(cls, value: str) -> str:
+        if value == OIDC_CLIENT_SECRET_ENV:
+            return value
+        return _check_api_key_env(value, "api.oidc.client_secret_env")
+
+    @field_validator("scopes")
+    @classmethod
+    def _scopes_ask_for_openid(cls, value: list[str]) -> list[str]:
+        if "openid" not in value:
+            raise ValueError("api.oidc.scopes must include openid")
+        if any(not scope or any(ch.isspace() for ch in scope) for scope in value):
+            raise ValueError("api.oidc.scopes must be single words")
+        return value
+
+    @model_validator(mode="after")
+    def _enabled_is_complete(self) -> ApiOidcConfig:
+        if self.enabled:
+            missing = [
+                key
+                for key, present in (
+                    ("issuer", self.issuer),
+                    ("client_id", self.client_id.strip()),
+                    ("redirect_uris", self.redirect_uris),
+                )
+                if not present
+            ]
+            if missing:
+                raise ValueError("[api.oidc] enabled = true needs " + ", ".join(missing))
+        return self
+
+
 class ApiConfig(_ConfigModel):
     """The remote operations API, served by ``sbxloop daemon`` in-process.
 
@@ -2745,6 +2882,7 @@ class ApiConfig(_ConfigModel):
     # A command accepted but not claimed within this expires rather than
     # applying stale intent later.
     operation_deadline_s: int = Field(default=300, ge=10)
+    oidc: ApiOidcConfig = Field(default_factory=ApiOidcConfig)
 
     @field_validator("bind")
     @classmethod

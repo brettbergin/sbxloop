@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
@@ -45,6 +45,9 @@ from sbxloop.api.stream import StreamHub
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.errors import ToolRejectedError
+
+if TYPE_CHECKING:
+    from sbxloop.api.auth.oidc import OidcProvider
 
 T = TypeVar("T")
 
@@ -134,6 +137,7 @@ class ApiContext:
         self._collaboration: CollaborationStore | None = None
         self._agents: tuple[Config, AgentRegistry] | None = None
         self._memory: tuple[Config, MemoryService] | None = None
+        self._oidc: tuple[Any, Any] | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -177,6 +181,23 @@ class ApiContext:
             )
             self._memory = cached
         return cached[1]
+
+    @property
+    def oidc(self) -> OidcProvider | None:
+        """The configured OpenID Connect provider, or ``None`` when sign-in
+        through one is off. Its discovery and key caches live as long as
+        the ``[api.oidc]`` section this context holds."""
+        settings = self.config.api.oidc
+        if not settings.enabled:
+            return None
+        cached = self._oidc
+        if cached is None or cached[0] is not settings:
+            from sbxloop.api.auth.oidc import OidcProvider
+
+            cached = (settings, OidcProvider(settings, clock=self.clock))
+            self._oidc = cached
+        provider: OidcProvider = cached[1]
+        return provider
 
     @property
     def public_ids(self) -> PublicIds:

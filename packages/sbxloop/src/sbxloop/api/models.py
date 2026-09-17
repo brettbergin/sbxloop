@@ -256,6 +256,35 @@ class TokenResponse(ApiModel):
     client_id: str
 
 
+class OidcProviderOut(ApiModel):
+    """What a signed-out browser needs to start Authorization Code + PKCE."""
+
+    id: str
+    label: str
+    authorize_url: str
+    client_id: str
+    scopes: list[str]
+    end_session_url: str | None
+
+
+class AuthProviders(ApiModel):
+    #: Username and password sign-in (``/v1/auth/local/login``) is offered.
+    local: bool
+    #: The OpenID Connect provider, when one is configured and reachable.
+    oidc: OidcProviderOut | None
+
+
+class OidcTokenRequest(ApiModel):
+    """The browser's authorization code, redeemed by the daemon."""
+
+    provider: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1, max_length=4096)
+    #: RFC 7636: 43 to 128 unreserved characters.
+    code_verifier: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9._~-]+$")
+    redirect_uri: str = Field(min_length=1, max_length=2048)
+    nonce: str = Field(min_length=1, max_length=512)
+
+
 class RevokeRequest(ApiModel):
     #: The refresh token whose family to revoke, besides the access token
     #: this request was made with.
