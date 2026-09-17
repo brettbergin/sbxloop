@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from sbxloop.agents.definition import AgentRoleName, AgentSpec, AgentStartKind
 from sbxloop.api.models import ApiModel
+
+WorkspaceRole = Literal["owner", "admin", "member"]
+AuthSource = Literal["local", "oidc"]
 
 
 class LocalRegisterRequest(ApiModel):
@@ -35,6 +38,72 @@ class LocalUserOut(ApiModel):
     is_active: bool
     created_at: str
     updated_at: str
+    #: The caller's workspace role (feature ``workspace.members``).
+    role: WorkspaceRole | None = None
+    #: The identity provider's picture URL, when it supplied one.
+    avatar_url: str | None = None
+    #: How the user signs in.
+    auth_source: AuthSource | None = None
+
+
+class WorkspaceUserOut(ApiModel):
+    """One person in the workspace directory."""
+
+    id: str
+    username: str
+    email: str
+    full_name: str | None
+    avatar_url: str | None
+    role: WorkspaceRole
+    is_active: bool
+    auth_source: AuthSource
+    last_seen_at: str | None
+
+
+class WorkspaceUserPage(ApiModel):
+    data: list[WorkspaceUserOut]
+
+
+class WorkspaceMemberUpdate(ApiModel):
+    role: WorkspaceRole | None = None
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def _something(self) -> Self:
+        if self.role is None and self.is_active is None:
+            raise ValueError("name a role or is_active to change")
+        return self
+
+
+class WorkspaceInviteCreate(ApiModel):
+    role: WorkspaceRole
+    #: When given, only a user registering with this email (in any case)
+    #: can spend the invite.
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    ttl_hours: int = Field(default=72, ge=1, le=720)
+
+
+class WorkspaceInviteCreated(ApiModel):
+    """A new invite. ``token`` appears here and nowhere else."""
+
+    id: str
+    token: str
+    expires_at: str
+    role: WorkspaceRole
+    email: str | None
+
+
+class WorkspaceInviteOut(ApiModel):
+    id: str
+    role: WorkspaceRole
+    email: str | None
+    expires_at: str
+    accepted_at: str | None
+    created_by: str | None
+
+
+class WorkspaceInvitePage(ApiModel):
+    data: list[WorkspaceInviteOut]
 
 
 class LocalUserUpdate(ApiModel):

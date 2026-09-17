@@ -26,6 +26,7 @@ from sbxloop.api.collaboration import (
     Member,
     Message,
     Preference,
+    Role,
     Team,
     Turn,
     Workflow,
@@ -204,12 +205,12 @@ def _problem(exc: CollaborationError) -> Problem:
     status = 404 if exc.code.endswith("not_found") else 409
     if exc.code in {"invalid_profile", "weak_password", "unknown_agent"}:
         status = 422
-    if exc.code in {"invite_invalid", "invite_expired"}:
+    if exc.code in {"invite_invalid", "invite_expired", "invite_email_mismatch", "owner_required"}:
         status = 403
     return Problem(status, exc.code, exc.message)
 
 
-def _user_out(user: LocalUser) -> LocalUserOut:
+def _user_out(user: LocalUser, role: Role | None = None) -> LocalUserOut:
     return LocalUserOut(
         id=user.id,
         email=user.email,
@@ -219,6 +220,9 @@ def _user_out(user: LocalUser) -> LocalUserOut:
         is_active=user.active,
         created_at=rfc3339(user.created_at) or "",
         updated_at=rfc3339(user.updated_at) or "",
+        role=role,
+        avatar_url=user.avatar_url,
+        auth_source="oidc" if user.auth_source == "oidc" else "local",
     )
 
 
@@ -390,7 +394,7 @@ async def get_local_user(
     auth: Authenticated = Depends(current),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> LocalUserOut:
-    return _user_out(member.user)
+    return _user_out(member.user, member.role)
 
 
 @router.patch("/users/me", response_model=LocalUserOut)
@@ -413,7 +417,7 @@ async def update_local_user(
     except CollaborationError as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
-    return _user_out(updated)
+    return _user_out(updated, member.role)
 
 
 # -- teams ---------------------------------------------------------------------------

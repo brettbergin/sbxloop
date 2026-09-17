@@ -16,7 +16,7 @@ from sbxloop.api.auth.tokens import AccessClaims, TokenError, verify_access
 from sbxloop.api.collaboration import Member
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
-from sbxloop.daemon.controls.principal import Capability, Principal
+from sbxloop.daemon.controls.principal import Capability, Principal, Role
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -94,6 +94,15 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
     )
     member = ctx.collaboration.member_for_client(client.id)
     if member is not None:
+        if not member.user.active:
+            # A deactivated person's tokens stop working at once, whatever
+            # they were minted with.
+            raise Problem(
+                401,
+                "user_inactive",
+                "the user behind this client is deactivated",
+                headers={"WWW-Authenticate": 'Bearer realm="sbxloop"'},
+            )
         seen = member.user.last_seen_at
         if seen is None or now - seen >= LAST_SEEN_INTERVAL_S:
             _touch_last_seen(ctx, member.user.id, now)
@@ -140,6 +149,43 @@ def require(
                 "forbidden",
                 f"{auth.principal.id} lacks {capability}",
                 capability=capability,
+            )
+        return auth
+
+    return dependency
+
+
+#: How much a role may do, lowest first: each role can do what the ones
+#: before it can.
+ROLE_RANK: dict[Role, int] = {"member": 0, "admin": 1, "owner": 2}
+
+
+def role_of(auth: Authenticated) -> Role | None:
+    """The workspace role the caller acts with: its member's role, ``owner``
+    for a plain API client holding ``daemon:manage`` (an operator), and
+    ``None`` for any other plain client."""
+    if auth.member is not None:
+        return auth.member.role if auth.member.user.active else None
+    if auth.principal.can("daemon:manage"):
+        return "owner"
+    return None
+
+
+def require_role(
+    minimum: Role,
+) -> Callable[..., Coroutine[Any, Any, Authenticated]]:
+    """A dependency admitting callers whose workspace role is at least
+    ``minimum`` (see :func:`role_of`); anyone else is 403
+    ``forbidden_role``."""
+
+    async def dependency(auth: Authenticated = Depends(current)) -> Authenticated:  # noqa: B008
+        role = role_of(auth)
+        if role is None or ROLE_RANK[role] < ROLE_RANK[minimum]:
+            raise Problem(
+                403,
+                "forbidden_role",
+                f"this action needs the {minimum} role or higher",
+                role=minimum,
             )
         return auth
 

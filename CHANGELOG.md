@@ -2,6 +2,21 @@
 
 ### Added
 
+- **Owners and admins can manage the workspace's people.** `GET /v1/users`
+  lists every member with role, standing, sign-in source and last-seen time
+  for any member to read. `PATCH` and `DELETE /v1/workspace/members/{user_id}`
+  change a role, deactivate or reactivate a user, or end a membership, and
+  `POST`, `GET` and `DELETE /v1/workspace/invites` create, list and withdraw
+  invites (72 hours by default, at most 720); the raw token appears only in
+  the creation response. Only an owner acts on the owner role, nobody
+  deactivates or removes themselves, and the workspace keeps an active owner.
+  A deactivated user's tokens are refused at once and their refresh tokens
+  revoked. An invite addressed to an email now admits only that email, in
+  any case. `GET /v1/users/me` gains `role`, `avatar_url` and `auth_source`.
+  Every change is audited, and the routes are advertised as
+  `users.directory` and `workspace.members`. A plain API client acts as an
+  owner only with `daemon:manage`.
+
 - **A workspace can hold more than one person.** Local users now belong to
   the installation's workspace as an owner, admin or member, and the
   database upgrade makes every existing local user an owner. A second user

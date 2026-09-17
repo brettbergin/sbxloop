@@ -53,6 +53,8 @@ FEATURES: tuple[str, ...] = (
     "collaboration.message_authors",
     "agents.registry",
     "agents.memory",
+    "users.directory",
+    "workspace.members",
 )
 
 

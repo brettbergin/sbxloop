@@ -471,7 +471,7 @@ class CollaborationStore:
                         raise CollaborationError(
                             "local_user_exists", "this installation already has a local user"
                         )
-                    invite = self._open_invite(session, invite_token, now)
+                    invite = self._open_invite(session, invite_token, now, email=email)
                     role = _role(str(invite.role))
                     capabilities_json = _capabilities_json(ROLE_CAPABILITIES[role])
                 session.execute(
@@ -576,7 +576,12 @@ class CollaborationStore:
     # -- workspace membership ------------------------------------------------------
 
     @staticmethod
-    def _open_invite(session: Any, raw_token: str, now: float) -> WorkspaceInviteRow:
+    def _open_invite(
+        session: Any, raw_token: str, now: float, *, email: str | None
+    ) -> WorkspaceInviteRow:
+        """The unspent, unexpired invite behind ``raw_token``. An invite
+        addressed to an email admits only that address, compared without
+        regard to case."""
         row: WorkspaceInviteRow | None = session.scalars(
             select(WorkspaceInviteRow).where(
                 WorkspaceInviteRow.token_hash == invite_token_hash(raw_token),
@@ -587,6 +592,10 @@ class CollaborationStore:
             raise CollaborationError("invite_invalid", "the invite is unknown or already used")
         if float(row.expires_at) <= now:
             raise CollaborationError("invite_expired", "the invite has expired")
+        if row.email is not None and (email or "").strip().casefold() != str(row.email).casefold():
+            raise CollaborationError(
+                "invite_email_mismatch", "the invite is addressed to another email"
+            )
         return row
 
     @staticmethod
@@ -601,14 +610,21 @@ class CollaborationStore:
             )
 
     @staticmethod
-    def _owner_count(session: Any) -> int:
+    def _owner_count(session: Any, *, besides: str | None = None) -> int:
+        """How many active owners the workspace has, ``besides`` one user
+        when named."""
+        conditions = [
+            WorkspaceMemberRow.workspace_id == WORKSPACE_ID,
+            WorkspaceMemberRow.role == "owner",
+            LocalUserRow.active != 0,
+        ]
+        if besides is not None:
+            conditions.append(WorkspaceMemberRow.user_id != besides)
         count = session.scalar(
             select(func.count())
             .select_from(WorkspaceMemberRow)
-            .where(
-                WorkspaceMemberRow.workspace_id == WORKSPACE_ID,
-                WorkspaceMemberRow.role == "owner",
-            )
+            .join(LocalUserRow, LocalUserRow.id == WorkspaceMemberRow.user_id)
+            .where(*conditions)
         )
         return int(count or 0)
 
@@ -672,25 +688,93 @@ class CollaborationStore:
             user = session.get(LocalUserRow, user_id)
             if row is None or user is None:
                 raise CollaborationError("member_not_found", "member not found")
-            if row.role == "owner" and role != "owner" and self._owner_count(session) <= 1:
+            if (
+                row.role == "owner"
+                and role != "owner"
+                and not self._owner_count(session, besides=user_id)
+            ):
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
             row.role = role
-            self._grant_role(session, user, role)
+            self._grant_role(session, user, role if user.active else None)
             session.flush()
             return _member(user, row)
 
-    def remove_member(self, user_id: str) -> bool:
-        """End a membership; the user's API client keeps no capability."""
+    def update_member(
+        self,
+        user_id: str,
+        *,
+        role: Role | None = None,
+        active: bool | None = None,
+        owner_ok: bool = True,
+        actor: dict[str, Any] | None = None,
+        now: float,
+    ) -> Member:
+        """Change a member's role, standing or both, in one step.
+
+        A deactivated user's API client holds nothing until the user is
+        reactivated, when it holds the role's capabilities again. The
+        workspace always keeps an active owner. Without ``owner_ok`` the
+        change may neither touch an owner nor grant the owner role
+        (``owner_required``).
+        """
+        role = None if role is None else _role(role)
+        with self.dstore.transaction() as session:
+            row = self._member_row(session, user_id)
+            user = session.get(LocalUserRow, user_id)
+            if row is None or user is None:
+                raise CollaborationError("user_not_found", "user not found")
+            if not owner_ok and (row.role == "owner" or role == "owner"):
+                raise CollaborationError("owner_required", "only an owner may do this to an owner")
+            losing_owner = row.role == "owner" and (
+                (role is not None and role != "owner") or active is False
+            )
+            if losing_owner and not self._owner_count(session, besides=user_id):
+                raise CollaborationError("last_owner", "the workspace must keep an owner")
+            data: dict[str, Any] = {"user_id": user_id}
+            if role is not None:
+                row.role = role
+                data["role"] = role
+            if active is not None:
+                user.active = 1 if active else 0
+                data["is_active"] = active
+            user.updated_at = now
+            current = _role(str(row.role))
+            self._grant_role(session, user, current if user.active else None)
+            session.flush()
+            _event(session, "workspace.member.updated", now, actor=actor, data=data)
+            return _member(user, row)
+
+    def remove_member(
+        self,
+        user_id: str,
+        *,
+        owner_ok: bool = True,
+        actor: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """End a membership; the user's API client keeps no capability.
+        Without ``owner_ok`` an owner cannot be removed (``owner_required``)."""
         with self.dstore.transaction() as session:
             row = self._member_row(session, user_id)
             if row is None:
                 return False
-            if row.role == "owner" and self._owner_count(session) <= 1:
+            if not owner_ok and row.role == "owner":
+                raise CollaborationError("owner_required", "only an owner may remove an owner")
+            if row.role == "owner" and not self._owner_count(session, besides=user_id):
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
+            role = str(row.role)
             session.delete(row)
             user = session.get(LocalUserRow, user_id)
             if user is not None:
                 self._grant_role(session, user, None)
+            if now is not None:
+                _event(
+                    session,
+                    "workspace.member.removed",
+                    now,
+                    actor=actor,
+                    data={"user_id": user_id, "role": role},
+                )
             return True
 
     def member_for_user(self, user_id: str) -> Member | None:
@@ -730,6 +814,7 @@ class CollaborationStore:
         created_by: str,
         ttl_s: float,
         now: float,
+        actor: dict[str, Any] | None = None,
     ) -> tuple[Invite, str]:
         """A new invite and its raw token. The token is returned only here;
         the store keeps its SHA-256."""
@@ -755,6 +840,7 @@ class CollaborationStore:
                 session,
                 "workspace.invite.created",
                 now,
+                actor=actor,
                 data={"invite_id": row.id, "role": role, "created_by": created_by},
             )
             return _invite(row), raw
@@ -762,7 +848,10 @@ class CollaborationStore:
     def accept_invite(self, raw_token: str, user_id: str, now: float) -> Member:
         """Spend an invite on an existing user who is not yet a member."""
         with self.dstore.transaction() as session:
-            invite = self._open_invite(session, raw_token, now)
+            user = session.get(LocalUserRow, user_id)
+            if user is None:
+                raise CollaborationError("user_not_found", "user not found")
+            invite = self._open_invite(session, raw_token, now, email=str(user.email))
             member = self._insert_member(
                 session, user_id, _role(str(invite.role)), str(invite.created_by), now
             )
@@ -774,6 +863,43 @@ class CollaborationStore:
                 data={"invite_id": invite.id, "user_id": user_id, "role": member.role},
             )
             return member
+
+    def list_invites(self) -> list[Invite]:
+        """Every invite still on record, newest first."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(WorkspaceInviteRow)
+                .where(WorkspaceInviteRow.workspace_id == WORKSPACE_ID)
+                .order_by(WorkspaceInviteRow.created_at.desc(), WorkspaceInviteRow.id)
+            ).all()
+            return [_invite(row) for row in rows]
+
+    def revoke_invite(
+        self, invite_id: str, *, actor: dict[str, Any] | None = None, now: float
+    ) -> bool:
+        """Withdraw an unspent invite so its token admits nobody.
+        ``False`` when there is no such invite; a spent one is kept."""
+        with self.dstore.transaction() as session:
+            row: WorkspaceInviteRow | None = session.scalars(
+                select(WorkspaceInviteRow).where(
+                    WorkspaceInviteRow.id == invite_id,
+                    WorkspaceInviteRow.workspace_id == WORKSPACE_ID,
+                )
+            ).first()
+            if row is None:
+                return False
+            if row.accepted_at is not None:
+                raise CollaborationError("invite_accepted", "the invite was already used")
+            role = str(row.role)
+            session.delete(row)
+            _event(
+                session,
+                "workspace.invite.revoked",
+                now,
+                actor=actor,
+                data={"invite_id": invite_id, "role": role},
+            )
+            return True
 
     # -- channels ------------------------------------------------------------------
 
