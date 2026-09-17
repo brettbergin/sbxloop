@@ -166,6 +166,17 @@
   that id once, so it resumes and stops gating bridge turns. Host tools
   still run one at a time.
 
+### Changed
+
+- **Every request now knows which workspace member is calling.** The
+  authenticated principal carries the caller's workspace membership, or none
+  for a plain API client, which keeps the reach its capabilities give it.
+  The collaboration routes take the member from one shared dependency, so a
+  client without an active local profile is still refused with
+  `403 local_profile_required`, and a user removed from the workspace is now
+  refused the same way. A member's last-seen time is recorded at most once a
+  minute. The single local user sees no change.
+
 ### Fixed
 
 - **A runner's result in a conversation is credited to Angie.** A code

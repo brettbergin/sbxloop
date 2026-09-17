@@ -11,6 +11,7 @@ from fastapi import Depends, Request
 
 from sbxloop.api.auth.store import Client
 from sbxloop.api.auth.tokens import AccessClaims, TokenError, verify_access
+from sbxloop.api.collaboration import Member
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.daemon.controls.principal import Capability, Principal
@@ -30,6 +31,14 @@ class Authenticated:
     #: The bearer token as presented: a long-lived stream re-verifies it
     #: on a schedule and closes when it no longer stands.
     token: str = ""
+    #: The workspace member the client belongs to. ``None`` for a plain API
+    #: client with no local user (or a user no longer in the workspace);
+    #: such a client keeps the reach its capabilities give it.
+    member: Member | None = None
+
+
+#: A member's last-seen time is written at most this often.
+LAST_SEEN_INTERVAL_S = 60.0
 
 
 def _bearer(request: Request) -> str:
@@ -69,7 +78,14 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
         capabilities=capabilities,
         workspace_id=claims.workspace_id,
     )
-    return Authenticated(principal=principal, claims=claims, client=client, token=token)
+    member = ctx.collaboration.member_for_client(client.id)
+    if member is not None:
+        seen = member.user.last_seen_at
+        if seen is None or now - seen >= LAST_SEEN_INTERVAL_S:
+            ctx.collaboration.touch_last_seen(member.user.id, now, LAST_SEEN_INTERVAL_S)
+    return Authenticated(
+        principal=principal, claims=claims, client=client, token=token, member=member
+    )
 
 
 def resolve_token(ctx: ApiContext, token: str) -> Authenticated:
@@ -84,6 +100,20 @@ async def current(request: Request, ctx: ApiContext = Depends(get_ctx)) -> Authe
     auth = await ctx.call(_resolve, ctx, token)
     request.state.principal = auth.principal
     return auth
+
+
+def member_of(auth: Authenticated) -> Member:
+    """The calling member, or the problem a client without an active local
+    profile has always been refused with."""
+    member = auth.member
+    if member is None or not member.user.active:
+        raise Problem(403, "local_profile_required", "this client is not the local Angie user")
+    return member
+
+
+async def current_member(auth: Authenticated = Depends(current)) -> Member:  # noqa: B008
+    """The workspace member behind the request; 403 for anyone else."""
+    return member_of(auth)
 
 
 def require(
