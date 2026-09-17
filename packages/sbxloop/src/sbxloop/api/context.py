@@ -20,6 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
+from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
     DbAgentRegistry,
@@ -132,6 +133,7 @@ class ApiContext:
         self._artifacts: ArtifactCatalog | None = None
         self._collaboration: CollaborationStore | None = None
         self._agents: tuple[Config, AgentRegistry] | None = None
+        self._memory: tuple[Config, MemoryService] | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -157,6 +159,23 @@ class ApiContext:
             )
             cached = (self.config, registry)
             self._agents = cached
+        return cached[1]
+
+    @property
+    def memory(self) -> MemoryService:
+        """Every agent's long-term memory, bounded by the config held now."""
+        cached = self._memory
+        if cached is None or cached[0] is not self.config:
+            cached = (
+                self.config,
+                MemoryService(
+                    self.loop.dstore,
+                    WorkspaceChannelVisibility(self.loop.dstore),
+                    self.config.memory,
+                    self.clock,
+                ),
+            )
+            self._memory = cached
         return cached[1]
 
     @property

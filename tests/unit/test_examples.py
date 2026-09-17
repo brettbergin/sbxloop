@@ -712,3 +712,27 @@ def test_example_documents_concurrent_runs_at_the_model_default() -> None:
     match = re.search(r"^# max_concurrent_runs = (\d+)", daemon, re.MULTILINE)
     assert match is not None, "[daemon] max_concurrent_runs is not in the example"
     assert int(match.group(1)) == Config().daemon.max_concurrent_runs == 1
+
+
+def test_example_memory_section_documents_the_defaults() -> None:
+    """The commented `[memory]` block (read from the packaged copy
+    `sbxloop init` writes), uncommented whole, loads and equals the model's
+    defaults, so the example never advertises a stale value."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[memory]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "enabled",
+        "max_items_per_agent",
+        "max_item_chars",
+        "prompt_budget_chars",
+    }
+    assert Config.model_validate({"memory": block}).memory == Config().memory

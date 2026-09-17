@@ -2757,6 +2757,23 @@ class ApiConfig(_ConfigModel):
         return value
 
 
+class MemoryConfig(_ConfigModel):
+    """Each agent's long-term memory: what it (or a person) chose to keep
+    beyond one conversation, scoped by the channel it was learned in.
+
+    ``enabled = false`` stops new memories and keeps them out of recall and
+    prompts; what is already stored stays listable and deletable.
+    """
+
+    enabled: bool = True
+    # Past this many live memories an agent's oldest unpinned one is dropped.
+    max_items_per_agent: int = Field(default=500, ge=1)
+    # One memory's text is cut to this many characters.
+    max_item_chars: int = Field(default=1000, ge=1)
+    # The most a memory block may add to an agent's prompt.
+    prompt_budget_chars: int = Field(default=4000, ge=0)
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # Runtime provenance, not operator knobs. Persisted so CLI precedence
@@ -2831,6 +2848,8 @@ class Config(_ConfigModel):
     # Identity, persona and narrowing only; egress stays with `[policy]`
     # and `[[workloads]]`.
     agents: list[AgentSpec] = Field(default_factory=list)
+    # Each agent's long-term memory (bounds and the on/off switch).
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:

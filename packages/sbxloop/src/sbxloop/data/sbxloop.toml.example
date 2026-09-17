@@ -383,6 +383,17 @@ service_memory = "2g"
 # aliases = ["weatherbot"]  # other @-names for it, never another agent's
 # enabled = true  # false hides it and routes nothing to it
 
+# [memory]
+# Each agent's long-term memory: what it, or a person through the API,
+# chose to keep beyond one conversation. A memory learned in a channel is
+# shown only in that channel; one with no channel is shown everywhere.
+# Turning it off stops new memories and keeps stored ones out of recall;
+# they stay listable and deletable.
+# enabled = true
+# max_items_per_agent = 500        # past this, the agent's oldest unpinned memory is dropped
+# max_item_chars = 1000            # one memory's text is cut to this length
+# prompt_budget_chars = 4000       # the most a memory block may add to a prompt
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need

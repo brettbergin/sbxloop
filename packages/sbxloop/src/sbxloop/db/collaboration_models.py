@@ -270,3 +270,31 @@ class AgentRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class AgentMemoryRow(Base):
+    """One thing an agent keeps beyond a conversation (revision 0023).
+
+    ``source_channel_id`` scopes it: null is global, otherwise it is shown
+    only in that channel unless the platform says the channel is visible to
+    the whole workspace. A forgotten memory keeps its row with
+    ``deleted_at`` set.
+    """
+
+    __tablename__ = "agent_memories"
+    __table_args__ = (Index("idx_agent_memories_agent", "agent_slug", "deleted_at", "updated_at"),)
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    agent_slug: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_channel_id: Mapped[str | None] = mapped_column(Text)
+    source_run_id: Mapped[str | None] = mapped_column(Text)
+    source_message_id: Mapped[str | None] = mapped_column(Text)
+    author: Mapped[str] = mapped_column(Text, nullable=False)
+    pinned: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[float | None] = mapped_column(REAL)
+    updated_at: Mapped[float | None] = mapped_column(REAL)
+    last_used_at: Mapped[float | None] = mapped_column(REAL)
+    deleted_at: Mapped[float | None] = mapped_column(REAL)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
