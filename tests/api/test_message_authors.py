@@ -127,6 +127,40 @@ def test_every_write_path_records_its_author(api: Any) -> None:
     assert humans == [Author("human", user.id, "Local Owner")] * 3
     assert all(m.author is not None for m in messages)
 
+    # The reader derives an author for a row with none, so check the stored
+    # columns themselves: every insert path must write them.
+    from sbxloop.db.collaboration_models import MessageRow, TurnRow
+
+    with api.harness.dstore.read() as session:
+        stored = sorted(
+            (row.role, row.kind, row.agent_slug or "", row.author_kind, row.author_id or "")
+            for row in session.scalars(
+                select(MessageRow).where(MessageRow.channel_id == channel.id)
+            )
+        )
+        turns = {
+            row.id: (row.author_kind, row.author_id)
+            for row in session.scalars(select(TurnRow).where(TurnRow.channel_id == channel.id))
+        }
+    assert stored == sorted(
+        [
+            ("user", "message", "", "human", user.id),
+            ("user", "message", "", "human", user.id),
+            ("user", "message", "", "human", user.id),
+            ("assistant", "agent_result", "planner", "agent", "planner"),
+            ("assistant", "message", "", "agent", "concierge"),
+            ("assistant", "work_result", "", "agent", "concierge"),
+            ("assistant", "agent_handoff", "planner", "agent", "planner"),
+            ("assistant", "turn_error", "", "system", ""),
+            ("assistant", "turn_cancelled", "", "system", ""),
+        ]
+    )
+    assert turns == {
+        turn.id: ("human", user.id),
+        turn2.id: ("human", user.id),
+        turn3.id: ("human", user.id),
+    }
+
 
 def test_message_created_events_name_the_author(api: Any) -> None:
     register(api)
