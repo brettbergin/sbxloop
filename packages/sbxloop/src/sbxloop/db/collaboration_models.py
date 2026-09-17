@@ -7,7 +7,16 @@ changing the run-oriented contract sbxloop already serves.
 
 from __future__ import annotations
 
-from sqlalchemy import REAL, Index, Integer, Text, UniqueConstraint, text
+from sqlalchemy import (
+    REAL,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
@@ -15,6 +24,17 @@ from sbxloop.db.base import Base
 
 class LocalUserRow(Base):
     __tablename__ = "collaboration_users"
+    __table_args__ = (
+        # One local account per identity-provider subject; accounts that
+        # never signed in through a provider carry neither column.
+        Index(
+            "idx_collaboration_users_oidc",
+            "oidc_issuer",
+            "oidc_subject",
+            unique=True,
+            sqlite_where=text("oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     client_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
@@ -25,6 +45,46 @@ class LocalUserRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
     active: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    auth_source: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'local'"))
+    oidc_issuer: Mapped[str | None] = mapped_column(Text)
+    oidc_subject: Mapped[str | None] = mapped_column(Text)
+    avatar_url: Mapped[str | None] = mapped_column(Text)
+    last_seen_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class WorkspaceMemberRow(Base):
+    """A user's role in a workspace. Every local user of an installation is
+    a member of its one workspace; the first is its owner."""
+
+    __tablename__ = "workspace_members"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner', 'admin', 'member')", name="ck_workspace_members_role"),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("collaboration_users.id"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    invited_by: Mapped[str | None] = mapped_column(Text)
+
+
+class WorkspaceInviteRow(Base):
+    """A pending invitation. Only the SHA-256 of the token is kept: the raw
+    token is shown once, to whoever created the invite."""
+
+    __tablename__ = "workspace_invites"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    email: Mapped[str | None] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    accepted_at: Mapped[float | None] = mapped_column(REAL)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
 class ChannelRow(Base):

@@ -2,6 +2,20 @@
 
 ### Added
 
+- **A workspace can hold more than one person.** Local users now belong to
+  the installation's workspace as an owner, admin or member, and the
+  database upgrade makes every existing local user an owner. A second user
+  still cannot register on their own: `POST /v1/auth/local/register` takes
+  an optional `invite_token`, and a valid, unexpired, unspent invite admits
+  the new user with the invite's role. The invite keeps only a hash of its
+  token. A role decides what the user's API client holds: an owner holds
+  every capability, an admin all but `credentials:manage`, and a member
+  `runs:read`, `runs:steer`, `items:create` and the three collaboration
+  capabilities. The workspace always keeps at least one owner. Users also
+  gain provider-identity, avatar and last-seen columns for sign-in work that
+  follows; no route reads them yet, and a single-user installation behaves as
+  before.
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,
