@@ -73,6 +73,18 @@
   (migration 0024). A run with no assignment, or with the built-in team, is
   unchanged. Nothing starts a run with an assignment yet.
 
+- **Runs and chat turns share one daily token budget.** `[daemon] daily_token_budget` (unset by default) caps the input and output tokens
+  every run and every chat turn reports in a calendar day in
+  `run_cap_timezone`. Once reached, no new run starts until the next day:
+  the daemon idles as `budget` and says so once that day. The run cap is
+  checked first and still idles as `daily_cap`. What runs and turns spend is
+  recorded in a new `workspace_usage` table (revision 0025), and
+  `GET /v1/usage/pool` (feature `usage.pool`, `runs:read`) reports the day's
+  runs against `max_runs_per_day` and tokens against the budget, split by
+  runs and turns. With more than one run allowed at once, the next slot goes
+  to the oldest queued item whose requester has no run in flight, before
+  the oldest item overall; one run at a time keeps plain FIFO order.
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,

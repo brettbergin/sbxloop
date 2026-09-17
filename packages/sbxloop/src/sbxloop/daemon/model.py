@@ -222,7 +222,9 @@ TickOutcome = Literal[
     # `[daemon] max_concurrent_runs` leaves room for more than one run).
     "started",
 ]
-IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work", "provider_held", "busy"]
+IdleKind = Literal[
+    "paused", "breaker", "daily_cap", "budget", "backoff", "no_work", "provider_held", "busy"
+]
 
 
 def live_runs(status: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -273,6 +275,7 @@ NoticeKind = Literal[
     "daemon.resumed",
     "daemon.holds_restored",
     "daemon.daily_cap",
+    "daemon.token_budget",
     "daemon.gc",
     "daemon.state_archived",
     "daemon.repoless_items_stranded",

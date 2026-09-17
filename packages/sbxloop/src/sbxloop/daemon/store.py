@@ -79,6 +79,7 @@ from sbxloop.db.daemon_models import (
     RunWatchRow,
     ScheduleRowModel,
     WorkItemRow,
+    WorkspaceUsageRow,
 )
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import DaemonError
@@ -2104,6 +2105,7 @@ class DaemonStore:
         backoff_s: float,
         *,
         skip: Callable[[WorkItem], bool] | None = None,
+        busy: Callable[[WorkItem], bool] | None = None,
     ) -> WorkItem | None:
         """Oldest queued item whose retry backoff (attempts * backoff) has
         elapsed since its last update. Ties on ``created_at`` (a batch
@@ -2117,14 +2119,21 @@ class DaemonStore:
         interruption is not a failure.
 
         ``skip`` passes over an eligible item that may not start yet (its
-        repository is busy), so the next one in order can."""
+        repository is busy), so the next one in order can. ``busy`` is a
+        preference, not a bar: the first eligible item it does not flag
+        wins (its requester has no run in flight), and only when it flags
+        every eligible item does the oldest of them start."""
+        fallback: WorkItem | None = None
         for item in self.queued_in_order():
             if dispatch_eligible_at(item, backoff_s) > now:
                 continue
             if skip is not None and skip(item):
                 continue
-            return item
-        return None
+            if busy is None or not busy(item):
+                return item
+            if fallback is None:
+                fallback = item
+        return fallback
 
     def queued_in_order(self) -> list[WorkItem]:
         """Every queued item in the order :meth:`next_queued` considers them:
@@ -2619,6 +2628,63 @@ class DaemonStore:
                 .scalar_subquery()
             )
             return int(session.scalar(select(started + resumed)) or 0)
+
+    # -- the workspace budget pool --------------------------------------------------
+
+    def record_usage(
+        self,
+        *,
+        ts: float,
+        source: str,
+        ref_id: str,
+        agent_slug: str | None,
+        channel_id: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+    ) -> None:
+        """Append one charge to the budget pool's ledger."""
+        with self._write() as session:
+            session.execute(
+                insert(WorkspaceUsageRow).values(
+                    ts=ts,
+                    source=source,
+                    ref_id=ref_id,
+                    agent_slug=agent_slug,
+                    channel_id=channel_id,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                )
+            )
+
+    def usage_tokens_since(self, ts: float, until: float | None = None) -> dict[str, int]:
+        """Input plus output tokens charged in ``[ts, until)``, by source."""
+        total = WorkspaceUsageRow.input_tokens + WorkspaceUsageRow.output_tokens
+        stmt = (
+            select(WorkspaceUsageRow.source, func.coalesce(func.sum(total), 0))
+            .where(WorkspaceUsageRow.ts >= ts)
+            .group_by(WorkspaceUsageRow.source)
+        )
+        if until is not None:
+            stmt = stmt.where(WorkspaceUsageRow.ts < until)
+        with self._read() as session:
+            return {str(source): int(tokens) for source, tokens in session.execute(stmt)}
+
+    def usage_entries_since(self, ts: float) -> list[WorkspaceUsageRow]:
+        """Every charge at or after ``ts``, oldest first (detached rows)."""
+        with self._read() as session:
+            rows = list(
+                session.scalars(
+                    select(WorkspaceUsageRow)
+                    .where(WorkspaceUsageRow.ts >= ts)
+                    .order_by(WorkspaceUsageRow.id.asc())
+                )
+            )
+            session.expunge_all()
+            return rows
 
     def resumes_since(self, ts: float) -> int:
         with self._read() as session:

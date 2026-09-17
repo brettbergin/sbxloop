@@ -422,6 +422,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/runs/{id}/artifacts`                    | `artifacts:read`       | The run's artifact catalog and where it published                     |
 | `GET`    | `/v1/artifacts/{id}[/content]`               | `artifacts:read`       | One entry; its bytes as an attachment                                 |
 | `GET`    | `/v1/runs/{id}/usage`, `/v1/usage`           | `runs:read`            | Reported tokens and turns; never a bill                               |
+| `GET`    | `/v1/usage/pool`                             | `runs:read`            | Today's runs and tokens against the daily cap and budget              |
 | `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
 | `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
 | `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
