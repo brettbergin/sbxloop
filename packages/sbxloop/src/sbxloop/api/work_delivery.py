@@ -16,6 +16,9 @@ from sbxloop.db.collaboration_models import ChannelRow, MessageRow, TurnRow
 from sbxloop.db.daemon_models import WorkItemRow
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunRecord
 from sbxloop.errors import SbxloopError
+from sbxloop.log import get_logger
+
+log = get_logger(__name__)
 
 #: Files named on one work result; the run's own catalog lists the rest.
 WORK_ARTIFACTS_MAX = 50
@@ -144,11 +147,18 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
 def _artifacts(ctx: Any, run: RunRecord) -> list[dict[str, Any]]:
     """The files a workload or tool run delivered, catalogued first when it
     has finished so the first result written already names them. A code
-    run delivers a pull request; its checkout is not handed to the channel."""
+    run delivers a pull request; its checkout is not handed to the channel.
+
+    A catalog that fails costs this result its file list, never the
+    delivery of every other channel's work: it names whatever is already
+    on record."""
     if run.kind not in DELIVERING_KINDS:
         return []
     if run.state in TERMINAL_RUN_STATES:
-        ctx.artifacts.catalog_run(run)
+        try:
+            ctx.artifacts.catalog_run(run)
+        except Exception:
+            log.warning("api.catalog_failed", run=run.run_id, exc_info=True)
     return [
         {
             "id": artifact.id,

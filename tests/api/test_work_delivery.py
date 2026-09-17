@@ -270,3 +270,55 @@ def test_projector_catalogues_finished_runs_before_delivering_work() -> None:
     projector.catalog("r1")
     projector.step()
     assert order == ["catalog:r1", "deliver"]
+
+
+def test_a_run_whose_catalog_fails_does_not_stop_delivery(api: Any, monkeypatch: Any) -> None:
+    """One run's unreadable files cost that result its file list, not every
+    channel's delivery nor the channel's own history."""
+    from sbxloop.db.collaboration_models import MessageRow
+
+    headers, channel, item = setup_work(api)
+    other = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{other}/turns",
+        headers=headers,
+        json={"content": "Prepare a report", "target_slugs": ["concierge", "operator"]},
+    ).json()
+    api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+    key = accepted["turn"]["input_message_id"]
+    second = WorkItem(
+        item_id=chat_item_id(key),
+        source_key=key,
+        title="Report",
+        body="Prepare a report",
+        kind="workload",
+    )
+    api.harness.dstore.upsert_new(second, api.clock())
+    catalog_run = api.ctx.artifacts.catalog_run
+
+    def failing(record: Any) -> int:
+        if record.run_id == api.harness.runs[0][0]:
+            raise OSError("the run's files could not be read")
+        return int(catalog_run(record))
+
+    monkeypatch.setattr(api.ctx.artifacts, "catalog_run", failing)
+    for work in (item, second):
+        api.harness.source.items = [work]
+        api.harness.outcomes = ["completed"]
+        api.clock.t += 10
+        api.loop.tick()
+    assert len(api.harness.runs) == 2
+    # The projector's pass over every channel carries on past the failure.
+    api.ctx.project_work()
+    with api.harness.dstore.read() as session:
+        delivered = {
+            str(row.channel_id)
+            for row in session.query(MessageRow).filter(MessageRow.kind == "work_result")
+        }
+    assert delivered == {channel, other}
+    response = api.client.get(f"/v1/channels/{channel}/messages", headers=headers)
+    assert response.status_code == 200, response.text
+    (result,) = [m for m in response.json() if m["kind"] == "work_result"]
+    assert result["work"]["state"] == "completed"
+    assert result["work"]["artifacts"] == []
+    assert "the answer is 42" in result["content"]
