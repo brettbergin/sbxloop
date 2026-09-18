@@ -965,6 +965,7 @@ daemon may run on schedules alone. `!sbx schedules` (or `sbxloop daemon ctl sche
 | `sbxloop gc`                                        | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `sbxloop secrets list\|clean\|rotate`               | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `sbxloop config show\|describe\|set\|unset\|policy` | Resolved configuration with per-key sources and when a change applies; one key's card (value, layer, what it accepts, what it is for); set or unset one key in the home's `config/sbxloop.toml` — comments kept, the whole file judged by the loader before it is written, the previous file kept as a backup; the effective egress policy.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `sbxloop users merge --from A --into B [--yes]`     | Merge a person's second collaboration account into their first (see "Merging a second account"): a dry run without `--yes`, one transaction with it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Network egress: least privilege, by plan
 
@@ -2253,6 +2254,39 @@ asserts `email_verified` only for addresses it has checked (Authentik's
 stock mapping has sent `true` unconditionally). A safe way to link the
 owner's local account is to enable it, have the owner sign in once, then
 turn it off again.
+
+**Merging a second account.** A provider that sends no email, or no verified
+one, cannot be linked to the local account that already exists, so the
+person's first sign-in through it creates a second account: a username with
+a numeric suffix, `auth_source = "oidc"` and an `oidc-...@users.invalid`
+address. `sbxloop users merge` folds that account into the first one. Run it
+on the daemon host, as the service user, against the home's state database;
+it is safe beside a running daemon, since the whole merge is one immediate
+SQLite transaction through the daemon's own store:
+
+```bash
+sbxloop users merge --from alice2 --into alice          # dry run: prints what would move
+sbxloop users merge --from alice2 --into alice --yes    # apply it
+```
+
+`--from` and `--into` take a username or a user id. Without `--yes` the
+command reports what would move and writes nothing. The merge moves the
+`--from` account's channels (ownership, and memberships, keeping the stronger
+channel role and the further read position), the messages and turns it
+wrote, its teams, preferences and workflows, the agent memories it authored,
+the invites it created, its bridge identities and the events addressed to it
+alone. A preference both accounts hold keeps the `--into` value and is listed;
+a team or workflow whose slug the `--into` account already uses moves as
+`<slug>-merged`. The `--into` account keeps the stronger of the two workspace
+roles, and its own username, email and password; the provider identity moves
+onto it, so both the password and the provider sign in to it from then on.
+Its `auth_source` stays `local`, as a linked account's does: the provider
+identity is recorded beside a working password. The `--from` account is
+deactivated, leaves the workspace, loses its provider identity and every
+capability, and its refresh tokens are revoked. The merge is refused for an
+account into itself, an unknown or deactivated `--into` account, and an
+`--into` account already bound to a different provider identity. It is
+recorded as `collaboration.user.merged`, carrying only the two user ids.
 
 **When it fails.** A provider error or an ID token that does not check out is
 `401 oidc_exchange_failed` with a generic message (the daemon's log says

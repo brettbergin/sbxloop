@@ -29,6 +29,18 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **`sbxloop users merge --from A --into B` folds one person's second
+  account into their first.** A provider that sends no verified email cannot
+  be linked to an existing local account, so the first sign-in through it
+  creates a separate one. The command (a dry run without `--yes`) moves that
+  account's channels, memberships, messages, turns, teams, preferences (the
+  target's value wins a clash), workflows, agent memories, invites and
+  bridge identities to the target in one immediate transaction, keeps the
+  stronger workspace role, moves the provider identity onto the target so
+  both the password and the provider sign in to it, and deactivates the
+  source with its refresh tokens revoked. `CollaborationStore.merge_users`
+  does the work; it records `collaboration.user.merged` with the two ids.
+
 - **A channel can have a window onto Slack, Discord or Mattermost.** A
   bridge surface linked to a channel stops routing to the daemon-wide
   concierge: what people type there becomes a turn in that channel, with

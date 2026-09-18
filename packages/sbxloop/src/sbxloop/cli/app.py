@@ -2262,6 +2262,15 @@ def _api_app() -> typer.Typer:
 app.add_typer(_api_app(), name="api")
 
 
+def _users_app() -> typer.Typer:
+    from sbxloop.cli.users import users_app
+
+    return users_app
+
+
+app.add_typer(_users_app(), name="users")
+
+
 @backup_app.callback()
 def backup_default(
     ctx: typer.Context,
