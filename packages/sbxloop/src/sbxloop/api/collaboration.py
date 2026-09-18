@@ -621,6 +621,40 @@ def _artifact_ref(row: MessageArtifactRow) -> ArtifactRef:
     )
 
 
+def _history_line(session: Any, row: Any, files: tuple[ArtifactRef, ...]) -> str:
+    """One message as a turn's history carries it.
+
+    The single place that shape is written, so what counts against the
+    history's character budget and what counts against the compaction
+    window's are the same measure.
+    """
+    line: dict[str, Any] = {
+        "seq": int(row.sequence),
+        "author_kind": None,
+        "author": None,
+        "role": str(row.role),
+        "kind": str(row.kind),
+        "content": str(row.content),
+    }
+    author = _author(session, row.author_kind, row.author_id)
+    if author is None:
+        derived = message_author(
+            str(row.role),
+            str(row.kind),
+            None if row.agent_slug is None else str(row.agent_slug),
+            _owner_id(session, str(row.channel_id)),
+        )
+        author = _author(session, derived.kind, derived.id) or derived
+    line["author_kind"] = author.kind
+    line["author"] = author.id
+    if files:
+        line["artifacts"] = [
+            {"id": ref.id, "name": ref.relpath, "media_type": ref.media_type, "size": ref.size}
+            for ref in files
+        ]
+    return json.dumps(line, ensure_ascii=False)
+
+
 def _attachments(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[ArtifactRef, ...]]:
     """The files each of ``message_ids`` carries, in one read: a channel's
     whole history is projected without a query per message."""
@@ -2618,8 +2652,19 @@ class CollaborationStore:
     def put_channel_summary(
         self, channel_id: str, through_sequence: int, content: str, now: float
     ) -> ChannelSummary:
-        """Record what the channel said up to ``through_sequence``."""
+        """Record what the channel said up to ``through_sequence``.
+
+        Each summary continues the one before it, so only the newest is
+        ever read: the channel's older rows are deleted in the same
+        transaction rather than kept forever.
+        """
         with self.dstore.immediate_transaction() as session:
+            session.execute(
+                delete(ChannelSummaryRow).where(
+                    ChannelSummaryRow.channel_id == channel_id,
+                    ChannelSummaryRow.through_sequence < through_sequence,
+                )
+            )
             row = session.get(ChannelSummaryRow, (channel_id, through_sequence))
             if row is None:
                 session.execute(
@@ -2648,17 +2693,35 @@ class CollaborationStore:
         Returns the last sequence covered, the previous summary (so the new
         one continues it) and the transcript of the messages that fell out,
         oldest first and bounded by ``max_chars``.
+
+        The window is the one :meth:`turn_history` keeps: ``keep`` messages
+        *and* ``max_chars`` characters, whichever binds first. A channel far
+        under the message cap still trims on the character budget, and a
+        summary has to exist for the trimmed history to open with.
+
+        The sequence returned is the last one the transcript actually
+        carries, never the last one that fell out: a backlog too big for one
+        excerpt is summarised over several compactions instead of having its
+        tail marked covered without ever being read.
         """
         with self.dstore.read() as session:
-            kept = list(
+            newest = list(
                 session.scalars(
-                    select(MessageRow.sequence)
+                    select(MessageRow)
                     .where(MessageRow.channel_id == channel_id)
                     .order_by(MessageRow.sequence.desc())
                     .limit(keep)
                 )
             )
-            if len(kept) < keep:
+            carried = _attachments(session, [str(message.id) for message in newest])
+            kept: list[int] = []
+            held = 0
+            for message in newest:
+                held += len(_history_line(session, message, carried.get(str(message.id), ()))) + 1
+                if kept and held > max_chars:
+                    break
+                kept.append(int(message.sequence))
+            if not kept:
                 return None
             previous = _latest_summary(session, channel_id)
             covered = 0 if previous is None else previous.through_sequence
@@ -2675,17 +2738,22 @@ class CollaborationStore:
             )
             if not rows:
                 return None
-            through = int(rows[-1].sequence)
+            through: int | None = None
             lines: list[str] = []
             spent = 0
             for row in rows:
                 author = _author(session, row.author_kind, row.author_id)
                 who = (author.display_name or author.id or author.kind) if author else str(row.role)
                 line = f"{who}: {' '.join(str(row.content).split())}"
-                if spent + len(line) > max_chars:
+                if lines and spent + len(line) > max_chars:
                     break
-                lines.append(line)
-                spent += len(line) + 1
+                # One message longer than the whole budget is cut rather
+                # than refused: the watermark has to be able to move past it.
+                lines.append(line[:max_chars])
+                spent += len(lines[-1]) + 1
+                through = int(row.sequence)
+            if through is None:
+                return None
             return through, None if previous is None else previous.content, "\n".join(lines)
 
     def message_exists(self, message_id: str) -> bool:
@@ -2955,37 +3023,7 @@ class CollaborationStore:
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                line: dict[str, Any] = {
-                    "seq": int(row.sequence),
-                    "author_kind": None,
-                    "author": None,
-                    "role": str(row.role),
-                    "kind": str(row.kind),
-                    "content": str(row.content),
-                }
-                author = _author(session, row.author_kind, row.author_id)
-                if author is None:
-                    derived = message_author(
-                        str(row.role),
-                        str(row.kind),
-                        None if row.agent_slug is None else str(row.agent_slug),
-                        _owner_id(session, str(row.channel_id)),
-                    )
-                    author = _author(session, derived.kind, derived.id) or derived
-                line["author_kind"] = author.kind
-                line["author"] = author.id
-                files = attachments.get(str(row.id), ())
-                if files:
-                    line["artifacts"] = [
-                        {
-                            "id": ref.id,
-                            "name": ref.relpath,
-                            "media_type": ref.media_type,
-                            "size": ref.size,
-                        }
-                        for ref in files
-                    ]
-                chunk = json.dumps(line, ensure_ascii=False)
+                chunk = _history_line(session, row, attachments.get(str(row.id), ()))
                 if len(chunk) > remaining:
                     dropped = True
                     break

@@ -17,7 +17,12 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait as wait_for_futures,
+)
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from sbxloop.agents.assignment import RUN_ROLES, agent_memory_block
@@ -68,9 +73,20 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
-#: The session the history compaction job resumes. Its own lane, so a
+#: The session prefix the history compaction job runs under. One session
+#: per channel, reset before every call: an SDK session is resumed message
+#: after message, so a shared one would carry a private channel's
+#: transcript into the next channel's summary. Its own lane too, so a
 #: summary never queues behind (or ahead of) somebody's conversation.
 SUMMARY_SESSION_KEY = "sbxloop:channel-summary"
+#: How long a compaction waits for the model before giving up. The job is
+#: best effort, and a provider that never answers must not pin the thread
+#: that runs it.
+SUMMARY_TIMEOUT_S = 180.0
+#: How often a compaction waiting on the model checks whether the daemon
+#: is stopping, and how long closing waits for one to let go of the store.
+_SUMMARY_POLL_S = 0.25
+COMPACTION_CLOSE_WAIT_S = 10.0
 _CONTENT_WORD = re.compile(r"\w+")
 #: Turn intents that may start managed work, so the agents a turn mentions
 #: are recorded as its run-role assignees.
@@ -207,6 +223,17 @@ class ApiContext:
         self.executor = ThreadPoolExecutor(
             max_workers=EXECUTOR_THREADS, thread_name_prefix="sbxloop-api-worker"
         )
+        #: History compaction, off both the turn pool and the route
+        #: executor: one model call at a time, and never in a lane a
+        #: conversation is waiting on.
+        self._compactor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sbxloop-api-compact"
+        )
+        #: Channels with a compaction queued or running, each with whether
+        #: another settled turn asked for one meanwhile.
+        self._compacting: dict[str, bool] = {}
+        self._compactions: set[Future[None]] = set()
+        self._compacting_lock = threading.Lock()
         #: Accepted chat turns: one FIFO lane per channel over a pool as wide
         #: as the concierge's own turn pool.
         self.turns = TurnCoordinator(config.concierge.max_concurrent_turns)
@@ -277,33 +304,98 @@ class ApiContext:
             self._summaries = ChannelSummarizer(self.collaboration, self._summarize, self.clock)
         return self._summaries
 
-    def _summarize(self, prompt: str) -> str:
-        """One cheap, tool-less model call through the concierge's session
-        pool. Raises when there is no concierge, which the job treats as
-        "no summary this time"."""
+    def _summarize(self, channel_id: str, prompt: str) -> str:
+        """One cheap, tool-less model call for ``channel_id`` alone.
+
+        The session is this channel's own and is reset first, so the call
+        sees this channel's excerpt and nothing else: no other channel's
+        transcript is resumed into it, and this one does not grow across
+        compactions. Raises when there is no concierge, which the job
+        treats as "no summary this time".
+        """
         concierge = self.concierge
         if concierge is None:
             raise RuntimeError("no concierge to summarise with")
-        reply = concierge.submit_turn(
+        session_key = f"{SUMMARY_SESSION_KEY}:{channel_id}"
+        concierge.reset_session(session_key)
+        pending = concierge.submit_turn(
             prompt,
             author="sbxloop",
             via="local",
-            session_key=SUMMARY_SESSION_KEY,
+            session_key=session_key,
             allow_actions=False,
             read_only=True,
-        ).result()
-        return str(reply.text or "") if reply.ok else ""
+            # Charged to the channel whose history it compacts.
+            channel_id=channel_id,
+        )
+        # Bounded, and abandoned as soon as the daemon stops: closing must
+        # not wait out a provider that is slow to answer.
+        deadline = time.monotonic() + SUMMARY_TIMEOUT_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("the summary was not answered in time")
+            if self.stopping.is_set():
+                raise RuntimeError("stopping")
+            try:
+                reply = pending.result(timeout=min(_SUMMARY_POLL_S, remaining))
+            except FutureTimeoutError:
+                continue
+            return str(reply.text or "") if reply.ok else ""
 
     def compact_channel(self, channel_id: str) -> None:
         """Summarise what has fallen out of a channel's history window.
 
-        Best effort and off the turn's critical path: a failure leaves the
-        watermark alone, so the next settled turn tries again.
+        Best effort: a failure -- including a model that never answers --
+        leaves the watermark alone, so the next settled turn tries again.
         """
+        if self.stopping.is_set():
+            return
         try:
             self.summaries.refresh(channel_id)
         except Exception:
             log.warning("collaboration.compaction_failed", channel=channel_id, exc_info=True)
+
+    def schedule_compaction(self, channel_id: str) -> None:
+        """Compact ``channel_id`` off the turn's critical path.
+
+        A settled turn holds its channel's lane and one of the turn pool's
+        threads (as few as one) until it returns, so the model call this
+        job makes cannot happen there: a slow provider would wedge chat for
+        every channel. It runs on its own thread instead. A channel already
+        queued or being compacted is not queued twice; it is compacted once
+        more after the running job, so what settled meanwhile is not left
+        waiting for some later turn.
+        """
+        with self._compacting_lock:
+            if channel_id in self._compacting:
+                self._compacting[channel_id] = True
+                return
+            self._compacting[channel_id] = False
+
+        def compact() -> None:
+            while True:
+                self.compact_channel(channel_id)
+                with self._compacting_lock:
+                    if not self._compacting.get(channel_id) or self.stopping.is_set():
+                        self._compacting.pop(channel_id, None)
+                        return
+                    self._compacting[channel_id] = False
+
+        try:
+            future = self._compactor.submit(compact)
+        except RuntimeError:
+            # Shutting down: the next daemon's first settled turn compacts.
+            with self._compacting_lock:
+                self._compacting.pop(channel_id, None)
+            return
+        with self._compacting_lock:
+            self._compactions.add(future)
+        future.add_done_callback(self._compaction_done)
+
+    def _compaction_done(self, future: Future[None]) -> None:
+        with self._compacting_lock:
+            self._compactions.discard(future)
 
     @property
     def oidc(self) -> OidcProvider | None:
@@ -677,7 +769,7 @@ class ApiContext:
             now=self.clock(),
         )
         self.hub.notify()
-        self.compact_channel(turn.channel_id)
+        self.schedule_compaction(turn.channel_id)
 
     def _channel_tools(self, channel_id: str) -> tuple[AgentTool, ...]:
         """The tools over the turn's own channel: today, reading a file
@@ -792,4 +884,13 @@ class ApiContext:
         # Every live stream sees `stopping` on its next wake and ends.
         self.hub.notify()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self._compactor.shutdown(wait=False, cancel_futures=True)
+        # The store closes right after this: a compaction still reading or
+        # writing it must finish first. One waiting on the model sees
+        # `stopping` within a poll and gives up without writing, so this
+        # wait is short in practice and bounded regardless.
+        with self._compacting_lock:
+            running = set(self._compactions)
+        if running:
+            wait_for_futures(running, timeout=COMPACTION_CLOSE_WAIT_S)
         self.turns.shutdown()
