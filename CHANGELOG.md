@@ -109,11 +109,16 @@ a code run's checkout, is `404` like any other id from elsewhere.
   concierge's model when unset) that answers RELEVANT or PASS; a PASS posts
   nothing and records `collaboration.followup.suppressed` with reason
   `ambient_pass`, and being over the hourly cap records `ambient_cap`. What
-  passes all three becomes an ordinary turn whose reply is an ordinary
-  agent message. An agent never answers its own message, one already
-  answering the turn does not also volunteer, and one turn draws at most
-  one unprompted answer from each listening agent. `ambient = false`, the
-  default, leaves every channel exactly as it was.
+  passes all three becomes a turn whose reply is an ordinary agent
+  message, but the turn carries no authority: it runs read-only, with no
+  actions and no handoff, and the agent is told the message was not a
+  request to it. The relevance call is one-shot and resumes no session, so
+  no earlier verdict colours the next. Each decision is audited once, as its
+  final outcome. An agent never answers its own message; one already
+  answering the turn, or named in the message it would answer, does not
+  also volunteer; and each message is looked at once, by the turn that
+  posted it. `ambient = false`, the default, leaves every channel exactly
+  as it was.
 
 - **Agents address each other, under a person's control.** An agent's
   reply is prose in a shared channel, so naming another agent in it now

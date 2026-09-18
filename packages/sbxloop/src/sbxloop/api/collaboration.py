@@ -2199,16 +2199,6 @@ class CollaborationStore:
                 return None
             return _message(session, row)
 
-    def channel_owner(self, channel_id: str) -> LocalUser | None:
-        """The person a channel's spending belongs to, so a turn nobody
-        typed still has someone it is charged to."""
-        with self.dstore.read() as session:
-            owner_id = _owner_id(session, channel_id)
-            if owner_id is None:
-                return None
-            row = session.get(LocalUserRow, owner_id)
-            return None if row is None else _user(row)
-
     def silenced_until(self, channel_id: str) -> float | None:
         """When the channel's silence lifts, or ``None``. Read by the
         guardrails, which run for the daemon and not for a viewer."""

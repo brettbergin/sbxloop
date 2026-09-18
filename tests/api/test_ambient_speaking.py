@@ -25,6 +25,7 @@ from typing import Any
 
 from sbxloop.agents.definition import AgentSpec
 from sbxloop.daemon.concierge import ConciergeReply
+from sbxloop.daemon.usagepool import Admission
 from tests.api.conftest import build
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
@@ -34,9 +35,12 @@ class ClassifyingConcierge(FakeConcierge):
     """Answers the relevance question with a scripted verdict and records
     which agents were ever asked one."""
 
-    def __init__(self, verdicts: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, verdicts: dict[str, str] | None = None, replies: dict[str, str] | None = None
+    ) -> None:
         super().__init__()
         self.verdicts = verdicts or {}
+        self.replies = replies or {}
         self.classified: list[str] = []
 
     def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
@@ -48,7 +52,26 @@ class ClassifyingConcierge(FakeConcierge):
             self.calls.append({"text": text, **kwargs})
             future.set_result(ConciergeReply(self.verdicts.get(slug, "PASS")))
             return future
+        speaker = key.rsplit(":", 1)[-1]
+        if speaker in self.replies:
+            self.calls.append({"text": text, **kwargs})
+            future.set_result(ConciergeReply(self.replies[speaker]))
+            return future
         return super().submit_turn(text, **kwargs)
+
+    def answered(self, slug: str) -> list[dict[str, Any]]:
+        """The calls in which ``slug`` spoke in the channel, not the
+        classifier's calls about it."""
+        return [
+            call
+            for call in self.calls
+            if ":ambient:" not in str(call.get("session_key") or "")
+            and str(call.get("session_key") or "").endswith(f":{slug}")
+        ]
+
+
+def _classifier_calls(api: Any) -> list[dict[str, Any]]:
+    return [c for c in api.ctx.concierge.calls if ":ambient:" in str(c.get("session_key") or "")]
 
 
 def _api(tmp_path: Any, **collaboration: Any) -> Any:
@@ -159,9 +182,12 @@ def test_a_pass_posts_nothing_and_says_why(tmp_path: Any) -> None:
 
         assert api.ctx.concierge.classified == ["baker"]
         assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
-        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        events = _events(api, headers, channel)
+        suppressed = [e for e in events if e["type"].endswith("suppressed")]
         assert [e["data"]["reason"] for e in suppressed] == ["ambient_pass"]
         assert suppressed[0]["data"]["agent_slug"] == "baker"
+        # One decision, one record: nothing claims a turn was queued.
+        assert [e for e in events if e["type"].endswith("queued")] == []
     api.ctx.close()
 
 
@@ -242,4 +268,207 @@ def test_ambient_off_is_the_whole_feature_off(tmp_path: Any) -> None:
         assert api.ctx.concierge.classified == []
         assert _events(api, headers, channel) == []
         assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()
+
+
+def test_each_listener_looks_at_a_message_once(tmp_path: Any) -> None:
+    """Two listeners, one of which passes. The turn the other one takes
+    answers the same message and must not put it in front of the listener
+    that already passed on it."""
+    api = _api(tmp_path, ambient_window_messages=1, pair_cooldown_s=0)
+    with api.client:
+        # Angie's own answer keeps the topic newest, so anything that looks
+        # at the conversation again would still find something to match.
+        api.ctx.concierge = ClassifyingConcierge(
+            {"baker": "RELEVANT", "miller": "PASS"}, replies={"angie": "bread takes a while"}
+        )
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        _agent(api, "miller", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+        _listening(api, headers, channel, "miller")
+
+        _say(api, headers, channel, "the bread is rising")
+
+        assert sorted(api.ctx.concierge.classified) == ["baker", "miller"]
+        ambient = [t for t in _turns(api, headers, channel) if t["trigger"] == "ambient"]
+        assert [t["targets"] for t in ambient] == [["baker"]]
+    api.ctx.close()
+
+
+def test_an_unprompted_answer_carries_no_authority(tmp_path: Any) -> None:
+    """Nobody asked the listener anything, so it answers without tools,
+    without handing off, and is told the message was not a request."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+
+        (call,) = api.ctx.concierge.answered("baker")
+        assert call["allow_actions"] is False
+        assert call["read_only"] is True
+        assert call["handoff"] is None
+        assert call["handoff_agents"] is None
+        assert "the bread is rising" in call["text"]
+        assert call["text"] != "the bread is rising"
+        assert "not a request" in call["text"]
+    api.ctx.close()
+
+
+def test_the_classifier_starts_fresh_every_time(tmp_path: Any) -> None:
+    """Each relevance call stands alone: no earlier verdict or transcript
+    rides along in a resumed session."""
+    api = _api(tmp_path, ambient_max_per_hour=10, pair_cooldown_s=0)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "PASS"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+        _say(api, headers, channel, "the bread is baked")
+
+        asks = _classifier_calls(api)
+        assert len(asks) == 2
+        assert all(call.get("stateless") is True for call in asks)
+    api.ctx.close()
+
+
+def test_the_classifier_runs_on_the_ambient_model(tmp_path: Any) -> None:
+    api = _api(tmp_path, ambient_model="small-cheap-model")
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "PASS"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+
+        (ask,) = _classifier_calls(api)
+        assert ask["model"] == "small-cheap-model"
+    api.ctx.close()
+
+
+def test_without_an_ambient_model_the_classifier_uses_the_concierges(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "PASS"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+
+        (ask,) = _classifier_calls(api)
+        # No override: the concierge resolves its own configured model.
+        assert ask["model"] is None
+    api.ctx.close()
+
+
+def test_an_agents_reply_can_draw_an_unprompted_answer(tmp_path: Any) -> None:
+    api = _api(tmp_path, ambient_window_messages=1)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge(
+            {"baker": "RELEVANT"}, replies={"helper": "you will need flour for the bread"}
+        )
+        headers = bearer(register(api))
+        _agent(api, "helper", [])
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "@helper what do I need this weekend")
+
+        assert api.ctx.concierge.classified == ["baker"]
+        ambient = [t for t in _turns(api, headers, channel) if t["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        assert ambient[0]["targets"] == ["baker"]
+        assert ambient[0]["author_id"] == "helper"
+    api.ctx.close()
+
+
+def test_a_listener_an_agent_names_is_answered_by_the_mention_alone(tmp_path: Any) -> None:
+    """A reply that names a listening agent queues that agent through the
+    mention. The ambient path stays out of it: no second look, no second
+    turn, no stray refusal in the audit trail."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge(
+            {"baker": "RELEVANT"}, replies={"helper": "@baker how long should it proof"}
+        )
+        headers = bearer(register(api))
+        _agent(api, "helper", [])
+        _agent(api, "baker", ["proof"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "@helper ask about the dough")
+
+        assert api.ctx.concierge.classified == []
+        baker = [t for t in _turns(api, headers, channel) if t["targets"] == ["baker"]]
+        assert [t["trigger"] for t in baker] == ["mention"]
+        events = _events(api, headers, channel)
+        assert [e for e in events if e["type"].endswith("suppressed")] == []
+    api.ctx.close()
+
+
+class _EmptyPool:
+    """A workspace budget with nothing left in it."""
+
+    def admit_turn(self, channel_id: str | None, agent_slug: str | None, now: float) -> Admission:
+        return Admission(ok=False, reason="budget", retry_at=now + 60)
+
+
+def test_a_spent_budget_keeps_an_ambient_agent_quiet(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+        api.ctx.guardrails.pool = _EmptyPool()
+
+        _say(api, headers, channel, "the bread is rising")
+
+        assert api.ctx.concierge.classified == []
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["budget"]
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()
+
+
+def test_an_ambient_turn_a_person_provoked_counts_against_the_rate_caps(
+    tmp_path: Any,
+) -> None:
+    """The caps count turns agents started, whoever wrote the message that
+    started them: an ambient answer to a person is still an agent turn."""
+    api = _api(tmp_path, channel_turns_per_window=1, ambient_max_per_hour=10, pair_cooldown_s=0)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+        _say(api, headers, channel, "the bread is baked")
+
+        turns = _turns(api, headers, channel)
+        person = next(t["author_id"] for t in turns if t["trigger"] == "human")
+        ambient = [t for t in turns if t["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        # Provoked by the person's message, not by another agent.
+        assert ambient[0]["author_id"] == person
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["channel_rate"]
     api.ctx.close()

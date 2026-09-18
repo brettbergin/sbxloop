@@ -343,6 +343,20 @@ class TestJobShape:
             concierge.submit_turn("hello", author="owner", session_key=key).result(timeout=10)
         assert [job.resume_session_id for job in client.jobs] == [None, None, "session-a"]
 
+    def test_a_stateless_turn_neither_resumes_nor_leaves_a_session(self, tmp_path: Path) -> None:
+        """A one-shot question (the ambient relevance check) carries no
+        earlier exchange and leaves nothing for the next one to resume."""
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"session_id": "one-shot-a"}, {"session_id": "one-shot-b"}, {"session_id": "kept"}],
+        )
+        for _ in range(2):
+            concierge.submit_turn(
+                "RELEVANT or PASS?", author="sbxloop", session_key="c:ambient:x", stateless=True
+            ).result(timeout=10)
+        concierge.submit_turn("hello", author="owner", session_key="c:ambient:x").result(timeout=10)
+        assert [job.resume_session_id for job in client.jobs] == [None, None, None]
+
     def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
         reply = concierge.submit_turn(

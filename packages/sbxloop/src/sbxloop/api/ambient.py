@@ -16,7 +16,8 @@ message reaches an ambient agent through three gates, cheapest first:
 3. **Relevance.** One short call on ``ambient_model`` (the concierge's model
    when unset) that answers RELEVANT or PASS. A PASS posts nothing and
    records ``collaboration.followup.suppressed`` with reason
-   ``ambient_pass``.
+   ``ambient_pass``. Each decision is recorded once, as its final outcome:
+   ``queued`` only once the turn exists.
 
 An agent never answers its own message, and one already answering the turn
 the message belongs to does not also volunteer. ``ambient = false``, the
@@ -30,6 +31,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sbxloop.api.mentions import addressed_slugs
+from sbxloop.daemon.usagepool import Admission
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
@@ -98,18 +100,18 @@ class AmbientSelector:
         participants: Callable[[str], Sequence[Any]],
         resolve: Callable[[str], AmbientAgent | None],
         recent: Callable[[str, int], Sequence[Any]],
-        admit: Callable[..., Any],
+        decide: Callable[..., Any],
         record: Callable[..., None],
         spoken_since: Callable[[str, str, float], int],
         classify: Callable[..., bool],
-        queue: Callable[..., None],
+        queue: Callable[..., bool],
         clock: Callable[[], float],
     ) -> None:
         self.config = config
         self.participants = participants
         self.resolve = resolve
         self.recent = recent
-        self.admit = admit
+        self.decide = decide
         self.record = record
         self.spoken_since = spoken_since
         self.classify = classify
@@ -132,8 +134,9 @@ class AmbientSelector:
         """Queue an ambient turn for each listening agent this message
         reaches; the slugs that will speak.
 
-        ``answering`` are the agents already taking this message's turn:
-        they are replying anyway and do not also volunteer. An agent this
+        ``answering`` are the agents already taking this message's turn, or
+        already queued by a mention of them in it: they are replying anyway
+        and do not also volunteer. An agent this
         selector has already decided about is not looked at again, so one
         turn draws at most one unprompted answer from each of them.
         """
@@ -160,19 +163,30 @@ class AmbientSelector:
             if slug not in named and not interested(agent.spec.interests, texts):
                 continue
             self.decided.add(slug)
+
+            def record(admission: Admission, slug: str = slug) -> None:
+                # Exactly one audit record per decision: the final outcome.
+                self.record(
+                    channel_id,
+                    source=author,
+                    target_slug=slug,
+                    depth=depth,
+                    trigger=AMBIENT,
+                    admission=admission,
+                )
+
             if self.spoken_since(channel_id, slug, now - HOUR_S) >= limits.ambient_max_per_hour:
-                self.record(channel_id, slug, AMBIENT_CAP, depth, now)
+                record(Admission(ok=False, reason=AMBIENT_CAP))
                 continue
-            admission = self.admit(
-                channel_id, source=author, target_slug=slug, depth=depth, trigger=AMBIENT
-            )
+            admission = self.decide(channel_id, source=author, target_slug=slug, depth=depth)
             if not getattr(admission, "ok", False):
+                record(admission)
                 continue
             if not self._relevant(channel_id, slug, agent, window):
-                self.record(channel_id, slug, AMBIENT_DECLINED, depth, now)
+                record(Admission(ok=False, reason=AMBIENT_DECLINED))
                 continue
             try:
-                self.queue(
+                accepted = self.queue(
                     author_slug=author.id or slug,
                     author_kind=author.kind,
                     channel_id=channel_id,
@@ -189,6 +203,9 @@ class AmbientSelector:
                     exc_info=True,
                 )
                 continue
+            if not accepted:
+                continue
+            record(Admission(ok=True))
             spoke.append(slug)
         return tuple(spoke)
 

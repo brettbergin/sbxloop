@@ -662,12 +662,15 @@ called); the guardrails above, with `trigger: "ambient"`, plus
 relevance call on `ambient_model` — the concierge's model when unset — that
 answers RELEVANT or PASS. A PASS posts nothing and records
 `collaboration.followup.suppressed` with reason `ambient_pass`; being over
-the hourly cap records reason `ambient_cap`. What passes all three becomes an
-ordinary turn with `trigger: "ambient"`, and its reply is an ordinary agent
-message. An agent never answers its own message, an agent already answering
-the turn does not also volunteer, and one turn draws at most one unprompted
-answer from each listening agent. `ambient = false`, the default, skips all
-of it.
+the hourly cap records reason `ambient_cap`. Each decision is recorded once,
+as its final outcome: `queued` only once the turn exists. What passes all
+three becomes a turn with `trigger: "ambient"`, and its reply is an ordinary
+agent message; the turn runs read-only with no actions and no handoff, since
+nobody asked for it. The relevance call is one-shot and resumes no session.
+An agent never answers its own message, an agent already answering the turn
+or named in the message does not also volunteer, and each message is looked
+at once, by the turn that posted it. `ambient = false`, the default, skips
+all of it.
 
 A person has the last word over all of it:
 

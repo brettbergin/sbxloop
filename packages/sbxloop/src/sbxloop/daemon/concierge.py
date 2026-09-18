@@ -235,6 +235,8 @@ class TurnContext:
     channel_id: str | None = None
     work_lead: str | None = None
     work_roles: Mapping[str, str] = field(default_factory=dict)
+    #: A one-shot call: it resumes no session and leaves none behind.
+    stateless: bool = False
     work_products: list[str] = field(default_factory=list)
     #: The sandbox generation of the turn's last session call, so a failure
     #: is blamed on the box it happened in.
@@ -615,6 +617,7 @@ class Concierge:
         channel_tools: Sequence[AgentTool] = (),
         work_lead: str | None = None,
         work_roles: Mapping[str, str] | None = None,
+        stateless: bool = False,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -633,7 +636,10 @@ class Concierge:
         the tools that start managed work, so the turn can only reply.
         ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
         this turn starts is admitted with: the channel it answers to, the
-        lead and the agent per run role (already checked by the caller)."""
+        lead and the agent per run role (already checked by the caller).
+        ``stateless`` makes the turn a one-shot call: it resumes no stored
+        session for ``session_key`` and records none, so nothing it says
+        reaches a later turn."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -672,6 +678,7 @@ class Concierge:
                 channel_id=channel_id,
                 work_lead=work_lead,
                 work_roles=dict(work_roles or {}),
+                stateless=stateless,
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -809,7 +816,9 @@ class Concierge:
             self.reset_session(session_key)
         self._update_turn(model=selection)
         session_id, turns = self._session(session_key)
-        if turns >= self.config.concierge.session_turns:
+        if self._turn.stateless:
+            session_id, turns = None, 0
+        elif turns >= self.config.concierge.session_turns:
             log.info("concierge.session_rotated", turns=turns)
             session_id, turns = None, 0
         started = time.monotonic()
@@ -841,7 +850,7 @@ class Concierge:
             except SbxloopError as exc2:
                 return self._error_reply(exc2, started)
         new_session, output = reply
-        if new_session:
+        if new_session and not self._turn.stateless:
             self.dstore.set_value(
                 self._session_state_key(STATE_SESSION_ID, session_key), new_session
             )
