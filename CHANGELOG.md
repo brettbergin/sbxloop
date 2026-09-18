@@ -12,7 +12,20 @@ with the channel's latest summary, written after a turn settles by one
 tool-less call on the concierge's model. Agents answering in a channel get
 `read_channel_artifact`, which reads a file that channel can see -- for
 read-only roles too -- refuses one from anywhere else, truncates with a marker
-naming the next offset, and never hands back bytes that are not text.
+naming the next offset, and never hands back bytes that are not text. Each
+channel is summarised in a session of its own, so no channel's transcript is
+resumed into another's summary; the summary covers exactly the messages the
+model was shown, and is written whenever the history window trims, on the
+character budget as well as the message count. Compaction runs on its own
+thread with a bounded wait, so a slow model never holds a channel's turn lane.
+Once a channel has a summary it is rewritten per batch (50 messages or 20,000
+characters fallen out), not per turn; only the newest summary row is kept, and
+the call's usage is charged to the channel it summarises. Shutting down abandons a summary
+the model has not answered and waits for one that is writing, so no compaction
+touches the store after it closes.
+The channel content route serves the channel's own files and nothing else: a
+catalogued file of a run the channel started but never delivered there, such as
+a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 

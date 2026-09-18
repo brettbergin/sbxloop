@@ -14,6 +14,10 @@ from sbxloop.daemon.concierge import ConciergeReply
 class FakeConcierge:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.resets: list[str | None] = []
+
+    def reset_session(self, session_key: str | None = None) -> None:
+        self.resets.append(session_key)
 
     def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
         self.calls.append({"text": text, **kwargs})

@@ -24,6 +24,8 @@ from typing import Any, ClassVar
 
 import pytest
 
+from sbxloop.agents.tools import AgentTool
+from sbxloop.api.channel_artifacts import TOOL_NAME as CHANNEL_READ_TOOL
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import (
     CONCIERGE_AGENT,
@@ -44,6 +46,7 @@ from sbxloop_worker.protocol import (
     ErrorInfo,
     HostToolCall,
     HostToolResponse,
+    HostToolSpec,
     JobRequest,
     JobResult,
 )
@@ -2383,6 +2386,53 @@ class TestMemoryStaysOutOfTheDaemonLog:
         assert "concierge.tool" in quoted and "recall" in quoted
         assert self.SECRET not in quoted and "Marisol" not in quoted
         assert "redacted query" in quoted
+
+
+class TestChannelToolsInTheRoster:
+    """The channel's own tools reach the turn, and a read-only role keeps
+    the ones that only read (plan S-P15).
+
+    ``ApiContext`` hands ``channel_tools`` to every participant, critics
+    included, and the roster's allowlist decides what a critic or a
+    read-only turn is actually offered. The behaviour lives in
+    :meth:`Concierge._chat_tools`, so it is pinned here rather than by
+    calling the tool's implementation directly.
+    """
+
+    @staticmethod
+    def _tool(name: str) -> AgentTool:
+        return AgentTool(
+            HostToolSpec(
+                name=name,
+                description="a tool over the turn's channel",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            lambda args: "ok",
+        )
+
+    def _offered(self, tmp_path: Path, **kwargs: Any) -> list[str]:
+        concierge, client, *_ = make(tmp_path, [{}])
+        concierge.submit_turn(
+            "review the delivered file",
+            author="Discord user `brett`",
+            channel_tools=(self._tool(CHANNEL_READ_TOOL), self._tool("rewrite_channel_artifact")),
+            **kwargs,
+        ).result(timeout=10)
+        return [spec.name for spec in client.jobs[0].host_tools]
+
+    def test_a_critic_is_offered_the_channel_s_read_tool(self, tmp_path: Path) -> None:
+        offered = self._offered(tmp_path, agent_role="critic")
+        assert CHANNEL_READ_TOOL in offered
+
+    def test_a_read_only_turn_is_offered_it_too(self, tmp_path: Path) -> None:
+        offered = self._offered(tmp_path, read_only=True)
+        assert CHANNEL_READ_TOOL in offered
+
+    def test_an_unlisted_channel_tool_stays_out_of_a_critic_s_roster(self, tmp_path: Path) -> None:
+        # The allowlist is what keeps a reviewer read-only: a channel tool
+        # nobody vouched for is not offered just because it was handed in.
+        assert "rewrite_channel_artifact" not in self._offered(tmp_path, agent_role="critic")
+        assert "rewrite_channel_artifact" in self._offered(tmp_path)
 
 
 class TestWatchRun:

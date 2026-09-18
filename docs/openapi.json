@@ -8455,7 +8455,7 @@
     },
     "/v1/channels/{channel_id}/artifacts/{artifact_id}/content": {
       "get": {
-        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel: a file this channel does not carry is\n``404`` whatever else the caller may read, so an id from elsewhere\nnever leaks through here.",
+        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel's own file list: a file this channel does\nnot carry is ``404`` whatever else the caller may read -- including a\ncatalogued file of a run the channel started but never delivered here,\nsuch as a code run's checkout -- so an id from elsewhere never leaks\nthrough here.",
         "operationId": "download_channel_artifact_v1_channels__channel_id__artifacts__artifact_id__content_get",
         "parameters": [
           {
