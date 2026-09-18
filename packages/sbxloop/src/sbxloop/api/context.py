@@ -44,8 +44,8 @@ from sbxloop.api.channel_posts import ApiChannelPoster
 from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
-    ChannelLink,
     Author,
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
@@ -733,8 +733,9 @@ class ApiContext:
             model = definition.agent.spec.model if definition and definition.agent else None
             # A named agent acts in its own persona, so it keeps its tools;
             # whether it may start work with them is the intent's business,
-            # not the mention's.
-            start_work = intent in START_WORK_INTENTS
+            # not the mention's. A turn another agent started never starts
+            # work, whatever intent it carries.
+            start_work = intent in START_WORK_INTENTS and source_agent is None
             allow_actions = start_work or definition is not None
             if intent in _RUNNER_INTENT:
                 persona += _RUNNER_INTENT[intent]
