@@ -224,12 +224,12 @@ def test_a_post_hangs_on_the_turn_that_asked_for_the_work(api: Any) -> None:
         )
 
     _post("r1:plan", asked["input_message_id"])
-    # A run nobody asked for in a message has no turn of its own, and falls
-    # back to the channel's most recent.
-    _post("r1:plan:anonymous", None)
+    # A post that names no message still finds the turn that asked for its
+    # work through the item, and never the channel's newest turn.
+    _post("r1:plan:unnamed", None)
 
     posted = _messages(api, headers, channel)
-    assert [m["work"]["turn_id"] for m in posted] == [asked["id"], newest["id"]]
+    assert [m["work"]["turn_id"] for m in posted] == [asked["id"], asked["id"]]
 
 
 def test_the_poster_knows_what_a_run_already_posted(api: Any) -> None:
