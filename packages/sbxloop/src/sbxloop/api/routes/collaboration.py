@@ -19,7 +19,7 @@ from sbxloop.api.auth.deps import (
     require,
 )
 from sbxloop.api.auth.store import AuthError
-from sbxloop.api.channel_artifacts import resolve as resolve_channel_artifact
+from sbxloop.api.channel_artifacts import attached as attached_channel_artifact
 from sbxloop.api.collaboration import (
     ArtifactRef,
     Author,
@@ -1449,14 +1449,16 @@ async def download_channel_artifact(
 ) -> StreamingResponse:
     """The bytes of one of the channel's files, as an attachment.
 
-    Resolved through the channel: a file this channel does not carry is
-    ``404`` whatever else the caller may read, so an id from elsewhere
-    never leaks through here.
+    Resolved through the channel's own file list: a file this channel does
+    not carry is ``404`` whatever else the caller may read -- including a
+    catalogued file of a run the channel started but never delivered here,
+    such as a code run's checkout -- so an id from elsewhere never leaks
+    through here.
     """
     channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    artifact = await ctx.call(resolve_channel_artifact, ctx, channel_id, artifact_id)
+    artifact = await ctx.call(attached_channel_artifact, ctx, channel_id, artifact_id)
     if artifact is None:
         raise Problem(404, "artifact_not_found", "artifact not found")
     return await stream_artifact(ctx, artifact.id)

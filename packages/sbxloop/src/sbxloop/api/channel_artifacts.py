@@ -79,8 +79,31 @@ def _as_text(chunk: bytes) -> str | None:
     return None
 
 
+def attached(ctx: ApiContext, channel_id: str, artifact_id: str) -> Artifact | None:
+    """The catalogued file, when a message in this channel carries it.
+
+    What the channel's own routes serve: exactly the files its file list
+    names, so ``GET .../artifacts`` and ``GET .../artifacts/{id}/content``
+    cannot disagree. A run linked to the channel is deliberately not enough
+    here -- a code run's whole checkout is catalogued and none of it is the
+    channel's, so a channel reader holding no ``artifacts:read`` would
+    otherwise reach it.
+    """
+    artifact = ctx.artifacts.get(artifact_id)
+    if artifact is None:
+        return None
+    return artifact if ctx.collaboration.artifact_attached(channel_id, artifact.id) else None
+
+
 def resolve(ctx: ApiContext, channel_id: str, artifact_id: str) -> Artifact | None:
-    """The catalogued file, when this channel is allowed to see it."""
+    """The catalogued file, when this channel is allowed to see it.
+
+    Wider than :func:`attached` by one case, and only for the in-turn tool:
+    a run the channel itself admitted is part of its shared context before
+    its result message lands, so an agent answering there can read what it
+    produced. The file still has to be named by an id the conversation
+    already carries.
+    """
     artifact = ctx.artifacts.get(artifact_id)
     if artifact is None:
         return None
@@ -177,6 +200,7 @@ def channel_artifact_tools(ctx: ApiContext, channel_id: str) -> list[AgentTool]:
 __all__ = [
     "READ_LIMIT_MAX",
     "TOOL_NAME",
+    "attached",
     "channel_artifact_tools",
     "read_channel_artifact",
     "resolve",

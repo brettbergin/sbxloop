@@ -319,8 +319,10 @@ carry, newest message first, as `{"data": [...]}`, and
 `GET /v1/channels/{id}/artifacts/{artifact_id}/content` serves one file's
 bytes as an attachment. Both take `collaboration:read` and channel read
 permission rather than `artifacts:read`, so a workspace member who can read
-the channel can read the files delivered into it. A file the channel does not
-carry is `404` there whatever else the caller may read.
+the channel can read the files delivered into it. Both resolve through that
+same list, so a file the channel does not carry is `404` there whatever else
+the caller may read -- including a catalogued file of a run the channel started
+but never delivered here, such as a code run's checkout.
 `GET /v1/runs/{id}/artifacts`, `GET /v1/artifacts/{id}` and
 `GET /v1/artifacts/{id}/content` are unchanged and still take
 `artifacts:read`. The channel routes are advertised as
@@ -342,9 +344,17 @@ A turn's prompt carries the channel's history as one JSON object per line:
 bounded to 200 messages and 60,000 characters. When anything is dropped, the
 history opens with a `channel_summary` line holding the channel's latest
 summary, so the earlier conversation is compacted rather than lost. The
-summary is written after a turn settles by one tool-less call on the
-concierge's own model (`[concierge] model`); it is best effort, and a channel
-without one simply gets a shorter history.
+summary is written after a turn settles -- on its own thread, not in the
+turn's lane, and with a bounded wait -- by one tool-less call on the
+concierge's own model (`[concierge] model`), in a session belonging to that
+channel alone. It covers exactly the messages that call was shown, so a
+backlog too large for one excerpt is summarised over several compactions.
+The first summary is written as soon as the history trims; after that it is
+rewritten once 50 messages or 20,000 characters have fallen out since, not on
+every turn, so the few messages between the summary and the window wait for
+the next batch. Only the newest summary is kept, and its model call is charged
+to the channel. It is best effort, and a channel without a summary simply gets
+a shorter history.
 
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
