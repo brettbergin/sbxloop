@@ -16,7 +16,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -3897,6 +3897,56 @@ class LeasingHost(FakeHost):
                 self.free.append(client)
 
 
+class HeldClient:
+    """A WorkerClient stand-in that answers at once, except for an ask
+    starting with ``hold``, which it holds until ``release`` is set."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.holding = threading.Event()
+        self.asks: list[str] = []
+        self.lock = threading.Lock()
+
+    def submit(self, job: JobRequest, **_: Any) -> JobResult:
+        assert job.prompt is not None
+        # The ask is the last line of the prompt the concierge builds.
+        ask = job.prompt.splitlines()[-1]
+        with self.lock:
+            self.asks.append(ask)
+        if ask.startswith("hold"):
+            self.holding.set()
+            assert self.release.wait(timeout=20), "the held job was never released"
+        return JobResult(job_id=job.job_id, status="ok", output_text=f"done {ask}")
+
+
+class SecondSubmitterFirst:
+    """Wraps the concierge's pool so that the first caller to hand it a turn
+    is let through only once the second caller has been, or after a second:
+    the interleaving two chat bridges, each on its own thread, can hit."""
+
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+        self.first_submitting = threading.Event()
+        self.second_submitted = threading.Event()
+        self.calls = 0
+        self.lock = threading.Lock()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        with self.lock:
+            self.calls += 1
+            first = self.calls == 1
+        if first:
+            self.first_submitting.set()
+            self.second_submitted.wait(timeout=1)
+            return self.pool.submit(fn, *args, **kwargs)
+        future = self.pool.submit(fn, *args, **kwargs)
+        self.second_submitted.set()
+        return future
+
+    def shutdown(self, *args: Any, **kwargs: Any) -> None:
+        self.pool.shutdown(*args, **kwargs)
+
+
 class TestConcurrentTurns:
     def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
         assert Config.model_validate({}).concierge.max_concurrent_turns == 1
@@ -4025,6 +4075,103 @@ class TestConcurrentTurns:
         finally:
             concierge.close()
         assert replies == ["done ask bridge", "done ask channel"]
+
+    def test_a_turn_waiting_in_its_lane_leaves_the_pool_to_other_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        """Two bridge turns share the default lane; the second waits for the
+        first, but not on a worker: a product channel's turn submitted after
+        both is answered while the first is still running."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        futures: list[Future[ConciergeReply]] = []
+        try:
+            futures = [
+                concierge.submit_turn("hold bridge a", author="a"),
+                concierge.submit_turn("ask bridge b", author="b"),
+                concierge.submit_turn("ask channel", author="c", session_key="channel-1:angie"),
+            ]
+            assert futures[2].result(timeout=5).text == "done ask channel"
+            assert not futures[0].done() and not futures[1].done()
+            client.release.set()
+            assert [future.result(timeout=20).text for future in futures[:2]] == [
+                "done hold bridge a",
+                "done ask bridge b",
+            ]
+        finally:
+            client.release.set()
+            concierge.close()
+        # The two sessions overlap, so only the bridge lane's order is fixed.
+        assert [ask for ask in client.asks if "bridge" in ask] == ["hold bridge a", "ask bridge b"]
+        assert sorted(client.asks) == ["ask bridge b", "ask channel", "hold bridge a"]
+
+    def test_bridge_turns_from_two_threads_are_all_answered_at_width_one(
+        self, tmp_path: Path
+    ) -> None:
+        """The local console and a configured bridge each submit from their
+        own thread into the one default lane. Whichever reaches the pool
+        first, both turns are answered, in the order they joined the lane."""
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        pool = SecondSubmitterFirst(concierge._executor)
+        concierge._executor = pool  # type: ignore[assignment]
+        futures: dict[str, Future[ConciergeReply]] = {}
+
+        def ask(name: str) -> None:
+            futures[name] = concierge.submit_turn(f"ask {name}", author=name)
+
+        first = threading.Thread(target=ask, args=("local",))
+        second = threading.Thread(target=ask, args=("mattermost",))
+        try:
+            first.start()
+            assert pool.first_submitting.wait(timeout=5)
+            second.start()
+            first.join(timeout=10)
+            second.join(timeout=10)
+            replies = [futures[name].result(timeout=10).text for name in ("local", "mattermost")]
+        finally:
+            concierge.close()
+        assert replies == ["done ask local", "done ask mattermost"]
+        assert client.asks == ["ask local", "ask mattermost"]
+
+    def test_a_cancelled_turn_gives_its_lane_place_to_the_next(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn(name, author="x") for name in ("hold a", "ask b", "ask c")
+            ]
+            assert futures[1].cancel()
+            client.release.set()
+            assert futures[2].result(timeout=20).text == "done ask c"
+        finally:
+            client.release.set()
+            concierge.close()
+        assert futures[1].cancelled()
+        assert client.asks == ["hold a", "ask c"]
+        # The bridge tells a newcomer how many turns are ahead of theirs; a
+        # cancelled one is no longer among them.
+        assert concierge.pending == 0
+
+    def test_closing_cancels_the_turns_still_waiting_in_a_lane(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        futures = [concierge.submit_turn(name, author="x") for name in ("hold a", "ask b")]
+        try:
+            assert client.holding.wait(timeout=10)
+            concierge.close()
+            with pytest.raises(CancelledError):
+                futures[1].result(timeout=5)
+        finally:
+            client.release.set()
+        assert futures[0].result(timeout=20).text == "done hold a"
+        assert client.asks == ["hold a"]
 
     def test_turns_run_one_at_a_time_at_width_one(self, tmp_path: Path) -> None:
         concierge, _, host, _, _ = make(
