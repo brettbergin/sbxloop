@@ -114,6 +114,7 @@ from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
+    ConfigError,
     ProvisionError,
     RunCancelledError,
     SbxError,
@@ -4329,6 +4330,19 @@ class DaemonLoop:
         source = source.resolve()
         return source if hostgit.repo_toplevel(source) == source else None
 
+    def _configured_clone_url(self, repo: str | None) -> str | None:
+        """``repo``'s clone URL on its configured forge -- the address its
+        credential is scoped to -- or ``None`` when there is no repository
+        or no URL can be built for it (the refresh then fetches ``origin``
+        as it points)."""
+        if repo is None:
+            return None
+        entry = self.config.github.find_repo(repo)
+        try:
+            return self.config.clone_url_for_repo(entry.repo if entry is not None else repo)
+        except ConfigError:
+            return None
+
     def _ensure_workspace(self, repo: str | None) -> None:
         """Clone ``repo`` into the home's ``workspaces/<owner>/<name>`` the
         first time it is needed, when the operator pointed the daemon at no
@@ -4404,6 +4418,13 @@ class DaemonLoop:
         and every chat ask posted a refresh failure. The first-use clone
         stays keyed on the item's own repository; a repo-less item never
         starts one.
+
+        A checkout whose ``origin`` names the repository at another address
+        than the configured forge (cloned under an older hostname, scheme or
+        port) is fetched from the configured forge, where the credential is
+        scoped: fetched from ``origin`` it went out anonymously, and a
+        private GitLab answered with a username prompt the daemon cannot
+        give, so every run started from a stale HEAD.
         """
         resolved = repo
         if resolved is None:
@@ -4457,7 +4478,10 @@ class DaemonLoop:
                 else None
             )
             result = hostgit.refresh_from_origin(
-                source, token=token, credential_url=self.config.forge_web_url(repo)
+                source,
+                token=token,
+                credential_url=self.config.forge_web_url(repo),
+                repo_url=self._configured_clone_url(repo),
             )
         except ProvisionError as exc:
             self._notice(

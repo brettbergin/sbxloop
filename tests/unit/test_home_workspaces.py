@@ -20,7 +20,9 @@ from sbxloop.errors import ProvisionError
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
+from tests.fakes.gitserver import PrivateGitServer, bare_from
 from tests.unit.test_daemon_loop import FakeSource
+from tests.unit.test_hostgit import git, make_repo
 
 
 def bare_remote(tmp_path: Path, name: str = "origin.git") -> Path:
@@ -141,7 +143,9 @@ class TestDaemonClonesOnFirstUse:
 
         monkeypatch.setattr(hostgit, "refresh_from_origin", refresh)
         loop._refresh_workspace(repo)
-        assert calls == [(checkout, {"token": token, "credential_url": origin})]
+        assert calls == [
+            (checkout, {"token": token, "credential_url": origin, "repo_url": f"{origin}/{repo}"})
+        ]
 
     def test_a_repoless_item_refreshes_the_sole_repository_with_its_credential(
         self, tmp_path, monkeypatch
@@ -178,7 +182,14 @@ class TestDaemonClonesOnFirstUse:
         # daemon's own issue runs are what populate the home's checkout.
         assert ensured == [None]
         assert calls == [
-            (checkout, {"token": "gitlab-token", "credential_url": "http://forge.example:8929"})
+            (
+                checkout,
+                {
+                    "token": "gitlab-token",
+                    "credential_url": "http://forge.example:8929",
+                    "repo_url": "http://forge.example:8929/o/n",
+                },
+            )
         ]
 
     def test_a_repoless_item_on_a_multi_repo_daemon_refreshes_nothing(self, tmp_path, monkeypatch):
@@ -199,6 +210,56 @@ class TestDaemonClonesOnFirstUse:
         monkeypatch.setattr(hostgit, "refresh_from_origin", lambda *a, **k: calls.append(a))
         loop._refresh_workspace(None)
         assert calls == []
+
+    def test_gitlab_checkout_with_a_moved_origin_refreshes_from_the_forge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The home's GitLab checkout names its repository at an origin other
+        than the configured forge (cloned under an older address). The token
+        the host holds is scoped to the configured forge, so a plain
+        ``git fetch origin`` was anonymous and failed with "could not read
+        Username", leaving every run on a stale HEAD. The refresh now reaches
+        the repository through the configured forge and advances."""
+        token = "TEST_ONLY_GITLAB_CREDENTIAL_52c1"
+        with (
+            PrivateGitServer(
+                tmp_path / "forge", username="x-access-token", token=token, tls=False
+            ) as forge,
+            PrivateGitServer(
+                tmp_path / "moved", username="x-access-token", token=token, tls=False
+            ) as moved,
+        ):
+            loop, home = self.make_loop(tmp_path)
+            loop.config = Config.model_validate(
+                {
+                    "home": str(home.root),
+                    "vcs": {"kind": "gitlab", "api_url": f"{forge.url}/api/v4"},
+                    "github": {"repo": "group/project"},
+                }
+            )
+            loop.github = SimpleNamespace(
+                provisioner=Provisioner(SbxCLI(), loop.config, env={"GITLAB_TOKEN": token})
+            )
+            source = make_repo(tmp_path, "source")
+            remote = bare_from(source, forge.root, "group/project")
+            bare_from(source, moved.root, "group/project")
+            checkout = home.workspaces / "group" / "project"
+            before = hostgit.clone_workspace(f"{forge.url}/group/project", checkout, token=token)
+            git("remote", "set-url", "origin", f"{moved.url}/group/project", cwd=checkout)
+            (source / "next.txt").write_text("new upstream work\n")
+            git("add", ".", cwd=source)
+            git("commit", "-m", "advance upstream", cwd=source)
+            git("push", str(remote), "main", cwd=source)
+            notices: list[tuple[str, str]] = []
+            monkeypatch.setattr(
+                loop, "_notice", lambda kind, text, **kw: notices.append((kind, text))
+            )
+
+            loop._refresh_workspace("group/project")
+
+            assert [kind for kind, _ in notices] == ["workspace.refreshed"], notices
+            assert hostgit.head_commit(checkout) == hostgit.head_commit(source) != before
+            assert all(value is None for value in moved.requests)
 
     @pytest.mark.parametrize("empty_directory", [False, True])
     @pytest.mark.parametrize("repo", ["o/n", "group/subgroup/project"])

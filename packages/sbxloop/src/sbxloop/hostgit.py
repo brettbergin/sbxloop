@@ -131,6 +131,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from git import (
     Git,
@@ -1513,8 +1514,56 @@ def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
     ) from last
 
 
+def _forge_fetch_url(
+    remote_url: str, *, token: str | None, credential_url: str, repo_url: str | None
+) -> str | None:
+    """The configured clone URL to fetch in place of ``remote_url``, or
+    ``None`` to fetch the remote where it points.
+
+    Only for a remote the token cannot reach: an HTTP(S) URL that names the
+    configured repository (``repo_url``) at another origin than the one the
+    credential is scoped to -- a checkout cloned under an older hostname,
+    scheme or port. Fetched where it points, git asks that origin for a
+    username with prompts off and the refresh fails; the configured forge
+    is where the repository's credential is good. A remote that names
+    another repository, that is not HTTP(S) (SSH keeps the host's own
+    configuration), or that carries its own credentials is left alone.
+    """
+    if not token or not repo_url:
+        return None
+    try:
+        remote = urlsplit(remote_url)
+    except ValueError:
+        return None
+    if remote.scheme not in ("http", "https") or remote.username or remote.password:
+        return None
+    scope = gitcredentials.authority(credential_url)
+    if not scope or gitcredentials.authority(remote_url) == scope:
+        return None
+    if gitcredentials.authority(repo_url) != scope:
+        return None
+    expected = normalise_repo_url(repo_url)
+    if expected is None or normalise_repo_url(remote_url) != expected:
+        return None
+    return repo_url
+
+
+def _remote_fetch_refspecs(repo: Repo, remote_name: str) -> list[str]:
+    """The remote's configured fetch refspecs, so a fetch by URL updates the
+    same tracking refs a fetch by name would."""
+    try:
+        configured = repo.git.config("--get-all", f"remote.{remote_name}.fetch").splitlines()
+    except GitCommandError:
+        configured = []
+    return configured or [f"+refs/heads/*:refs/remotes/{remote_name}/*"]
+
+
 def refresh_from_origin(
-    repo_path: Path, *, token: str | None = None, credential_url: str = ""
+    repo_path: Path,
+    *,
+    token: str | None = None,
+    credential_url: str = "",
+    repo_url: str | None = None,
 ) -> RefreshResult:
     """``git fetch`` and fast-forward the checked-out branch to its
     upstream, so an unattended run starts from current ``<remote>/<branch>``
@@ -1527,7 +1576,12 @@ def refresh_from_origin(
     HTTP(S) authentication uses the selected repository's token, scoped to
     the operator's ``credential_url`` rather than the checkout's remote.
     Like cloning, fetching disables prompts and ambient credential helpers;
-    SSH authentication continues to use the host's SSH configuration.
+    SSH authentication continues to use the host's SSH configuration. When
+    the tracked remote names the configured repository (``repo_url``) at
+    another HTTP(S) origin, the token cannot answer there, so the
+    repository is fetched from ``repo_url`` into the same tracking refs
+    (:func:`_forge_fetch_url`); the checkout's remote configuration is not
+    changed.
 
     Strictly non-destructive: fast-forward only. A detached HEAD, a branch
     with no upstream, a diverged local branch, or a working tree whose
@@ -1548,11 +1602,34 @@ def refresh_from_origin(
             remote_name = tracking.remote_name if tracking is not None else "origin"
             if remote_name not in remotes:
                 return RefreshResult(False, before, before, f"{repo_path}: no {remote_name} remote")
+            remote = repo.remote(remote_name)
+            env = _clone_env(token, credential_url=credential_url)
+            forge_url = _forge_fetch_url(
+                remote.url, token=token, credential_url=credential_url, repo_url=repo_url
+            )
             try:
-                repo.remote(remote_name).fetch(env=_clone_env(token, credential_url=credential_url))
+                if forge_url is None:
+                    remote.fetch(env=env)
+                else:
+                    log.info(
+                        "workspace.refresh_via_forge",
+                        path=str(repo_path),
+                        remote=remote_name,
+                        remote_url=public_remote_url(remote.url),
+                        forge_url=forge_url,
+                        hint=(
+                            f"{remote_name} points at another address than the configured "
+                            f"forge; `git -C {repo_path} remote set-url {remote_name} "
+                            f"{forge_url}` makes them agree"
+                        ),
+                    )
+                    repo.git.fetch(
+                        "--", forge_url, *_remote_fetch_refspecs(repo, remote_name), env=env
+                    )
             except GitCommandError as exc:
+                via = "" if forge_url is None else f" (through {forge_url})"
                 raise ProvisionError(
-                    f"git fetch {remote_name} failed in {repo_path}: {_describe(exc)}"
+                    f"git fetch {remote_name}{via} failed in {repo_path}: {_describe(exc)}"
                 ) from exc
             if not on_branch:
                 why = "unborn HEAD" if before is None else "detached HEAD"

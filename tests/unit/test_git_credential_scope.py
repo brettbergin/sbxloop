@@ -149,6 +149,79 @@ def test_refresh_never_sends_configured_token_to_foreign_tracking_remote(tmp_pat
         assert foreign.requests and all(value is None for value in foreign.requests)
 
 
+def test_refresh_fetches_a_moved_origin_from_the_configured_forge(tmp_path: Path):
+    """A checkout whose origin names the configured repository at another
+    HTTP(S) origin (an old hostname, a different scheme or port) gets no
+    credential there -- the token is scoped to the configured forge. The
+    refresh fetches that repository from the configured forge instead, so
+    the run starts from current upstream, and the other origin never sees
+    the token."""
+    with (
+        PrivateGitServer(
+            tmp_path / "forge", username="x-access-token", token=TOKEN, tls=False
+        ) as forge,
+        PrivateGitServer(
+            tmp_path / "moved", username="x-access-token", token=TOKEN, tls=False
+        ) as moved,
+    ):
+        source = make_repo(tmp_path, "source")
+        remote = bare_from(source, forge.root, "group/project")
+        bare_from(source, moved.root, "group/project")
+        target = tmp_path / "checkout"
+        before = hostgit.clone_workspace(f"{forge.url}/group/project", target, token=TOKEN)
+        git("remote", "set-url", "origin", f"{moved.url}/group/project.git", cwd=target)
+        (source / "next.txt").write_text("new upstream work\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "advance upstream", cwd=source)
+        git("push", str(remote), "main", cwd=source)
+        forge.requests.clear()
+
+        result = hostgit.refresh_from_origin(
+            target,
+            token=TOKEN,
+            credential_url=forge.url,
+            repo_url=f"{forge.url}/group/project",
+        )
+
+        assert result.advanced
+        assert result.before == before
+        assert result.after == hostgit.head_commit(source)
+        assert any(value is not None for value in forge.requests)
+        assert all(value is None for value in moved.requests)
+        config = (target / ".git/config").read_text()
+        assert f"{moved.url}/group/project.git" in config  # the operator's remote is untouched
+        assert TOKEN not in config + repr(result)
+
+
+def test_refresh_keeps_a_foreign_repository_on_its_own_remote(tmp_path: Path):
+    """Only the configured repository is fetched from the configured forge:
+    a tracking remote naming another repository is fetched where it points,
+    unauthenticated, exactly as before."""
+    with (
+        PrivateGitServer(
+            tmp_path / "foreign", username="x-access-token", token=TOKEN, tls=False
+        ) as foreign,
+        PrivateGitServer(
+            tmp_path / "forge", username="x-access-token", token=TOKEN, tls=False
+        ) as forge,
+    ):
+        source = make_repo(tmp_path, "source")
+        git("remote", "add", "upstream", f"{foreign.url}/other/project.git", cwd=source)
+        git("config", "branch.main.remote", "upstream", cwd=source)
+        git("config", "branch.main.merge", "refs/heads/main", cwd=source)
+
+        with pytest.raises(ProvisionError, match="git fetch upstream failed"):
+            hostgit.refresh_from_origin(
+                source,
+                token=TOKEN,
+                credential_url=forge.url,
+                repo_url=f"{forge.url}/group/project",
+            )
+
+        assert foreign.requests and all(value is None for value in foreign.requests)
+        assert not forge.requests
+
+
 @pytest.mark.parametrize("host", ["ghe.example.invalid", "ghe.example.invalid:8443"])
 def test_enterprise_authority_is_explicit_and_does_not_grant_dotcom(
     tmp_path: Path, host: str

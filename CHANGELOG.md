@@ -641,6 +641,22 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A checkout whose `origin` points at an old address for the repository
+  refreshes again.** The token the daemon fetches with is scoped to the
+  forge's configured origin (`[vcs] api_url`, or `[github] api_url`). A home
+  checkout cloned under another hostname, scheme or port kept that address
+  as `origin`, so `git fetch origin` went out with no credential, a private
+  GitLab answered with a username prompt ("could not read Username ...
+  terminal prompts disabled"), and every run started from a stale local
+  HEAD. When the tracked remote is HTTP(S) and names the configured
+  repository at another origin, the refresh now fetches it from the
+  configured forge into the same tracking refs and logs
+  `workspace.refresh_via_forge` with the `git remote set-url` that makes
+  the two agree. The checkout's remote configuration is not changed, the
+  other origin never receives the token, and a remote naming a different
+  repository, an SSH remote or a URL carrying its own credentials is
+  fetched where it points, as before.
+
 - **`doctor --deep` no longer reports a sandbox reaching the remote API
   when nothing got through.** The `api-host-unreachable` probe counted any
   accepted connection as reachable, and sbx accepts connections its
