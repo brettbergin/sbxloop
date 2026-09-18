@@ -565,6 +565,15 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **`doctor --deep` no longer reports a sandbox reaching the remote API
+  when nothing got through.** The `api-host-unreachable` probe counted any
+  accepted connection as reachable, and sbx accepts connections its
+  network policy then closes unanswered, so on sbx 0.43 it drifted with
+  the API out of reach. It now counts the API as reachable only when the API's own
+  `/health/live` answer comes back, tried directly and through the
+  sandbox's proxy, and it also tries `host.docker.internal` and the
+  `[api] bind` address on `[api] port`, which it never did before.
+
 - **A runner's result in a conversation is credited to Angie.** A code
   or workload turn names no participant, so the `work_result` message and
   its work snapshot were stored with no author and clients showed an
