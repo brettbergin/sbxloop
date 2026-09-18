@@ -244,11 +244,6 @@ class TurnContext:
 
 
 #: Who ``handoff_agent`` may address when the turn does not say.
-#: The host tools that start managed work, withheld from a turn that may
-#: only reply (a conversation that mentions an agent).
-_WORK_STARTERS = frozenset(
-    {"start_workload", "start_entrygraph", "create_schedule", "create_issue", "label_issue_for_run"}
-)
 _HANDOFF_BUILTINS = ("concierge", "planner", "builder", "critic", "operator")
 
 _CURRENT_TURN: ContextVar[TurnContext | None] = ContextVar("sbxloop_concierge_turn", default=None)
@@ -1254,8 +1249,10 @@ class Concierge:
             else offered
         )
         if not self._turn_start_work:
+            # A turn that may only reply (a conversation that mentions an
+            # agent) keeps its read tools but none that start managed work.
             available = {
-                name: tool for name, tool in available.items() if name not in _WORK_STARTERS
+                name: tool for name, tool in available.items() if name not in UNGUARDED_START_TOOLS
             }
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]
@@ -1308,6 +1305,10 @@ class Concierge:
             for name in UNGUARDED_START_TOOLS:
                 available.pop(name, None)
         for tool in self._turn_agent_tools:
+            if not self._turn_start_work and tool.spec.name in WORK_TOOL_NAMES:
+                # A turn that may only reply gets none of an agent's own
+                # start tools either, whatever its can_start declares.
+                continue
             # Adapted to the roster's (args, by) shape; the agent acts as
             # itself, so who asked does not change what it keeps.
             available[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))

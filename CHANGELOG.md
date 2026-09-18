@@ -92,8 +92,9 @@ naming the next offset, and never hands back bytes that are not text.
   joins it to the channel. A conversation that mentions an agent keeps
   that agent's read tools but not the ones that start managed work
   (`start_workload`, `start_entrygraph`, `create_schedule`, `create_issue`,
-  `label_issue_for_run`), so a reply is the only outcome it can have, and
-  the agent says which mode to pick when the ask needs work. Turns that may
+  `label_issue_for_run`, nor an agent's own `start_run` and `file_issue`
+  whatever its `can_start` declares), so a reply is the only outcome it
+  can have, and the agent says which mode to pick when the ask needs work. Turns that may
   start work carry the rule that an ask the reply itself can satisfy (a
   list, an explanation, a short plan, an opinion, a judgement about work
   already in the channel) is answered inline, with managed work reserved
