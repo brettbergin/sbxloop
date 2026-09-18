@@ -29,6 +29,72 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **A channel can have a window onto Slack, Discord or Mattermost.** A
+  bridge surface linked to a channel stops routing to the daemon-wide
+  concierge: what people type there becomes a turn in that channel, with
+  its own history and the agents in it, credited to whoever's account the
+  author is mapped to. People map themselves once, with
+  `POST /v1/users/me/identities/link-code` and `!sbx link <code>` typed on
+  the bridge; `GET` and `DELETE /v1/users/me/identities` show and undo it.
+  An author nobody has mapped is refused with a short reply, unless the
+  link was created with `allow_guests`, in which case the message is stored
+  as a person with no account under the name they use there; an account
+  that has since left the workspace, or been deactivated, counts as
+  unmapped again, so revoking someone's access here revokes it on the
+  bridge too. Outbound, every message appended to a linked channel is
+  posted to each linked surface under a `**name**` header, never back to
+  the surface it arrived on, so two services mirror each other without
+  looping; a failed or cancelled turn's message and one agent's request to
+  another travel that way as well, so an ask that fails is answered on the
+  surface it came from. `GET /v1/bridges` lists the services and whether
+  one is configured here, and `GET`, `POST` and
+  `DELETE /v1/channels/{id}/links` manage a channel's links (creating one
+  takes managing the channel and a workspace owner or admin, and a run's
+  thread cannot be linked; a Discord thread is linked as a surface of its
+  own). A guest's turn that a daemon restart interrupts before it starts
+  resumes for the guest, never for the channel's owner. Messages gain `origin`, naming the surface a message arrived
+  on. Linking a surface grants nobody operator powers: a link cannot widen
+  where `!sbx` runs, so on a linked surface that is not the control channel
+  the only command is `!sbx link`, and every other one is refused with a
+  note saying where it does run. Commands on the control channel,
+  run-thread steering and an unlinked surface behave exactly as before.
+  Advertised as `collaboration.bridges`.
+
+- **Agents can start work and file issues themselves.** An agent whose
+  `[[agents]]` entry declares `can_start` is offered two new tools in a chat
+  turn: `start_run` (a `workload` run, or a `code` run filed as a queued
+  issue) and `file_issue`. Six guardrails run before anything is admitted —
+  the kind must be one the agent declares, the repository must be configured
+  and enabled, the work must sit below `[agent_team] max_chain_depth`, the
+  agent must be under its daily cap (`[[agents]] max_runs_per_day`, else
+  `[agent_team] max_agent_runs_per_day`), the workspace pool must admit
+  another run, and the same ask under the same parent is refused rather than
+  queued twice. The admission runs under a new `Principal.for_agent`, which
+  holds `items:create` and nothing else. Work an agent started carries its
+  channel, the agent, the parent item and the chain depth, and everything it
+  writes to a repository carries an attribution footer and an origin marker
+  that issue discovery reads back, so a chain stays countable across a poll.
+  The marker is the daemon's alone: every marker is stripped out of the body
+  the agent wrote before the daemon appends its own, and the last marker in a
+  body is the one read back, so nothing an agent types can credit another
+  agent or reset the depth its chain is already at. Every start is written to
+  a durable ledger as it is made, so a queued issue counts against the daily
+  cap from the moment it is filed rather than from whenever a poll discovers
+  it, and an ask is refused as a duplicate across turns and restarts, not
+  only within one turn. Filing an issue nobody queued runs nothing, so it
+  needs no `can_start` kind and does not ask the pool, but it answers to the
+  chain depth, the daily cap and the duplicate check like every other start.
+  A queued issue needs `code` in `can_start`; an agent with none can only
+  file one for a person to decide on. An agent offered these tools is not
+  also offered the concierge's own start tools (`create_issue`,
+  `label_issue_for_run`, `start_workload`, `start_entrygraph`,
+  `create_schedule`), which check none of those guardrails, so `start_run`
+  and `file_issue` are the only way it starts work. An issue an agent files
+  from a conversation leaves that channel with the daemon, as the
+  concierge's own filings do, so the code run a poll builds from it reports
+  back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
+  capability `agents.initiative`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

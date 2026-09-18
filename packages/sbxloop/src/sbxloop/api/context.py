@@ -33,7 +33,7 @@ from sbxloop.agents.registry import (
     addressable,
     default_registry,
 )
-from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools
+from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools, work_granted
 from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -42,11 +42,13 @@ from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
     Message,
     Turn,
+    guest_user,
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
@@ -448,6 +450,38 @@ class ApiContext:
                 )
             return turn, message, created
 
+    def accept_bridge_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+    ) -> tuple[Turn, Message]:
+        """Accept a message from a linked bridge surface as a turn in the
+        channel that surface mirrors.
+
+        A mapped author answers as themselves. A guest — only where the link
+        admits one — has no account, so the turn runs for a stand-in carrying
+        the name they use on that service: no preferences to read, and no
+        standing to hand work off with.
+        """
+        store = self.collaboration
+        with self._turn_admission:
+            turn, message = store.accept_linked_turn(
+                link,
+                content=content,
+                author_user_id=author_user_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                now=self.clock(),
+            )
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else guest_user(display_name)
+            self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
+        return turn, message
+
     def start_collaboration_turn(
         self,
         turn: Turn,
@@ -557,6 +591,11 @@ class ApiContext:
             # The channel's own files, for every participant: a read-only
             # critic reviewing a delivered file has to be able to read it.
             channel_tools = self._channel_tools(turn.channel_id)
+            if not read_only:
+                # An agent whose spec declares `can_start` may put work in
+                # the queue itself, on behalf of whoever asked (S-A12). A
+                # read-only turn, and every built-in, gets nothing new.
+                agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
             persona += _RUNNER_INTENT.get(intent, "")
@@ -727,6 +766,37 @@ class ApiContext:
             log.warning("collaboration.agent_memory_unavailable", agent=agent.slug, exc_info=True)
             return "", ()
         return block, tuple(tools)
+
+    def _agent_work(
+        self,
+        definition: AgentDefinition | None,
+        channel_id: str,
+        *,
+        on_behalf_of: str | None,
+    ) -> tuple[AgentTool, ...]:
+        """``start_run`` and ``file_issue`` for a mentioned agent whose spec
+        declares ``can_start`` (S-A12). A turn is depth 0 -- a person asked
+        for it -- so what the agent starts from here is depth 1. A
+        daemon-less context, or an agent that declares nothing, brings
+        nothing, so the shipped team's turns are unchanged."""
+        agent = definition.agent if definition is not None else None
+        if agent is None or self.loop is None or not work_granted(agent):
+            return ()
+        try:
+            from sbxloop.daemon.agentwork import AgentWorkService
+
+            return tuple(
+                AgentWorkService(self.loop, clock=self.clock).tools(
+                    agent,
+                    channel_id=channel_id,
+                    parent_item_id=None,
+                    parent_depth=0,
+                    on_behalf_of=on_behalf_of,
+                )
+            )
+        except Exception:
+            log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
+            return ()
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

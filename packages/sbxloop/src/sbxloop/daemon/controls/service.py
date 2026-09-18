@@ -926,7 +926,7 @@ def _request_fields(request: AdmitRequest) -> dict[str, Any]:
     fields.pop("key", None)
     # Recorded only when asked for, so a request made before admission
     # could name agents fingerprints as it always did.
-    for name in ("lead", "roles", "channel_id"):
+    for name in ("lead", "roles", "channel_id", "origin_agent", "parent_item_id", "chain_depth"):
         if name in fields and not fields[name]:
             del fields[name]
     if "roles" in fields:

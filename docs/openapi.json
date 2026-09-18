@@ -895,6 +895,53 @@
         "title": "AuthorOut",
         "type": "object"
       },
+      "BridgeOut": {
+        "additionalProperties": false,
+        "description": "A chat service this release can bridge, and whether it is set up.",
+        "properties": {
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "configured",
+          "label"
+        ],
+        "title": "BridgeOut",
+        "type": "object"
+      },
+      "BridgePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/BridgeOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "BridgePage",
+        "type": "object"
+      },
       "Capabilities": {
         "additionalProperties": false,
         "properties": {
@@ -985,6 +1032,139 @@
           }
         },
         "title": "ChannelCreate",
+        "type": "object"
+      },
+      "ChannelLinkCreate": {
+        "additionalProperties": false,
+        "description": "Link a surface of a chat service to this channel.\n\n``allow_guests`` admits people on that surface who have linked no\naccount: their messages are stored under the name they use there.",
+        "properties": {
+          "allow_guests": {
+            "default": false,
+            "title": "Allow Guests",
+            "type": "boolean"
+          },
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "surface_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Surface Id",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          }
+        },
+        "required": [
+          "backend",
+          "surface_id"
+        ],
+        "title": "ChannelLinkCreate",
+        "type": "object"
+      },
+      "ChannelLinkOut": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "default": true,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "allow_guests": {
+            "default": false,
+            "title": "Allow Guests",
+            "type": "boolean"
+          },
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "surface_id": {
+            "title": "Surface Id",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          }
+        },
+        "required": [
+          "id",
+          "channel_id",
+          "backend",
+          "surface_id",
+          "created_at"
+        ],
+        "title": "ChannelLinkOut",
+        "type": "object"
+      },
+      "ChannelLinkPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelLinkOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelLinkPage",
         "type": "object"
       },
       "ChannelMemberCreate": {
@@ -2004,6 +2184,63 @@
         "title": "EventOut",
         "type": "object"
       },
+      "ExternalIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "external_user_id": {
+            "title": "External User Id",
+            "type": "string"
+          },
+          "verified_at": {
+            "title": "Verified At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "external_user_id",
+          "verified_at"
+        ],
+        "title": "ExternalIdentityOut",
+        "type": "object"
+      },
+      "ExternalIdentityPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ExternalIdentityOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ExternalIdentityPage",
+        "type": "object"
+      },
       "Gate": {
         "additionalProperties": false,
         "properties": {
@@ -2861,6 +3098,26 @@
         "title": "Limits",
         "type": "object"
       },
+      "LinkCodeOut": {
+        "additionalProperties": false,
+        "description": "A code to type on a bridge, once, to prove an account is yours.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "expires_at"
+        ],
+        "title": "LinkCodeOut",
+        "type": "object"
+      },
       "LocalLoginRequest": {
         "additionalProperties": false,
         "properties": {
@@ -3412,6 +3669,37 @@
         "title": "MemoryUpdate",
         "type": "object"
       },
+      "MessageOriginOut": {
+        "additionalProperties": false,
+        "description": "The bridge surface a message arrived on, for a message that did.",
+        "properties": {
+          "backend": {
+            "title": "Backend",
+            "type": "string"
+          },
+          "external_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Message Id"
+          },
+          "surface_id": {
+            "title": "Surface Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "surface_id"
+        ],
+        "title": "MessageOriginOut",
+        "type": "object"
+      },
       "MessageOut": {
         "additionalProperties": false,
         "properties": {
@@ -3462,6 +3750,16 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MessageOriginOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "reactions": {
             "items": {
@@ -8169,6 +8467,28 @@
         ]
       }
     },
+    "/v1/bridges": {
+      "get": {
+        "description": "The chat services a channel can be linked to, and whether this daemon\nhas one set up. An unconfigured service can still be linked: the link\nstarts working when the operator configures the bridge.",
+        "operationId": "list_bridges_v1_bridges_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BridgePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Bridges",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
     "/v1/capabilities": {
       "get": {
         "operationId": "capabilities_v1_capabilities_get",
@@ -8498,6 +8818,144 @@
           }
         },
         "summary": "Download Channel Artifact",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/links": {
+      "get": {
+        "description": "The bridge surfaces mirroring this channel; takes managing it.",
+        "operationId": "list_channel_links_v1_channels__channel_id__links_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelLinkPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Links",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "description": "Mirror a bridge surface into this channel; takes managing it and a\nworkspace owner or admin. A surface carries one link, so a second one\nis refused, and a run's thread cannot be linked.",
+        "operationId": "create_channel_link_v1_channels__channel_id__links_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelLinkCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelLinkOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Channel Link",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/links/{link_id}": {
+      "delete": {
+        "operationId": "delete_channel_link_v1_channels__channel_id__links__link_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Channel Link",
         "tags": [
           "collaboration"
         ]
@@ -12369,6 +12827,85 @@
           }
         },
         "summary": "Update Local User",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities": {
+      "get": {
+        "operationId": "list_identities_v1_users_me_identities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalIdentityPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Identities",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities/link-code": {
+      "post": {
+        "description": "A code to type on a bridge, as ``!sbx link <code>``, so messages you\nsend on a linked surface post under this account. It is single use and\nshort-lived, and this is the only place it is shown.",
+        "operationId": "create_link_code_v1_users_me_identities_link_code_post",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkCodeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Link Code",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities/{backend}": {
+      "delete": {
+        "description": "Forget who this account is on a bridge. Messages already stored keep\nthe author they were written with.",
+        "operationId": "delete_identity_v1_users_me_identities__backend__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "backend",
+            "required": true,
+            "schema": {
+              "title": "Backend",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Identity",
         "tags": [
           "collaboration"
         ]

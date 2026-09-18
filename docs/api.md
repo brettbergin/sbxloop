@@ -559,6 +559,64 @@ otherwise. Mentioning an agent with `@slug`, or targeting it, adds it as a
 `{channel_id, agent_slug}`; an agent starting and finishing its part of a
 turn records `collaboration.participant.activity` with `{channel_id, agent_slug, status}` (`thinking`, then `idle`; Angie reports as `concierge`).
 
+### Bridge links
+
+A channel can have a window onto a chat service: a Slack, Discord or
+Mattermost surface where the same conversation happens. When
+`/v1/capabilities` lists `collaboration.bridges`:
+
+| Route                                  | Needs                   | Result                                                                                                                                                        |
+| -------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/bridges`                      | read                    | `{data: [{backend, configured, label}]}` — the services this release can bridge, and whether one is set up here                                               |
+| `GET /v1/channels/{id}/links`          | manage                  | `{data: [{id, channel_id, backend, surface_id, thread_id, allow_guests, created_by, created_at, active}]}`                                                    |
+| `POST /v1/channels/{id}/links`         | manage, workspace admin | Body `{backend, surface_id, thread_id?, allow_guests?}`; `201` with the link; `409 link_exists` for a taken surface, `409 link_run_thread` for a run's thread |
+| `DELETE /v1/channels/{id}/links/{lid}` | manage                  | `204`; `404 link_not_found`                                                                                                                                   |
+
+Creating a link takes managing the channel and being a workspace owner or
+admin (`403 channel_forbidden` otherwise): a link makes the channel hear
+everyone on that surface and post its own traffic there, which reaches
+past the channel itself. A thread a run opened is refused. A Discord thread
+is a channel of its own, so a Discord link given a `thread_id` is stored
+with that thread as its `surface_id` and no `thread_id`; Slack and
+Mattermost keep both. Deleting a link and linking the same surface or
+thread again works.
+
+While a surface is linked, what people type there becomes a turn in the
+channel it mirrors, instead of reaching the daemon's concierge. A link is a
+window on a channel, not a grant of operator powers: it never widens where
+`!sbx` runs, so on a linked surface that is not the control channel the one
+command is `!sbx link`, and every other is refused with a note saying where
+it does run. Commands on the control channel, run-thread steering and an
+unlinked surface behave exactly as they did. Every message appended to the
+channel — a person's, an agent's, a run's delivery, a failed turn's error,
+one agent's request to another — is posted back to each linked surface
+under a `**name**` header, except to the surface it arrived on, so two
+linked services mirror each other without a loop.
+
+A message that arrived over a bridge carries `origin`:
+
+```json
+{ "backend": "discord", "surface_id": "C123", "external_message_id": "998" }
+```
+
+Angie shows it as a "via" badge; it is `null` for everything typed here.
+
+Who somebody is on a bridge is theirs to prove, once:
+
+| Route                                      | Needs | Result                                                                     |
+| ------------------------------------------ | ----- | -------------------------------------------------------------------------- |
+| `POST /v1/users/me/identities/link-code`   | write | `{code, expires_at}` — shown here and nowhere else, single use, 10 minutes |
+| `GET /v1/users/me/identities`              | read  | `{data: [{backend, external_user_id, display_name, verified_at}]}`         |
+| `DELETE /v1/users/me/identities/{backend}` | write | `204`; `404 identity_not_found`                                            |
+
+The person types `!sbx link <code>` on the bridge, from the account they
+want mapped. A message from an author nobody has mapped is refused with a
+short reply pointing at that command — unless the link was created with
+`allow_guests`, in which case it is stored as a person with no account,
+under the name they use on that service. A map is only as good as the
+membership behind it: an account removed from the workspace or deactivated
+is unmapped again, and the link's `allow_guests` rule decides afresh.
+
 ## Clients and tokens
 
 sbxloop issues its own tokens. A client is registered on the host with the
@@ -679,6 +737,9 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
 | `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
 | CRUD     | `/v1/channels/{id}/members`, `/participants` | collaboration          | The people and agents in a channel                                    |
+| `GET`    | `/v1/bridges`                                | collaboration read     | The chat services a channel can be linked to                          |
+| CRUD     | `/v1/channels/{id}/links`                    | collaboration          | The bridge surfaces mirroring a channel                               |
+| CRUD     | `/v1/users/me/identities[/{backend}]`        | collaboration          | Who you are on a bridge, and the code that proves it                  |
 | CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
 | `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
 | `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
