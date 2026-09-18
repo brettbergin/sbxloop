@@ -23,6 +23,7 @@ from sbxloop.api.context import ApiContext
 from sbxloop.daemon.channel_mirror import ChannelMirror
 from tests.unit.test_daemon_discord import (
     BOT_USER,
+    FakeChannel,
     FakeConcierge,
     FakeMessage,
     FakeUser,
@@ -32,6 +33,10 @@ from tests.unit.test_daemon_discord import (
 
 CONTROL = 42
 SURFACE = "42"
+#: An ordinary channel somebody linked: not the control channel, so nothing
+#: the bot hears there used to reach it at all.
+ELSEWHERE = 77
+ELSEWHERE_SURFACE = "77"
 
 
 class ChannelConcierge:
@@ -56,7 +61,8 @@ class Linked:
     """A started bridge over a real collaboration store, with an API context
     the bridge reaches through its daemon loop."""
 
-    def __init__(self, tmp_path: Path, **link: Any) -> None:
+    def __init__(self, tmp_path: Path, *, surface: int = CONTROL, **link: Any) -> None:
+        self.surface = surface
         self.concierge = FakeConcierge()
         self.channel_agent = ChannelConcierge()
         self.bridge, self.client, self.loop = make_bridge(tmp_path, concierge=self.concierge)
@@ -81,6 +87,8 @@ class Linked:
             now=time.time(),
         )
         self.channel = self.store.create_channel(self.user.id, "Plans", time.time())
+        if surface not in self.client.channels:
+            self.client.channels[surface] = FakeChannel(self.client, surface, name="linked")
         self.link = (
             None
             if not link
@@ -88,7 +96,7 @@ class Linked:
                 None,
                 self.channel.id,
                 backend="discord",
-                surface_id=SURFACE,
+                surface_id=str(surface),
                 thread_id=None,
                 allow_guests=bool(link.get("allow_guests")),
                 created_by=self.user.id,
@@ -98,13 +106,40 @@ class Linked:
         self.bridge.start()
 
     def say(self, text: str, *, author: FakeUser | None = None, mid: int = 900) -> FakeMessage:
-        control = self.client.channels[CONTROL]
-        msg = FakeMessage(f"<@{BOT_USER.id}> {text}", control, mid=mid, mentions=[BOT_USER])
+        return self._post(f"<@{BOT_USER.id}> {text}", [BOT_USER], author, mid)
+
+    def type(self, text: str, *, author: FakeUser | None = None, mid: int = 950) -> FakeMessage:
+        """Type text verbatim — a ``!sbx`` command, with no mention of the bot."""
+        return self._post(text, [], author, mid)
+
+    def _post(
+        self, content: str, mentions: list[FakeUser], author: FakeUser | None, mid: int
+    ) -> FakeMessage:
+        channel = self.client.channels[self.surface]
+        msg = FakeMessage(content, channel, mid=mid, mentions=mentions)
         if author is not None:
             msg.author = author
-        control.messages[mid] = msg
+        channel.messages[mid] = msg
         self.bridge._handle_message(msg)
         return msg
+
+    def sent(self) -> list[str]:
+        return self.client.channels[self.surface].sent
+
+    def invite(self, username: str) -> Any:
+        """A second workspace member, joined through an invite."""
+        _invite, token = self.store.create_invite(
+            "member", f"{username}@example.test", self.user.id, 3600.0, time.time()
+        )
+        return self.store.register_user(
+            username=username,
+            email=f"{username}@example.test",
+            password="correct horse battery staple",
+            full_name=username.title(),
+            timezone="UTC",
+            now=time.time(),
+            invite_token=token,
+        )
 
     def messages(self) -> list[Any]:
         return self.store.list_messages(None, self.channel.id)
@@ -208,3 +243,62 @@ def test_a_link_code_typed_on_the_bridge_maps_the_author(linked: Any) -> None:
     linked.bridge._handle_message(msg)
     assert wait_for(lambda: linked.store.identity_user("discord", "1") == linked.user.id)
     assert any("linked" in sent.casefold() for sent in control.sent)
+
+
+@pytest.fixture
+def elsewhere(tmp_path: Path) -> Any:
+    """A link on an ordinary channel: not the control channel, and no guests."""
+    built = Linked(tmp_path, surface=ELSEWHERE, backend="discord")
+    yield built
+    built.close()
+
+
+def test_a_linked_surface_is_not_an_operator_console(elsewhere: Any) -> None:
+    elsewhere.type("!sbx pause", author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: any(sent for sent in elsewhere.sent()))
+    assert elsewhere.loop.paused is False
+    assert elsewhere.loop.hold_calls == []
+    assert elsewhere.messages() == []
+
+
+def test_a_linked_surface_does_not_hand_out_the_daemon_log(elsewhere: Any) -> None:
+    elsewhere.type("!sbx log --tail 50", author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: any(sent for sent in elsewhere.sent()))
+    assert not any("```" in sent for sent in elsewhere.sent())
+
+
+def test_the_control_channel_keeps_its_commands_when_it_is_linked(linked: Any) -> None:
+    linked.type("!sbx pause")
+    assert wait_for(lambda: linked.loop.paused)
+    assert linked.messages() == []
+
+
+def test_a_link_code_still_maps_an_author_from_a_linked_surface(elsewhere: Any) -> None:
+    code, _expires = elsewhere.store.create_link_code(elsewhere.user.id, time.time())
+    elsewhere.type(f"!sbx link {code}")
+    assert wait_for(lambda: elsewhere.store.identity_user("discord", "1") == elsewhere.user.id)
+    assert any("linked" in sent.casefold() for sent in elsewhere.sent())
+
+
+def test_revoking_workspace_access_revokes_bridge_access(linked: Any) -> None:
+    joiner = linked.invite("joiner")
+    linked.store.link_identity(
+        linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
+    )
+    linked.store.link_identity(
+        joiner.id, backend="discord", external_user_id="99", display_name="joiner", now=1.0
+    )
+    assert linked.store.remove_member(joiner.id) is True
+
+    linked.say("plan the bread", author=FakeUser(99, "joiner"))
+    assert wait_for(lambda: any("link" in sent for sent in linked.sent()))
+    assert linked.messages() == []
+    assert linked.store.list_turns(None, linked.channel.id) == []
+
+
+def test_a_refusal_quotes_the_word_back_without_breaking_out_of_it(elsewhere: Any) -> None:
+    elsewhere.type("!sbx `stop`" + "x" * 200, author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: any(sent for sent in elsewhere.sent()))
+    refusal = elsewhere.sent()[0]
+    assert refusal.count("`") % 2 == 0
+    assert len(refusal) < 300

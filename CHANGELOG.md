@@ -25,16 +25,24 @@ naming the next offset, and never hands back bytes that are not text.
   the bridge; `GET` and `DELETE /v1/users/me/identities` show and undo it.
   An author nobody has mapped is refused with a short reply, unless the
   link was created with `allow_guests`, in which case the message is stored
-  as a person with no account under the name they use there. Outbound,
-  every message appended to a linked channel is posted to each linked
-  surface under a `**name**` header, never back to the surface it arrived
-  on, so two services mirror each other without looping. `GET /v1/bridges`
-  lists the services and whether one is configured here, and
-  `GET`, `POST` and `DELETE /v1/channels/{id}/links` manage a channel's
-  links (managing the channel). Messages gain `origin`, naming the surface
-  a message arrived on. `!sbx` commands and run-thread steering are
-  untouched, and an unlinked surface behaves exactly as before. Advertised
-  as `collaboration.bridges`.
+  as a person with no account under the name they use there; an account
+  that has since left the workspace, or been deactivated, counts as
+  unmapped again, so revoking someone's access here revokes it on the
+  bridge too. Outbound, every message appended to a linked channel is
+  posted to each linked surface under a `**name**` header, never back to
+  the surface it arrived on, so two services mirror each other without
+  looping; a failed or cancelled turn's message and one agent's request to
+  another travel that way as well, so an ask that fails is answered on the
+  surface it came from. `GET /v1/bridges` lists the services and whether
+  one is configured here, and `GET`, `POST` and
+  `DELETE /v1/channels/{id}/links` manage a channel's links (managing the
+  channel). Messages gain `origin`, naming the surface a message arrived
+  on. Linking a surface grants nobody operator powers: a link cannot widen
+  where `!sbx` runs, so on a linked surface that is not the control channel
+  the only command is `!sbx link`, and every other one is refused with a
+  note saying where it does run. Commands on the control channel,
+  run-thread steering and an unlinked surface behave exactly as before.
+  Advertised as `collaboration.bridges`.
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel

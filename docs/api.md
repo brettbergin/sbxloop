@@ -563,12 +563,16 @@ Mattermost surface where the same conversation happens. When
 | `DELETE /v1/channels/{id}/links/{lid}` | manage | `204`; `404 link_not_found`                                                                                         |
 
 While a surface is linked, what people type there becomes a turn in the
-channel it mirrors, instead of reaching the daemon's concierge: `!sbx`
-commands and run-thread steering are untouched, and an unlinked surface
-behaves exactly as it did. Every message appended to the channel — a
-person's, an agent's, a run's delivery — is posted back to each linked
-surface under a `**name**` header, except to the surface it arrived on, so
-two linked services mirror each other without a loop.
+channel it mirrors, instead of reaching the daemon's concierge. A link is a
+window on a channel, not a grant of operator powers: it never widens where
+`!sbx` runs, so on a linked surface that is not the control channel the one
+command is `!sbx link`, and every other is refused with a note saying where
+it does run. Commands on the control channel, run-thread steering and an
+unlinked surface behave exactly as they did. Every message appended to the
+channel — a person's, an agent's, a run's delivery, a failed turn's error,
+one agent's request to another — is posted back to each linked surface
+under a `**name**` header, except to the surface it arrived on, so two
+linked services mirror each other without a loop.
 
 A message that arrived over a bridge carries `origin`:
 
@@ -590,7 +594,9 @@ The person types `!sbx link <code>` on the bridge, from the account they
 want mapped. A message from an author nobody has mapped is refused with a
 short reply pointing at that command — unless the link was created with
 `allow_guests`, in which case it is stored as a person with no account,
-under the name they use on that service.
+under the name they use on that service. A map is only as good as the
+membership behind it: an account removed from the workspace or deactivated
+is unmapped again, and the link's `allow_guests` rule decides afresh.
 
 ## Clients and tokens
 

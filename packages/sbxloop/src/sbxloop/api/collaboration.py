@@ -1998,10 +1998,22 @@ class CollaborationStore:
             return _identity(row)
 
     def identity_user(self, backend: str, external_user_id: str) -> str | None:
-        """The local user a bridge account belongs to, or None."""
+        """The local user a bridge account belongs to, or None.
+
+        A map outlives the membership it was made under, so the membership
+        is what answers: a user who has been removed from the workspace or
+        deactivated is no longer anybody here, exactly as ``_resolve`` has
+        it. The caller then treats the author as unmapped and the link's
+        own ``allow_guests`` rule decides what happens to the message.
+        """
         with self.dstore.read() as session:
             row = session.get(ExternalIdentityRow, (backend, external_user_id))
-            return None if row is None else str(row.user_id)
+            if row is None:
+                return None
+            member = _member_in(session, str(row.user_id))
+            if member is None or not member.user.active:
+                return None
+            return str(row.user_id)
 
     def list_identities(self, user_id: str) -> list[ExternalIdentity]:
         with self.dstore.read() as session:
@@ -2674,6 +2686,10 @@ class CollaborationStore:
             return _message(session, row)
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
+        # A turn that ends badly leaves the only answer the asker gets, and
+        # a linked surface hears about it the same way it hears about a
+        # reply: through the observers, once the write has committed.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
@@ -2739,6 +2755,10 @@ class CollaborationStore:
                         "author_id": None,
                     },
                 )
+                session.flush()
+                message_row = session.get(MessageRow, message_id)
+                if message_row is not None:
+                    appended = _message(session, message_row)
             session.flush()
             _event(
                 session,
@@ -2746,7 +2766,9 @@ class CollaborationStore:
                 now,
                 data={"channel_id": row.channel_id, "turn_id": row.id, "error": error},
             )
-            return _turn(session, row)
+            finished = _turn(session, row)
+        self._appended(appended)
+        return finished
 
     def recover_turns(self, now: float) -> list[tuple[Turn, LocalUser, str]]:
         """Settle interrupted execution and return only work that never started.
@@ -3166,6 +3188,9 @@ class CollaborationStore:
             )
         message = message.strip()
         key = hashlib.sha256(json.dumps([source_index, agent_slug, message]).encode()).hexdigest()
+        # One agent asking another is channel traffic like any other, so the
+        # observers — and through them a linked surface — hear it too.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             try:
                 channel, _ = _access(session, channel_id, user_id, "post", now=now)
@@ -3263,7 +3288,13 @@ class CollaborationStore:
                     "message_id": message_id,
                 },
             )
-            return f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+            session.flush()
+            message_row = session.get(MessageRow, message_id)
+            if message_row is not None:
+                appended = _message(session, message_row)
+            queued = f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+        self._appended(appended)
+        return queued
 
     # -- teams ---------------------------------------------------------------------
 

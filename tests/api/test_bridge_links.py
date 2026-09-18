@@ -148,3 +148,103 @@ def test_a_message_carries_its_origin(api: Any) -> None:
     assert posted.status_code == 202, posted.text
     # A message typed in Angie has no external origin.
     assert posted.json()["message"]["origin"] is None
+
+
+def _heard(api: Any) -> list[Any]:
+    """Every message the store tells its observers about, in order."""
+    seen: list[Any] = []
+    api.ctx.collaboration.add_message_observer(seen.append)
+    return seen
+
+
+def _running_turn(api: Any, user_id: str, channel_id: str, targets: tuple[str, ...] = ()) -> Any:
+    store = api.ctx.collaboration
+    turn, _message, _ = store.accept_turn(
+        user_id,
+        channel_id,
+        content="hello",
+        targets=targets,
+        client_turn_id=None,
+        client_message_id=None,
+        actor=None,
+        now=api.clock(),
+    )
+    assert store.start_turn(turn.id, api.clock())
+    return turn
+
+
+def test_a_failed_turn_mirrors_its_error_message(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    user_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    turn = _running_turn(api, user_id, channel_id)
+    heard = _heard(api)
+
+    api.ctx.collaboration.finish_turn(turn.id, error="the model refused", now=api.clock())
+    assert [(m.kind, m.content) for m in heard] == [("turn_error", "the model refused")]
+
+
+def test_a_cancelled_turn_mirrors_the_message_it_leaves_behind(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    user_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    turn = _running_turn(api, user_id, channel_id)
+    api.ctx.collaboration.cancel_turn(user_id, channel_id, turn.id, api.clock())
+    heard = _heard(api)
+
+    api.ctx.collaboration.finish_turn(turn.id, error=None, now=api.clock())
+    assert [m.kind for m in heard] == ["turn_cancelled"]
+
+
+def test_a_completed_turn_leaves_the_observers_nothing_to_mirror(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    user_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    turn = _running_turn(api, user_id, channel_id)
+    heard = _heard(api)
+
+    api.ctx.collaboration.finish_turn(turn.id, error=None, now=api.clock())
+    assert heard == []
+
+
+def test_a_queued_handoff_mirrors_the_message_it_appends(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    user_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    store = api.ctx.collaboration
+    turn = _running_turn(api, user_id, channel_id, ("planner",))
+    assert store.participant_started(turn.id, 0, api.clock())
+    heard = _heard(api)
+
+    store.queue_handoff(user_id, channel_id, turn.id, 0, "critic", "check it", api.clock())
+    assert [(m.kind, m.agent_slug) for m in heard] == [("agent_handoff", "planner")]
+
+
+def test_a_revoked_member_is_no_longer_a_known_identity(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    _owner, guest, _admin = _people(api)
+    store = api.ctx.collaboration
+    guest_id = _user_id(api, guest)
+    store.link_identity(
+        guest_id, backend="discord", external_user_id="U9", display_name="Casey", now=api.clock()
+    )
+    assert store.identity_user("discord", "U9") == guest_id
+
+    assert store.remove_member(guest_id) is True
+    assert store.identity_user("discord", "U9") is None
+
+
+def test_a_deactivated_member_is_no_longer_a_known_identity(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    _owner, guest, _admin = _people(api)
+    store = api.ctx.collaboration
+    guest_id = _user_id(api, guest)
+    store.link_identity(
+        guest_id, backend="discord", external_user_id="U9", display_name="Casey", now=api.clock()
+    )
+    store.update_member(guest_id, active=False, now=api.clock())
+    assert store.identity_user("discord", "U9") is None

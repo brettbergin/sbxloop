@@ -889,19 +889,64 @@ class ChatBridge(ABC):
             return None
 
     def _handle_linked(self, msg: Inbound, link: Any) -> None:
-        """Route a message on a linked surface: a command, or a channel turn."""
+        """Route a message on a linked surface: a command, or a channel turn.
+
+        Linking a channel makes a surface a window on it; it does not make
+        the people on that surface operators. ``route_message`` confines
+        operator commands to the control channel and to a run thread, and a
+        link must not widen that: anywhere else the only command is
+        ``link``, which claims an identity and touches no daemon state.
+        """
         text = strip_mentions(
             (msg.content or "").strip(), self._bot_user_id(), mention_re=self.mention_re
         )
         prefix = self.chat.command_prefix
         if text.startswith(prefix):
-            self._ack(msg, ACK_RECEIVED)
-            self._schedule(self._command(msg, text[len(prefix) :].strip()))
+            cmd = text[len(prefix) :].strip()
+            if self._may_command(msg, cmd):
+                self._ack(msg, ACK_RECEIVED)
+                self._schedule(self._command(msg, cmd))
+            else:
+                self._schedule(self._refuse_command(msg, cmd))
             return
         if not text:
             return
         self._ack(msg, ACK_RECEIVED)
         self._schedule(self._linked_turn(msg, link, text))
+
+    def _may_command(self, msg: Inbound, cmd: str) -> bool:
+        """May this command run from the surface it was typed on? Only on
+        the control channel — the operator surface ``route_message`` already
+        trusts — or when it is ``link``, which is identity, not control."""
+        if (cmd.split() or [""])[0].lower() == "link":
+            return True
+        control = self.chat.channel_ref or None
+        return (
+            control is not None
+            and msg.channel_id is not None
+            and str(msg.channel_id) == str(control)
+        )
+
+    async def _refuse_command(self, msg: Inbound, cmd: str) -> None:
+        """Say no to an operator command typed on a linked surface, and say
+        what this surface is for instead."""
+        # Whatever they typed is quoted back, so clip it: the word is theirs,
+        # not ours, and an inline span is no place for a paragraph.
+        word = _clip((cmd.split() or [""])[0].lower() or "that", 40)
+        self.log.info(
+            "chat.linked_command_refused",
+            backend=self.backend,
+            surface=msg.channel_id,
+            command=word,
+        )
+        await self._ack_now(msg, ACK_FAILED)
+        usage = code(f"{self.chat.command_prefix} link CODE")
+        await self._send(
+            msg.channel,
+            f"{code(word)} runs where I take operator commands, not here. "
+            f"This surface takes {usage} and whatever you want to say to the channel.",
+            reply_to=msg.raw,
+        )
 
     async def _linked_turn(self, msg: Inbound, link: Any, text: str) -> None:
         """One message on a linked surface, as a turn in its channel."""
