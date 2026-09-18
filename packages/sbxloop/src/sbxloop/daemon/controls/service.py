@@ -358,9 +358,16 @@ class ControlService:
         expected_revision: int | None = None,
         deadline_s: float | None = None,
         idempotency: tuple[str, str] | None = None,
+        task_id: str | None = None,
+        agent_slug: str | None = None,
     ) -> SteerOutcome:
         """Submit explicit direction to the run in flight (#1038): a record
-        first, then the hand-over; the record says what became of it."""
+        first, then the hand-over; the record says what became of it.
+
+        ``task_id`` addresses one task lane and ``agent_slug`` the agent
+        that was mentioned (S-A11); both ride on the record so a reader can
+        see who the instruction was for, and both are optional, so a caller
+        that names neither steers the run exactly as before."""
         require(principal, "runs:steer")
         text = text.strip()
         if not text:
@@ -388,6 +395,8 @@ class ControlService:
                     text,
                     by=principal.attribution(),
                     expected_revision=expected_revision,
+                    task_id=task_id,
+                    agent_slug=agent_slug,
                 )
             except ControlError as exc:
                 store.failed(record.id, exc.message, self.loop.clock())
@@ -405,6 +414,10 @@ class ControlService:
             expected_revision=expected_revision,
             text=text,
             source_refs=list(source_refs),
+            # Recorded only when named, so an unaddressed instruction's
+            # operation fingerprint is the one it always was.
+            **({"task_id": task_id} if task_id else {}),
+            **({"agent_slug": agent_slug} if agent_slug else {}),
         )
         return self._record(spec, apply)
 

@@ -63,7 +63,7 @@ from pydantic import ValidationError
 
 from sbxloop import hostgit, repofiles
 from sbxloop.agentmodels import model_for_phase, refreshed_models, run_model_repo
-from sbxloop.agents.assignment import AgentAssignment
+from sbxloop.agents.assignment import AgentAssignment, AgentBinding
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -224,10 +224,20 @@ class _Reprovision(Exception):
 
 
 class ChatMessage(NamedTuple):
-    """One queued interactive chat message, waiting for a phase boundary."""
+    """One queued interactive chat message, waiting for a phase boundary.
+
+    ``task_id`` names the task lane the message is *for*: it waits in that
+    lane's own mailbox and is answered when that task reaches a boundary,
+    so a message meant for one task is not answered by whichever lane
+    happened to get there first. ``agent_slug`` names the agent that was
+    mentioned, so the answer comes back in that agent's persona. Both are
+    None for an ordinary message, which behaves exactly as it always has.
+    """
 
     message_id: str
     text: str
+    task_id: str | None = None
+    agent_slug: str | None = None
 
 
 @dataclass
@@ -395,6 +405,12 @@ class LoopEngine:
         # same boundaries cancellation uses. All bus/store activity for a
         # message happens on the engine thread when it is drained.
         self._chat_queue: queue.SimpleQueue[ChatMessage] = queue.SimpleQueue()
+        # One mailbox per targeted task (S-A11). A lane drains only its own,
+        # so a message addressed to a task is answered by that task's lane
+        # however many lanes are in flight; the shared mailbox above keeps
+        # its "whichever lane wins the lock" behaviour for untargeted ones.
+        self._task_chat_queues: dict[str, queue.SimpleQueue[ChatMessage]] = {}
+        self._task_chat_lock = threading.Lock()
         self._steer_attempts = 0
         # Held while one task lane drains the chat mailbox. Taken
         # non-blocking: with several lanes in flight every one of them
@@ -629,15 +645,22 @@ class LoopEngine:
         if release_provider_hold and recovery.pending(run_id):
             recovery.release()
         recovery.check()
-        pending_chat: dict[str, str] = {}
+        pending_chat: dict[str, ChatMessage] = {}
         for _, event in self.store.events(run_id, type_prefix="chat."):
-            message_id = event.data.get("message_id")
+            message_id = str(event.data.get("message_id"))
             if event.type == "chat.provider_pending":
-                pending_chat[str(message_id)] = str(event.data["text"])
+                # The target rides the event, so a resumed run still answers
+                # a targeted message in the lane and the persona it named.
+                pending_chat[message_id] = ChatMessage(
+                    message_id,
+                    str(event.data["text"]),
+                    task_id=event.data.get("task_id"),
+                    agent_slug=event.data.get("agent_slug"),
+                )
             elif event.type == HostEventTypes.CHAT_REPLY:
-                pending_chat.pop(str(message_id), None)
-        for message_id, text in pending_chat.items():
-            self._chat_queue.put(ChatMessage(message_id, text))
+                pending_chat.pop(message_id, None)
+        for message in pending_chat.values():
+            self._queue_chat(message)
         self.bus.emit(
             HostEventTypes.RUN_START,
             run_id,
@@ -682,17 +705,36 @@ class LoopEngine:
         self._cancel_event.set()
         self._wake.set()
 
-    def post_user_message(self, text: str) -> str:
+    def post_user_message(
+        self, text: str, *, task_id: str | None = None, agent_slug: str | None = None
+    ) -> str:
         """Queue an interactive chat message for the run this engine is
         driving. Thread-safe; returns the message id. The agent pauses at
         the next phase boundary — or, during a CI or landing wait, at once —
         answers over a read-only STEER session, and applies any course
         change the reply calls for.
+
+        ``task_id`` addresses one task: the message waits in that task's own
+        mailbox and is answered when *that* lane reaches its boundary, which
+        is what makes steering one task meaningful with several in flight.
+        A task that finishes with messages still waiting hands them to the
+        shared mailbox rather than swallowing them. ``agent_slug`` names the
+        agent that was mentioned, and the answer comes back in its persona.
+        Both omitted, this is the message it always was.
         """
-        message = ChatMessage(new_message_id(), text)
-        self._chat_queue.put(message)
+        message = ChatMessage(new_message_id(), text, task_id=task_id, agent_slug=agent_slug)
+        self._queue_chat(message)
         self._wake.set()
         return message.message_id
+
+    def _queue_chat(self, message: ChatMessage) -> None:
+        """Put ``message`` in the mailbox it is addressed to."""
+        if message.task_id is None:
+            self._chat_queue.put(message)
+            return
+        with self._task_chat_lock:
+            mailbox = self._task_chat_queues.setdefault(message.task_id, queue.SimpleQueue())
+        mailbox.put(message)
 
     # -- resume config rehydration ------------------------------------------
 
@@ -4506,6 +4548,9 @@ class LoopEngine:
             # boundary cancellation uses — the agent pauses here, replies,
             # and any course change (re-plan, standing guidance) lands
             # before the next phase runs.
+            # Addressed to this task first, in its own lane; then the
+            # shared mailbox, under the rules it always had.
+            self._process_task_chat(run_id, phases, task)
             self._process_chat(run_id, phases, self._steer_target(task))
             abort_reason = self._resource_abort_reason()
             if abort_reason:
@@ -4540,6 +4585,10 @@ class LoopEngine:
             # harvesting at once would interleave into the same directory.
             with self._sandbox_lock:
                 self._harvest(run_id, pair, p.kind)
+        # Anything still addressed to this task goes to the shared mailbox:
+        # the task it named is over, so it is answered as run-level
+        # direction rather than lost (S-A11).
+        self._release_task_chat(task)
         self._emit_task_end(run_id, task)
 
     def _phase_build(
@@ -5238,16 +5287,78 @@ class LoopEngine:
         if not self._chat_lock.acquire(blocking=False):
             return
         try:
-            self._drain_chat(run_id, phases, task, stage)
+            # A message addressed to a lane that will never drain it -- a
+            # task that is over, or one this run never had -- is answered
+            # here, as run-level direction, rather than swallowed.
+            self._sweep_task_chat(run_id)
+            self._drain_chat(self._chat_queue, run_id, phases, task, stage)
         finally:
             self._chat_lock.release()
 
+    def _process_task_chat(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
+        """Drain the messages addressed to ``task`` (S-A11).
+
+        Its own lane, its own mailbox: no shared lock, because nothing else
+        may answer these. The target is honoured whatever
+        ``max_parallel_tasks`` is — the message named this task, so there is
+        no guess to make about which lane the person meant.
+        """
+        with self._task_chat_lock:
+            mailbox = self._task_chat_queues.get(task.spec.id)
+        if mailbox is None:
+            return
+        self._drain_chat(mailbox, run_id, phases, task, None)
+
+    def _sweep_task_chat(self, run_id: str) -> None:
+        """Hand back every mailbox whose task is not in flight.
+
+        The engine's own routing only ever addresses a live task, but the
+        steering API takes whatever task id a caller sends. Without this,
+        an instruction for a task that is finished, was never planned, or
+        was misspelled would wait in a mailbox no lane will ever read.
+        """
+        with self._task_chat_lock:
+            addressed = list(self._task_chat_queues)
+        if not addressed:
+            return
+        try:
+            live = {task.spec.id for task in self.store.get_tasks(run_id) if not task.terminal}
+        except SbxloopError:
+            return
+        for task_id in addressed:
+            if task_id not in live:
+                self._release_task_chat(task_id)
+
+    def _release_task_chat(self, task: TaskRecord | str) -> None:
+        """Hand a finished task's unanswered messages to the shared mailbox.
+
+        A message addressed to a task that ended before its lane drained it
+        must still be answered — as run-level direction, since the task it
+        named is over — rather than sitting in a mailbox nobody reads again.
+        """
+        task_id = task if isinstance(task, str) else task.spec.id
+        with self._task_chat_lock:
+            mailbox = self._task_chat_queues.pop(task_id, None)
+        if mailbox is None:
+            return
+        while True:
+            try:
+                message = mailbox.get_nowait()
+            except queue.Empty:
+                return
+            self._chat_queue.put(message._replace(task_id=None))
+
     def _drain_chat(
-        self, run_id: str, phases: PhaseRunner, task: TaskRecord | None, stage: str | None
+        self,
+        mailbox: queue.SimpleQueue[ChatMessage],
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord | None,
+        stage: str | None,
     ) -> None:
         while True:
             try:
-                message = self._chat_queue.get_nowait()
+                message = mailbox.get_nowait()
             except queue.Empty:
                 return
             self.bus.emit(
@@ -5255,20 +5366,30 @@ class LoopEngine:
                 run_id,
                 message_id=message.message_id,
                 text=message.text,
+                # Only when addressed: an ordinary message's event is the
+                # one it has always been, byte for byte.
+                **self._chat_target(message),
             )
-            self._steer_attempts += 1
+            with self._task_chat_lock:
+                self._steer_attempts += 1
             started = time.time()
             try:
                 verdict = phases.steer(
-                    message.text, tasks=self.store.get_tasks(run_id), task=task, stage=stage
+                    message.text,
+                    tasks=self.store.get_tasks(run_id),
+                    task=task,
+                    stage=stage,
+                    binding=self._chat_binding(message),
                 )
             except ProviderHeldError:
-                self._steer_attempts -= 1
+                with self._task_chat_lock:
+                    self._steer_attempts -= 1
                 self.bus.emit(
                     "chat.provider_pending",
                     run_id,
                     message_id=message.message_id,
                     text=message.text,
+                    **self._chat_target(message),
                 )
                 raise
             except WorkerError as exc:
@@ -5296,6 +5417,7 @@ class LoopEngine:
                     run_id,
                     message_id=message.message_id,
                     error=str(exc),
+                    **self._chat_target(message),
                 )
                 continue
             action = self._apply_steer(run_id, task, verdict, phases)
@@ -5319,7 +5441,30 @@ class LoopEngine:
                 message_id=message.message_id,
                 reply=verdict.reply,
                 action=action,
+                **self._chat_target(message),
             )
+
+    def _chat_target(self, message: ChatMessage) -> dict[str, str]:
+        """The target fields a chat event carries, when it was addressed.
+
+        Empty for an untargeted message, so the events of a run nobody
+        steered by name are unchanged.
+        """
+        target: dict[str, str] = {}
+        if message.task_id is not None:
+            target["task_id"] = message.task_id
+        if message.agent_slug is not None:
+            target["agent_slug"] = message.agent_slug
+        return target
+
+    def _chat_binding(self, message: ChatMessage) -> AgentBinding | None:
+        """The agent a message named, when the run's assignment has it: the
+        steer answers in that agent's persona and with its model. An
+        unassigned or forged slug falls back to the run's own steering
+        agent rather than inventing one."""
+        if message.agent_slug is None or self._assignment is None:
+            return None
+        return self._assignment.agents.get(message.agent_slug)
 
     def _steer_target(self, task: TaskRecord) -> TaskRecord | None:
         """The task a steer verdict may re-plan, or None for run-level only.
@@ -5331,9 +5476,11 @@ class LoopEngine:
         the verdict through the existing ``steer_task`` -> ``steer_run``
         downgrade in :meth:`_apply_steer`, recording the guidance for every
         later prompt instead of gambling on a lane. Steering one task by
-        name under parallelism needs an explicit target plus a barrier
-        holding that lane at its boundary until the verdict lands — a
-        feature to design, not a default to fall into.
+        name under parallelism is what :meth:`_process_task_chat` does
+        instead (S-A11): a message that names its task waits in that task's
+        own mailbox, so the lane that answers it is the one the person
+        meant. This method still refuses to guess for a message that named
+        nothing.
         """
         return task if self.config.budgets.max_parallel_tasks == 1 else None
 

@@ -284,6 +284,8 @@ class Turn:
     parent_turn_id: str | None = None
     source_message_id: str | None = None
     chain_depth: int = 0
+    #: The run this turn steered instead of answering from scratch (S-A11).
+    steered_run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,6 +790,7 @@ def _turn(session: Any, row: TurnRow) -> Turn:
         parent_turn_id=None if row.parent_turn_id is None else str(row.parent_turn_id),
         source_message_id=None if row.source_message_id is None else str(row.source_message_id),
         chain_depth=int(row.chain_depth or 0),
+        steered_run_id=None if row.steered_run_id is None else str(row.steered_run_id),
     )
 
 
@@ -3239,6 +3242,15 @@ class CollaborationStore:
                 )
             session.flush()
             return _message(session, row)
+
+    def record_steered_run(self, turn_id: str, run_id: str, now: float) -> None:
+        """Note that this turn steered ``run_id`` rather than answering from
+        scratch (S-A11), so a client can show the mention as direction to
+        work already in flight."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is not None:
+                row.steered_run_id = run_id
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
         # A turn that ends badly leaves the only answer the asker gets, and

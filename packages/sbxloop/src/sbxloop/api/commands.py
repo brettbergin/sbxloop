@@ -428,6 +428,8 @@ async def steer(
             expected_revision=body.expected_revision,
             deadline_s=deadline_s,
             idempotency=pair,
+            task_id=body.task_id,
+            agent_slug=body.agent_slug,
         )
 
     try:

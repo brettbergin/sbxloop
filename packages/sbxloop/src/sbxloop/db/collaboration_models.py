@@ -268,6 +268,9 @@ class TurnRow(Base):
     parent_turn_id: Mapped[str | None] = mapped_column(Text)
     source_message_id: Mapped[str | None] = mapped_column(Text)
     chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    #: The run this turn steered instead of answering (S-A11): a mention of
+    #: an agent working live work in this channel goes to that run.
+    steered_run_id: Mapped[str | None] = mapped_column(Text)
 
 
 class TeamRow(Base):

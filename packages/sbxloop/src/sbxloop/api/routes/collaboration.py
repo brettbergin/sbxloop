@@ -419,6 +419,7 @@ def _turn_out(turn: Turn) -> TurnOut:
         parent_turn_id=turn.parent_turn_id,
         intent=turn.intent,
         chain_depth=turn.chain_depth,
+        steered_run_id=turn.steered_run_id,
     )
 
 
