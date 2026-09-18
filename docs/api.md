@@ -389,7 +389,14 @@ see each one as a `collaboration.message.created` event carrying
 `post_kind` and the run's public `run_id`, the id
 `GET /v1/runs/{id}` answers to. The events of a run a channel asked for, and the
 run's catalogued files, belong to that channel: a member who can open it
-sees them.
+sees them. A workspace member without `artifacts:read` may list and download
+the files of a run a channel they can open asked for, through
+`GET /v1/runs/{id}/artifacts` and `GET /v1/artifacts/{id}[/content]`; every
+other run's files, and an id nobody catalogued, answer the same `403`
+naming `artifacts:read` that they always did.
+
+A `post_kind` sbxloop does not know is never stored: the post is dropped and
+its dedupe key stays free. One recorded by a later build reads back as null.
 
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing

@@ -19,7 +19,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from sbxloop.agents.posts import TERMINAL_POST_KINDS, PostKind
+from sbxloop.agents.posts import POST_KINDS, TERMINAL_POST_KINDS, PostKind
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
 from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
@@ -57,7 +57,7 @@ from sbxloop.db.collaboration_models import (
     WorkspaceMemberRow,
 )
 from sbxloop.db.daemon_models import WorkItemRow
-from sbxloop.db.event_scope import turn_for_item
+from sbxloop.db.event_scope import channel_for_run, turn_for_item
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -721,7 +721,9 @@ def _message(
             else attachments.get(str(row.id), ())
         ),
         origin=origin,
-        post_kind=None if row.post_kind is None else cast(PostKind, str(row.post_kind)),
+        # A kind this build does not know (a later build's) reads as none:
+        # one row must never fail the whole channel's message list.
+        post_kind=cast(PostKind, str(row.post_kind)) if row.post_kind in POST_KINDS else None,
     )
 
 
@@ -2763,6 +2765,20 @@ class CollaborationStore:
                 return None
             return through, None if previous is None else previous.content, "\n".join(lines)
 
+    def member_reads_run(self, member: Member, run_id: str) -> bool:
+        """Whether ``member`` may read what run ``run_id`` (internal id)
+        produced: the run was asked for by a channel they can read. A run
+        no channel asked for, or whose channel is gone, is not theirs."""
+        with self.dstore.read() as session:
+            channel_id = channel_for_run(session, run_id)
+            if channel_id is None:
+                return False
+            try:
+                _access(session, channel_id, member, "read")
+            except CollaborationError:
+                return False
+            return True
+
     def turn_for_post(
         self,
         channel_id: str,
@@ -2804,6 +2820,14 @@ class CollaborationStore:
         silenced. A silenced channel still hears a run that has finished
         or stopped: ``delivery`` and ``notice`` are posted anyway.
         """
+        if kind not in POST_KINDS:
+            # ``PostKind`` is a type, not a check: a caller naming a kind
+            # this build does not know gets nothing stored, and its key
+            # stays free for a post that is readable.
+            log.warning(
+                "api.channel_post_unknown_kind", channel=channel_id, key=dedupe_key, kind=kind
+            )
+            return None
         with self.dstore.immediate_transaction() as session:
             posted = session.get(ChannelRunPostRow, dedupe_key)
             if posted is not None:

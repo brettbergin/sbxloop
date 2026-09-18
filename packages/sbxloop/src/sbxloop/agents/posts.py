@@ -14,12 +14,17 @@ rather than a second copy of it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 #: What a post is: the plan a run settled on, progress through it, a
 #: reviewer's verdict, what it delivered, a reply to someone who asked, or
 #: a notice that it is blocked or waiting on a person.
 PostKind = Literal["plan", "progress", "review", "delivery", "reply", "notice"]
+
+#: Every kind this build knows. ``PostKind`` is not enforced at runtime, so
+#: a post naming anything else is refused before it is stored, and a stored
+#: kind outside this set (a later build's) reads back as no kind at all.
+POST_KINDS: frozenset[str] = frozenset(get_args(PostKind))
 
 #: The posts a channel hears even while it is silenced: a run that has
 #: finished or stopped says so, because nobody is coming to look.
@@ -74,6 +79,7 @@ class ChannelPoster(Protocol):
 
 
 __all__ = [
+    "POST_KINDS",
     "TERMINAL_POST_KINDS",
     "ArtifactRef",
     "ChannelPost",

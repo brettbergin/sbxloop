@@ -17,14 +17,17 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import insert, update
 
 from sbxloop.agents.posts import ArtifactRef, ChannelPost, ChannelPoster
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.daemon.model import WorkItem
+from sbxloop.db.api_models import ArtifactRow
 from sbxloop.db.collaboration_models import ChannelRow, MessageRow
 from sbxloop.ghids import chat_item_id, issue_item_id
+from sbxloop_worker.protocol import Event
+from tests.api.test_channel_access import _channel, _people
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
 from tests.unit.test_daemon_loop import Harness
@@ -445,3 +448,146 @@ def test_a_code_runs_post_hangs_on_the_turn_that_filed_its_issue(api: Any) -> No
     )
 
     assert [m["turn_id"] for m in _messages(api, headers, channel)] == [filed]
+
+
+def test_a_post_of_a_kind_this_build_does_not_know_is_dropped(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+
+    def _post(kind: Any, text: str) -> str | None:
+        return api.ctx.poster.post(
+            ChannelPost(
+                channel_id=channel,
+                author_agent="builder",
+                kind=kind,
+                text=text,
+                run_id="r1",
+                item_id=item.item_id,
+                dedupe_key="r1:progress:1",
+            )
+        )
+
+    assert _post("musing", "Thinking about flour") is None
+    assert _messages(api, headers, channel) == []
+    # The dropped post held no claim on its key: a known kind under it posts.
+    kept = _post("progress", "Kneading")
+    assert kept is not None
+    assert [(m["id"], m["post_kind"]) for m in _messages(api, headers, channel)] == [
+        (kept, "progress")
+    ]
+
+
+def test_a_stored_post_kind_this_build_cannot_read_hides_only_itself(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+    message_id = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="progress",
+            text="Kneading",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:progress:1",
+        )
+    )
+    with api.harness.dstore.transaction() as session:
+        session.execute(
+            update(MessageRow)
+            .where(MessageRow.id == message_id)
+            .values(post_kind="a kind a later build added")
+        )
+
+    posted = _messages(api, headers, channel)
+    assert [(m["id"], m["content"], m["post_kind"]) for m in posted] == [
+        (message_id, "Kneading", None)
+    ]
+
+
+def _admitted_run(api: Any, channel_id: str, key: str) -> str:
+    """Run a workload admitted with ``channel_id`` and asked for by no
+    message in it; returns the run id."""
+    item = WorkItem(
+        item_id=chat_item_id(key),
+        source_key=key,
+        title="Weekly report",
+        body="Write the weekly report",
+        kind="workload",
+        channel_id=channel_id,
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.harness.source.items = [item]
+    api.harness.outcomes = ["completed"]
+    api.clock.t += 10
+    api.loop.tick()
+    run_id = str(api.harness.runs[-1][0])
+    api.harness.store.append_event(
+        Event(ts=api.clock(), run_id=run_id, type="phase.start", data={"phase": "plan"})
+    )
+    return run_id
+
+
+def _file(api: Any, run_id: str, artifact_id: str) -> None:
+    """Catalogue one file of the run, already pruned, so reading it never
+    touches the disk."""
+    with api.harness.dstore.transaction() as session:
+        session.execute(
+            insert(ArtifactRow).values(
+                id=artifact_id,
+                run_id=run_id,
+                relpath="report.md",
+                size=9,
+                sha256="0" * 64,
+                media_type="text/markdown",
+                origin="workspace",
+                recorded_at=api.clock(),
+                available=0,
+                tombstoned_at=api.clock(),
+            )
+        )
+
+
+def test_a_channels_members_read_the_files_of_its_runs(api: Any) -> None:
+    owner, guest, _admin = _people(api)
+    shared = _channel(api, owner, "workspace")
+    private = _channel(api, owner)
+    shared_run = _admitted_run(api, shared, "report:shared")
+    _file(api, shared_run, "art_shared")
+    private_run = _admitted_run(api, private, "report:private")
+    _file(api, private_run, "art_private")
+
+    def reads(headers: dict[str, str], run_id: str, artifact_id: str) -> list[int]:
+        return [
+            api.client.get(f"/v1/runs/run_{run_id}/artifacts", headers=headers).status_code,
+            api.client.get(f"/v1/artifacts/{artifact_id}", headers=headers).status_code,
+            api.client.get(f"/v1/artifacts/{artifact_id}/content", headers=headers).status_code,
+        ]
+
+    # The guest can open the workspace channel, so its run's files are theirs;
+    # the bytes are gone (410), which is past the door, not at it.
+    assert reads(guest, shared_run, "art_shared") == [200, 200, 410]
+    listed = api.client.get(f"/v1/runs/run_{shared_run}/artifacts", headers=guest).json()
+    assert [a["id"] for a in listed["data"]] == ["art_shared"]
+    # A private channel they are not in: refused as they always were.
+    assert reads(guest, private_run, "art_private") == [403, 403, 403]
+    refused = api.client.get("/v1/artifacts/art_private", headers=guest).json()
+    assert refused["capability"] == "artifacts:read"
+    # An id nobody catalogued looks the same to them as one they may not see.
+    assert api.client.get("/v1/artifacts/art_nope", headers=guest).status_code == 403
+    for everyone in (owner, api.bearer()):
+        assert reads(everyone, private_run, "art_private") == [200, 200, 410]
+
+
+def test_a_channels_members_read_the_events_of_a_run_admitted_with_it(api: Any) -> None:
+    owner, guest, _admin = _people(api)
+    shared = _channel(api, owner, "workspace")
+    private = _channel(api, owner)
+    shared_run = _admitted_run(api, shared, "report:shared")
+    private_run = _admitted_run(api, private, "report:private")
+
+    def run_types(headers: dict[str, str], run_id: str) -> list[str]:
+        page = api.client.get(f"/v1/runs/run_{run_id}/events", headers=headers)
+        assert page.status_code == 200, page.text
+        return [e["type"] for e in page.json()["data"]]
+
+    assert "phase.start" in run_types(guest, shared_run)
+    assert run_types(guest, private_run) == []
+    assert "phase.start" in run_types(owner, private_run)

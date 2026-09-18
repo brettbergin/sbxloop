@@ -77,6 +77,7 @@ COLLABORATION_TABLES = (
     "agent_memories",
     "collaboration_channel_links",
     "collaboration_external_identities",
+    "channel_run_posts",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 

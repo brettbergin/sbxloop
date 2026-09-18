@@ -142,7 +142,12 @@ a code run's checkout, is `404` like any other id from elsewhere.
   hides itself rather than the channel's whole message list. An item
   admitted with a `channel_id` now belongs to that channel for event
   visibility too, so a member who can open the channel sees the run's
-  events even when no message there names the work. Nothing posts yet:
+  events even when no message there names the work, and a workspace member
+  without `artifacts:read` may list and download the files of a run a
+  channel they can open asked for (anything else answers the same `403` as
+  before). A post of a kind this build does not know is dropped before it
+  is stored, and a stored kind a later build wrote reads back as a null
+  `post_kind`, so one row never fails the channel's message list. Nothing posts yet:
   this is the contract (`ChannelPoster`) the daemon and engine will use,
   advertised as `collaboration.run_progress`.
 
