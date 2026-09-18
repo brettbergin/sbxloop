@@ -4,19 +4,20 @@ attachments, never by a path the client chose."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from sbxloop.api.artifacts import Artifact, content_type_for
-from sbxloop.api.auth.deps import Authenticated, get_ctx, require
+from sbxloop.api.auth.deps import Authenticated, current, get_ctx
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import ArtifactOut, ArtifactPage, PublishedOut, rfc3339
 from sbxloop.api.projections import Views, not_found
 from sbxloop.api.publicids import run_public_id
+from sbxloop.daemon.controls.principal import Capability
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunRecord
 
 router = APIRouter(prefix="/v1", tags=["artifacts"])
@@ -53,6 +54,54 @@ def _out(artifact: Artifact) -> ArtifactOut:
     )
 
 
+_CAPABILITY: Capability = "artifacts:read"
+
+
+def _refused(auth: Authenticated) -> Problem:
+    """What ``require("artifacts:read")`` has always answered."""
+    return Problem(
+        403,
+        "forbidden",
+        f"{auth.principal.id} lacks {_CAPABILITY}",
+        capability=_CAPABILITY,
+    )
+
+
+async def _reader(auth: Authenticated = Depends(current)) -> Authenticated:  # noqa: B008
+    """``artifacts:read``, or a workspace member, who is judged per run: a
+    member reads the files of a run a channel they can read asked for."""
+    if not auth.principal.can(_CAPABILITY) and auth.member is None:
+        raise _refused(auth)
+    return auth
+
+
+def _admit[T](
+    ctx: ApiContext, auth: Authenticated, find: Callable[[], T], run_of: Callable[[T], str]
+) -> T:
+    """``find()``'s result for a caller holding ``artifacts:read``. A member
+    without it gets the result only when ``run_of`` names a run a channel
+    they can read asked for; any other outcome, an unknown id included, is
+    the same refusal, so nothing about another channel's runs leaks."""
+    if auth.principal.can(_CAPABILITY):
+        return find()
+    try:
+        found = find()
+    except Problem as exc:
+        raise _refused(auth) from exc
+    member = auth.member
+    if member is None or not ctx.collaboration.member_reads_run(member, run_of(found)):
+        raise _refused(auth)
+    return found
+
+
+def _record_run(record: RunRecord) -> str:
+    return record.run_id
+
+
+def _lookup_run(found: tuple[Artifact, RunRecord]) -> str:
+    return found[1].run_id
+
+
 def _ensure_catalogued(ctx: ApiContext, record: RunRecord) -> None:
     """A finished run is catalogued the first time anyone asks, when the
     listener's own pass has not got to it yet."""
@@ -64,13 +113,13 @@ def _ensure_catalogued(ctx: ApiContext, record: RunRecord) -> None:
 async def list_artifacts(
     run_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("artifacts:read")),  # noqa: B008
+    auth: Authenticated = Depends(_reader),  # noqa: B008
 ) -> ArtifactPage:
     """The run's catalog, and separately where the run published."""
 
     def read() -> ArtifactPage:
         views = Views(ctx)
-        record = views.run_by_public_id(run_id)
+        record = _admit(ctx, auth, lambda: views.run_by_public_id(run_id), _record_run)
         _ensure_catalogued(ctx, record)
         rows = ctx.artifacts.for_run(record.run_id)
         return ArtifactPage(
@@ -98,12 +147,12 @@ def _lookup(ctx: ApiContext, artifact_id: str) -> tuple[Artifact, RunRecord]:
 async def get_artifact(
     artifact_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("artifacts:read")),  # noqa: B008
+    auth: Authenticated = Depends(_reader),  # noqa: B008
 ) -> ArtifactOut:
     """Digest, media type, size, origin and availability."""
 
     def read() -> ArtifactOut:
-        artifact, record = _lookup(ctx, artifact_id)
+        artifact, record = _admit(ctx, auth, lambda: _lookup(ctx, artifact_id), _lookup_run)
         if artifact.available and not ctx.artifacts.present(record, artifact):
             refreshed = ctx.artifacts.get(artifact_id)
             artifact = refreshed or artifact
@@ -116,11 +165,12 @@ async def get_artifact(
 async def download_artifact(
     artifact_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("artifacts:read")),  # noqa: B008
+    auth: Authenticated = Depends(_reader),  # noqa: B008
 ) -> StreamingResponse:
     """The bytes, as an attachment: never rendered, never a path the
     client chose, opened relative to the run's own directory without
     following a link out of it. ``410`` once the run was pruned."""
+    await ctx.call(lambda: _admit(ctx, auth, lambda: _lookup(ctx, artifact_id), _lookup_run))
     return await stream_artifact(ctx, artifact_id)
 
 
