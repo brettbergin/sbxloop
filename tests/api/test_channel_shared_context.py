@@ -425,10 +425,14 @@ class TestSummaryCompaction:
             api.ctx.collaboration, api.ctx._summarize, api.clock, keep=2
         )
         api.ctx.compact_channel(channel)
-        (call,) = _summary_calls(api)
-        assert call["channel_id"] == channel
-        # Still a call that cannot act.
-        assert call["allow_actions"] is False
+        # The messages that built the channel may already have queued a
+        # background compaction, so count nothing: every summary call made
+        # for this channel is charged to it and cannot act.
+        calls = _summary_calls(api)
+        assert calls
+        for call in calls:
+            assert call["channel_id"] == channel
+            assert call["allow_actions"] is False
 
     def test_a_summariser_that_never_answers_is_given_up_on(
         self, api: Any, monkeypatch: Any
