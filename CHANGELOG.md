@@ -89,11 +89,17 @@ naming the next offset, and never hands back bytes that are not text.
   ordinary as a list came back as a queued run instead of an answer. The
   caller's intent now survives a mention — a conversation stays a
   conversation, and the mention still records the agent as a target and
-  joins it to the channel — and every chat turn carries the rule that an
-  ask the reply itself can satisfy (a list, an explanation, a short plan,
-  an opinion, a judgement about work already in the channel) is answered
-  inline, with managed work reserved for asks that need execution,
-  external sources, a repository change or a produced file. `TurnCreate`
+  joins it to the channel. A conversation that mentions an agent keeps
+  that agent's read tools but not the ones that start managed work
+  (`start_workload`, `start_entrygraph`, `create_schedule`, `create_issue`,
+  `label_issue_for_run`), so a reply is the only outcome it can have, and
+  the agent says which mode to pick when the ask needs work. Turns that may
+  start work carry the rule that an ask the reply itself can satisfy (a
+  list, an explanation, a short plan, an opinion, a judgement about work
+  already in the channel) is answered inline, with managed work reserved
+  for asks that need execution, external sources, a repository change or
+  a produced file. A turn with no tools at all now points the person at the
+  Code, Workload or Auto mode instead of at a mention. `TurnCreate`
   also accepts `intent: "auto"` for a client that does not know which it
   is and wants the lead to decide, advertised as
   `collaboration.lead_orchestrator`; `TurnOut` now reports the recorded

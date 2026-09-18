@@ -10,8 +10,12 @@ instead of answering. This module pins the contract that replaces it:
   conversation while the mentioned agent is still recorded as a target and
   joins the channel;
 - ``auto`` exists as an intent, so a client can hand the choice to the lead;
-- every chat turn carries the rule that an ask answerable in the reply is
-  answered inline, and only a runner turn carries a runner's instruction;
+- every chat turn that may act carries the rule that an ask answerable in
+  the reply is answered inline, and only a runner turn carries a runner's
+  instruction;
+- a conversation mention cannot start managed work at all: the agent keeps
+  its tools but not the ones that queue work, so a reply is the only
+  outcome, while runner and ``auto`` turns keep them;
 - a runner turn records the run roles of the agents it mentions, so
   admission can assign them.
 
@@ -34,6 +38,10 @@ MENTION_RULE = "Being mentioned is a request to reply, not a request to queue wo
 ANSWER_RULE = "answer it inline and in full, and start nothing"
 #: The sentence only an explicit workload turn carries.
 WORKLOAD_RULE = "Call start_workload once with their request"
+#: What a turn that may start work is told; a conversation never is.
+START_WITHOUT_ASKING = "without asking for confirmation"
+#: What a conversation mention is told instead of how to start work.
+NO_WORK_RULE = "This turn cannot start managed work"
 #: The sentence only an `auto` turn carries.
 AUTO_RULE = "The person left this turn's handling to you."
 
@@ -88,6 +96,10 @@ def test_a_mention_keeps_the_turn_a_conversation_and_answers_in_the_channel(api:
     assert ANSWER_RULE in call["persona"]
     assert WORKLOAD_RULE not in call["persona"]
     assert AUTO_RULE not in call["persona"]
+    assert START_WITHOUT_ASKING not in call["persona"]
+    assert NO_WORK_RULE in call["persona"]
+    # Structural, not only prompt text: the mention cannot queue work.
+    assert call["start_work"] is False
 
     messages = _messages(api, headers, channel, 2)
     assert [message["role"] for message in messages] == ["user", "assistant"]
@@ -116,6 +128,27 @@ def test_an_explicit_workload_turn_still_carries_the_runner_instruction(api: Any
     (call,) = concierge.calls
     assert WORKLOAD_RULE in call["persona"]
     assert call["allow_actions"] is True
+    assert call["start_work"] is True
+
+
+def test_an_unmentioned_conversation_turn_is_not_told_how_to_start_work(api: Any) -> None:
+    """A turn that mentions nobody has no tools; telling it to start work
+    without confirmation, or that it was mentioned, contradicts that."""
+    concierge = FakeConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    channel = _channel(api, headers)
+
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns", headers=headers, json={"content": "hello there"}
+    )
+    assert accepted.status_code == 202, accepted.text
+    settled(api.client, headers, channel, accepted.json()["turn"]["id"])
+    (call,) = concierge.calls
+    assert call["allow_actions"] is False
+    assert MENTION_RULE not in call["persona"]
+    assert START_WITHOUT_ASKING not in call["persona"]
+    assert call["start_work"] is False
 
 
 def test_the_auto_intent_hands_the_choice_to_the_lead(api: Any) -> None:
@@ -145,6 +178,7 @@ def test_the_auto_intent_hands_the_choice_to_the_lead(api: Any) -> None:
     assert ANSWER_RULE in call["persona"]
     assert "start_workload" in call["persona"]
     assert call["allow_actions"] is True
+    assert call["start_work"] is True
 
 
 def test_a_runner_turn_assigns_the_run_roles_of_the_agents_it_mentions(api: Any) -> None:
@@ -169,6 +203,7 @@ def test_a_runner_turn_assigns_the_run_roles_of_the_agents_it_mentions(api: Any)
     settled(api.client, headers, channel, turn["id"])
     (call,) = concierge.calls
     assert call["work_roles"] == {"planner": "baker", "builder": "baker"}
+    assert call["start_work"] is True
 
     joined = api.client.get(f"/v1/channels/{channel}/participants", headers=headers)
     assert [entry["agent_slug"] for entry in joined.json()["data"]] == ["baker"]

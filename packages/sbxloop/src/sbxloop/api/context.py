@@ -75,15 +75,28 @@ _CONTENT_WORD = re.compile(r"\w+")
 #: Turn intents that may start managed work, so the agents a turn mentions
 #: are recorded as its run-role assignees.
 WORK_INTENTS = frozenset({"code", "workload", "auto"})
-#: What every chat turn is told: a mention asks for an answer. Managed work
-#: is for asks the reply itself cannot satisfy.
+#: Turn intents whose agents are offered the tools that start managed work:
+#: the runner intents and an explicit delegation. A conversation, mention
+#: or not, only answers.
+START_WORK_INTENTS = frozenset({"delegate", *WORK_INTENTS})
+#: What a turn that may start work, but picked no runner, is told: an ask
+#: the reply can satisfy is answered. Managed work is for asks it cannot.
 _INLINE_ANSWER = (
+    "\n\nWhen the ask can be satisfied in this reply - a list, an explanation, "
+    "a short plan, an opinion, a judgement about work already in this channel - "
+    "answer it inline and in full, and start nothing. Start managed work only when the "
+    "ask needs execution, external sources, a change to a repository or a "
+    "produced file; then start it without asking for confirmation."
+)
+#: What a conversation turn that mentions an agent is told. It keeps its
+#: read tools but none that start work, so a reply is the only outcome.
+_CONVERSATION_ANSWER = (
     "\n\nBeing mentioned is a request to reply, not a request to queue work. "
-    "When the ask can be satisfied in this reply - a list, an explanation, a short "
-    "plan, an opinion, a judgement about work already in this channel - answer it "
-    "inline and in full, and start nothing. Start managed work only when the ask "
-    "needs execution, external sources, a change to a repository or a produced "
-    "file; then start it without asking for confirmation."
+    "Whatever this reply can satisfy, answer it inline and in full, and start "
+    "nothing. This turn cannot start managed work: when the ask needs "
+    "execution, external sources, a change to a repository or a produced file, "
+    "say so and tell the person to ask again with the Code, Workload or Auto "
+    "mode selected."
 )
 _RUNNER_INTENT = {
     "code": (
@@ -542,14 +555,18 @@ class ApiContext:
                 agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
-            persona += _RUNNER_INTENT.get(intent, _INLINE_ANSWER)
             model = definition.agent.spec.model if definition and definition.agent else None
             # A named agent acts in its own persona, so it keeps its tools;
-            # what it may do with them is the intent's business, not the
-            # mention's.
-            allow_actions = (
-                intent in {"delegate", "code", "workload", "auto"} or definition is not None
-            )
+            # whether it may start work with them is the intent's business,
+            # not the mention's.
+            start_work = intent in START_WORK_INTENTS
+            allow_actions = start_work or definition is not None
+            if intent in _RUNNER_INTENT:
+                persona += _RUNNER_INTENT[intent]
+            elif start_work:
+                persona += _INLINE_ANSWER
+            elif allow_actions:
+                persona += _CONVERSATION_ANSWER
             prompt = content
             if participant.get("parent_index") is not None:
                 parent_index = int(participant["parent_index"])
@@ -619,6 +636,7 @@ class ApiContext:
                     session_key=f"{turn.channel_id}:{target or 'angie'}",
                     persona=persona,
                     allow_actions=allow_actions,
+                    start_work=start_work,
                     history=store.turn_history(turn),
                     agent_role=definition.role if definition else "concierge",
                     read_only=read_only,
