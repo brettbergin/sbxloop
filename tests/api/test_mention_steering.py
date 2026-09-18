@@ -194,6 +194,38 @@ class TestMentionSteering:
         assert [c["agent_role"] for c in concierge.calls] == ["planner", "builder"]
         assert "Say how long the build takes" in concierge.calls[1]["text"]
 
+    def test_an_agent_mentioning_an_agent_on_a_live_run_does_not_steer_it(self, api: Api) -> None:
+        """An agent's reply that mentions the builder starts a follow-up
+        turn by the builder (#1212). That turn speaks as the agent, not the
+        person, so it answers as a peer and never reaches the run."""
+        from tests.api.test_agent_mentions import ScriptedConcierge
+
+        concierge = ScriptedConcierge({"planner": "Plan ready. @builder how long will it take?"})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        planned = _planned(api, channel)
+        only_builder = AgentAssignment(
+            lead=planned.lead,
+            roles={"builder": "builder"},
+            agents={"builder": planned.agents["builder"]},
+            channel_id=channel,
+        )
+        handle = _live(api, channel, only_builder)
+
+        _turn(api, headers, channel, "@planner plan the release")
+        assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+
+        turns = api.client.get(f"/v1/channels/{channel}/turns", headers=headers).json()
+        follow_up = [t for t in turns if t["trigger"] == "mention"]
+        assert [t["targets"] for t in follow_up] == [["builder"]]
+        assert all(t.get("steered_run_id") is None for t in turns)
+        assert handle.engine.messages == []
+        assert [c["session_key"].rsplit(":", 1)[-1] for c in concierge.calls] == [
+            "planner",
+            "builder",
+        ]
+
 
 class TestStopFromChat:
     def test_a_channel_stop_cancels_the_channels_runs(self, api: Api) -> None:
