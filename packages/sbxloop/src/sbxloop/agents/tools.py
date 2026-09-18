@@ -483,6 +483,12 @@ def work_tools(
     6. the ask must not be one this agent already started under this
        parent.
 
+    Filing an issue nobody queued runs nothing, so it is excused 1 and 5 --
+    there is no kind to declare and no run for the pool to admit -- and
+    nothing else: writing on a repository is work the agent started, and
+    an agent that could file unqueued issues without answering to 3, 4 and
+    6 would have no cap at all.
+
     A refusal is a :class:`ToolRejectedError` naming the knob that refused,
     so the agent can say why it stopped instead of trying again.
     """
@@ -492,9 +498,16 @@ def work_tools(
     slug = agent.slug
     declared = ", ".join(can_start)
 
-    def guard(kind: str, repo: str | None, *, needs_repo: bool) -> str:
-        """Every check, in order; the canonical repository when one applies."""
-        if kind not in can_start:
+    def guard(kind: str | None, repo: str | None, *, needs_repo: bool, budget: bool = True) -> str:
+        """Every check, in order; the canonical repository when one applies.
+
+        ``kind`` is None for work that starts no run of its own (filing an
+        issue nobody queued): there is no kind to declare, and the
+        workspace pool has no run to admit, but everything else still
+        applies -- an agent writing on a repository is work it started,
+        and it answers to the chain and to its daily cap like the rest.
+        """
+        if kind is not None and kind not in can_start:
             raise ToolRejectedError(
                 f"you may not start a {kind} run (your can_start declares: {declared})"
             )
@@ -517,7 +530,7 @@ def work_tools(
                 f"you have started {started} today and {knob} is {cap}: nothing more "
                 "starts until the day rolls over"
             )
-        refusal = host.budget_refusal()
+        refusal = host.budget_refusal() if budget else None
         if refusal is not None:
             raise ToolRejectedError(f"the workspace will not admit another run: {refusal}")
         return resolved
@@ -575,9 +588,15 @@ def work_tools(
                 f"(it declares: {declared}). File it unqueued and say why it matters"
             )
         repo = _text(args, "repo").strip() or None
-        # An unqueued issue starts nothing, so only a queued one answers to
-        # the chain, the daily cap and the budget.
-        resolved = guard("code", repo, needs_repo=True) if queue else host.repository(repo)
+        # An unqueued issue runs nothing, so only a queued one answers to
+        # `can_start` and to the workspace pool. Everything else holds
+        # either way: filing on a repository is work the agent started, so
+        # it counts against the chain and against its own day.
+        resolved = (
+            guard("code", repo, needs_repo=True)
+            if queue
+            else guard(None, repo, needs_repo=True, budget=False)
+        )
         key = deduped(f"issue:{title}")
         return host.file_issue(
             IssueRequest(

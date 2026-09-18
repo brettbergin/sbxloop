@@ -12,6 +12,11 @@ it back at discovery (:mod:`sbxloop.daemon.sources`) is what keeps a chain
 of agent-started work countable — without it every generation would start
 again at depth zero and the chain cap would never bite.
 
+The marker is the daemon's, never the agent's. The agent writes the body;
+the daemon strips every marker out of it (:func:`strip_origin_markers`)
+and appends its own, and the reader takes the last one, so nothing an
+agent types can name a different agent or claim a shallower chain.
+
 An inline workload does not need the marker to carry its origin (the
 admission sets the item's columns directly), but it carries one anyway so
 the ask a person reads says where it came from.
@@ -31,6 +36,7 @@ __all__ = [
     "origin_footer",
     "origin_from_body",
     "origin_marker",
+    "strip_origin_markers",
 ]
 
 #: The most a marker may claim, whatever it says. A forged or corrupted
@@ -74,20 +80,43 @@ def origin_marker(origin: WorkOrigin) -> str:
     return f"<!-- sbxloop:origin item={parent} agent={origin.agent_slug} depth={depth} -->"
 
 
+def strip_origin_markers(text: str) -> str:
+    """``text`` with every marker in it removed.
+
+    Everything an agent writes goes through this before the daemon appends
+    its own marker: the body is agent-controlled text, and a marker the
+    agent wrote would otherwise be read back at discovery as if the daemon
+    had written it -- naming another agent and resetting the chain depth,
+    which would make both the per-agent cap and ``max_chain_depth``
+    unenforceable.
+
+    Removal repeats until nothing matches, because one marker can be
+    written *inside* another: taking the inner one out would leave a valid
+    outer one behind. Every pass shortens the text, so this terminates.
+    """
+    while True:
+        stripped = _MARKER_RE.sub("", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
 def origin_from_body(body: str | None) -> WorkOrigin | None:
     """The origin a body claims, or None when it claims none.
 
-    The *first* marker wins: a body that quotes an earlier issue cannot
-    re-parent the work by appending a second one.
+    The *last* marker wins. The daemon appends its marker after whatever
+    the agent wrote, so the last one is always the one the daemon itself
+    put there -- the reading that cannot be steered from a body, even if a
+    forged marker survived :func:`strip_origin_markers`.
     """
-    match = _MARKER_RE.search(body or "")
-    if match is None:
+    matches = _MARKER_RE.findall(body or "")
+    if not matches:
         return None
-    parent = match.group("item")
+    item, agent, depth = matches[-1]
     return WorkOrigin(
-        agent_slug=match.group("agent"),
-        parent_item_id=None if parent == _NO_PARENT else parent,
-        chain_depth=min(int(match.group("depth")), MAX_CHAIN_DEPTH),
+        agent_slug=agent,
+        parent_item_id=None if item == _NO_PARENT else item,
+        chain_depth=min(int(depth), MAX_CHAIN_DEPTH),
     )
 
 
