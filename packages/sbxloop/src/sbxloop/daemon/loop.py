@@ -4404,11 +4404,23 @@ class DaemonLoop:
         and every chat ask posted a refresh failure. The first-use clone
         stays keyed on the item's own repository; a repo-less item never
         starts one.
+
+        On a daemon with several repositories a repo-less item refreshes
+        nothing: no repository means no credential, and the checkout would
+        otherwise fall back to the primary repository's, fetched anonymously
+        -- a private forge answered with a username prompt and every chat ask
+        or scheduled workload posted a refresh failure.
         """
         resolved = repo
         if resolved is None:
             default = self.config.github.default_repo()
             resolved = default.repo if default is not None else None
+            if resolved is None and self.config.github.enabled_repos():
+                log.info(
+                    "workspace.refresh_skipped",
+                    reason="the item names no repository and several are configured",
+                )
+                return
         if resolved is not None and resolved in self._live_repos():
             # Another run is working from this checkout right now: moving
             # it under that run's feet is not ours to do. The next run
