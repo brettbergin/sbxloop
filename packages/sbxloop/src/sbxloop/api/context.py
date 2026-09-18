@@ -59,7 +59,12 @@ from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
 from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
-from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.principal import (
+    ROLE_CAPABILITIES,
+    WORKSPACE_ID,
+    Capability,
+    Principal,
+)
 from sbxloop.daemon.controls.results import ControlError
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.daemon.controls.steering import stop_command
@@ -668,6 +673,7 @@ class ApiContext:
             preference_context = f"\n\nUser preferences:\n\n{joined}"
         errors: list[str] = []
         author = user.full_name or user.username
+        principal = self._chat_principal(user, author)
         author_id: str | None = user.id
         # A turn another agent started takes that agent's prose as its
         # input. It speaks as that agent, never as the person, and it gets
@@ -716,7 +722,16 @@ class ApiContext:
                 if resolved is not None and resolved.slug == target
                 else None
             )
-            stopped = self._stop_from_chat(turn, target, content, author)
+            # Only the person's own words steer or stop: a peer an agent
+            # handed off to answers the request it was handed, a turn
+            # another agent started speaks as that agent, and a participant
+            # the person did not name was not spoken to.
+            direct = (
+                source_agent is None
+                and participant.get("parent_index") is None
+                and (target is None or target in (turn.targets or ()))
+            )
+            stopped = self._stop_from_chat(turn, target, content, principal) if direct else None
             if stopped is not None:
                 store.append_reply(
                     turn.id,
@@ -728,7 +743,7 @@ class ApiContext:
                 self.hub.notify()
                 index += 1
                 continue
-            steered = self._steer_by_mention(turn, target, content, author)
+            steered = self._steer_by_mention(turn, target, content, principal) if direct else None
             if steered is not None:
                 # The agent is working live work in this channel: the
                 # mention is direction for that run, not a fresh answer.
@@ -1148,7 +1163,39 @@ class ApiContext:
             log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
             return ()
 
-    def _stop_from_chat(self, turn: Turn, target: str | None, text: str, author: str) -> str | None:
+    def _chat_principal(self, user: LocalUser, author: str) -> Principal:
+        """The person behind a chat turn, holding what their workspace role
+        grants and nothing more (S-A11).
+
+        A stop or a steer from chat is the same operation the API performs,
+        so it answers to the same role model: a ``member`` may steer but may
+        not cancel a run, from either surface. The id is the user's, so the
+        recorded operation names the person; the display name is only the
+        attribution the source hears. Someone who is no longer a member, or
+        whose account is deactivated, holds nothing.
+        """
+        capabilities: frozenset[Capability] = frozenset()
+        workspace_id = WORKSPACE_ID
+        try:
+            member = self.collaboration.member_for_user(user.id)
+        except Exception:
+            log.warning("collaboration.member_lookup_failed", user=user.id, exc_info=True)
+            member = None
+        if member is not None and member.user.active:
+            capabilities = ROLE_CAPABILITIES[member.role]
+            workspace_id = member.workspace_id
+        return Principal(
+            kind="client",
+            id=user.id,
+            display=author,
+            via="collaboration",
+            capabilities=capabilities,
+            workspace_id=workspace_id,
+        )
+
+    def _stop_from_chat(
+        self, turn: Turn, target: str | None, text: str, principal: Principal
+    ) -> str | None:
         """Answer an explicit stop from chat (S-A11), or None.
 
         Only the exact words stop anything -- `/stop`, `/cancel`, or
@@ -1163,13 +1210,17 @@ class ApiContext:
         stop = getattr(self.loop, "stop_channel", None)
         if not callable(stop):
             return None
+        if not principal.can("runs:control"):
+            return "Nothing was stopped: you do not have permission to stop runs."
         try:
             stopped = stop(
                 turn.channel_id,
-                Principal.trusted(author, "collaboration"),
+                principal,
                 agent_slug=target if scope == "agent" else None,
             )
         except ControlError as exc:
+            if exc.code == "forbidden":
+                return "Nothing was stopped: you do not have permission to stop runs."
             return f"Nothing was stopped: {exc.message}"
         except Exception:
             log.warning("collaboration.stop_failed", channel=turn.channel_id, exc_info=True)
@@ -1183,7 +1234,7 @@ class ApiContext:
         )
 
     def _steer_by_mention(
-        self, turn: Turn, target: str | None, text: str, author: str
+        self, turn: Turn, target: str | None, text: str, principal: Principal
     ) -> str | None:
         """Hand this mention to the run ``target`` is working in this
         channel (S-A11), and say so; None when the mention is not about
@@ -1203,7 +1254,7 @@ class ApiContext:
                 turn.channel_id,
                 target,
                 text,
-                Principal.trusted(author, "collaboration"),
+                principal,
             )
         except ControlError as exc:
             log.info(

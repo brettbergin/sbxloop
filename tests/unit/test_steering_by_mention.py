@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from sbxloop.agents.assignment import AgentAssignment, AgentBinding
-from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.principal import ROLE_CAPABILITIES, Principal
 from sbxloop.daemon.controls.results import CancelOutcome, ControlError
 from sbxloop.engine.engine import ChatMessage, LoopEngine
 from sbxloop.engine.model import SteerVerdict, TaskSpec
@@ -309,15 +309,57 @@ class TestRouteMention:
         (target,) = loop.live_runs_for_agent("ch1", "scout")
         assert target.task_ids == ()
 
-    def test_steering_a_run_that_is_not_really_live_is_refused_by_name(
-        self, tmp_path: Path
-    ) -> None:
-        """The handle says the run is in flight but the engine is not this
-        loop's: the refusal is the control service's, not a crash."""
+    def test_the_steer_reaches_the_engine_with_the_task_and_the_agent(self, tmp_path: Path) -> None:
+        """Planned the way `_assign` plans it (no tasks), with assignees
+        recorded the way the engine records them: the one in-flight task
+        bound to the agent is the one steered, as that agent."""
         loop = self._loop(tmp_path)
-        loop._runs["r1"] = FakeHandle("r1", "ch1", assignment_json({}))
-        with pytest.raises((ControlError, AttributeError)):
-            loop.route_mention("ch1", "scout", "hi", Principal.trusted("me", "chat"))
+        handle = FakeHandle("r1", "ch1", assignment_json({}))
+        handle.engine = StubEngine()  # type: ignore[attr-defined]
+        loop._runs["r1"] = handle
+        loop.store.create_run("r1", "an outcome")
+        loop.store.save_tasks("r1", [TaskSpec(id="t1", title="t1"), TaskSpec(id="t2", title="t2")])
+        loop.store.set_task_assignees("r1", {"t1": "scout", "t2": "critic"})
+
+        outcome = loop.route_mention(
+            "ch1", "scout", "use the other library", Principal.trusted("me", "chat")
+        )
+
+        assert outcome is not None and outcome.run_id == "r1"
+        assert handle.engine.calls == [("use the other library", "t1", "scout")]  # type: ignore[attr-defined]
+
+    def test_a_steer_without_runs_steer_is_refused(self, tmp_path: Path) -> None:
+        loop = self._loop(tmp_path)
+        handle = FakeHandle("r1", "ch1", assignment_json({}))
+        handle.engine = StubEngine()  # type: ignore[attr-defined]
+        loop._runs["r1"] = handle
+        with pytest.raises(ControlError) as refused:
+            loop.route_mention("ch1", "scout", "hi", MEMBER_WITHOUT_STEER)
+        assert refused.value.code == "forbidden"
+        assert handle.engine.calls == []  # type: ignore[attr-defined]
+
+
+class StubEngine:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None, str | None]] = []
+
+    def post_user_message(
+        self, text: str, *, task_id: str | None = None, agent_slug: str | None = None
+    ) -> str:
+        self.calls.append((text, task_id, agent_slug))
+        return "m1"
+
+
+MEMBER_WITHOUT_STEER = Principal(
+    kind="client", id="usr_1", display="Someone", via="collaboration", capabilities=frozenset()
+)
+MEMBER = Principal(
+    kind="client",
+    id="usr_2",
+    display="Member",
+    via="collaboration",
+    capabilities=ROLE_CAPABILITIES["member"],
+)
 
 
 def test_the_steering_request_accepts_a_task_and_an_agent() -> None:
@@ -388,3 +430,21 @@ class TestStopFromChat:
         stopped = loop.stop_channel("ch1", Principal.trusted("me", "chat"), agent_slug="scout")
         assert stopped == ["r1"]
         assert cancelled == ["r1"]
+
+    def test_a_member_cannot_stop_a_channel(self, tmp_path: Path) -> None:
+        """`runs:control` stays with admins, from chat as from the API."""
+        from tests.unit.test_daemon_loop import Harness as LoopHarness
+
+        loop = LoopHarness(tmp_path).loop
+        cancelled: list[str] = []
+
+        def cancel(run_id: str, **kw: Any) -> CancelOutcome:
+            cancelled.append(run_id)
+            return CancelOutcome(mode="current", target=run_id, message="stopping")
+
+        loop.cancel_run = cancel  # type: ignore[assignment]
+        loop._runs["r1"] = FakeHandle("r1", "ch1", assignment_json({"t1": "scout"}))
+        with pytest.raises(ControlError) as refused:
+            loop.stop_channel("ch1", MEMBER)
+        assert refused.value.code == "forbidden"
+        assert cancelled == []

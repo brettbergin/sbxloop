@@ -73,9 +73,12 @@ a code run's checkout, is `404` like any other id from elsewhere.
   mention of an agent already working live work there is taken as direction
   for that run instead of a fresh answer, and the turn records
   `steered_run_id`; the mention has to be unambiguous, or it stays an
-  ordinary turn. Stopping stays explicit: `/stop`, `/cancel` or exactly
-  `@agent stop` cancels that channel's runs through the same control service
-  the API's cancel uses. New capability `collaboration.mention_steering`;
+  ordinary turn. Only a person's own mention steers: an agent another agent
+  hands off to answers the request it was handed. Stopping stays explicit:
+  `/stop`, `/cancel` or exactly `@agent stop` cancels that channel's runs
+  through the same control service the API's cancel uses, as the person who
+  typed it and with their workspace role's capabilities, so a `member` (who
+  may steer but not cancel) is told they may not stop runs. New capability `collaboration.mention_steering`;
   revision 0031 adds the turn column. An instruction that names no target is
   answered exactly as before.
 

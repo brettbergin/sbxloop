@@ -983,6 +983,13 @@ alone, for the third), through the same cancel the API's
 `POST /v1/runs/{id}/cancel` uses. A message that merely argues for stopping
 is steering, not a stop.
 
+Both act as the person who wrote the message, with the capabilities their
+workspace role grants: a `member` holds `runs:steer` but not
+`runs:control`, so a member's mention steers and a member's `/stop` is
+refused with a reply saying so. Only a mention the person wrote steers; an
+agent reached through another agent's handoff answers the request it was
+handed.
+
 ### Who sees which events
 
 When `/v1/capabilities` lists `events.scoped`, every event is recorded with

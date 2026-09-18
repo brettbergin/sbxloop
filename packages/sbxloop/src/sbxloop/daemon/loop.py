@@ -988,9 +988,17 @@ class DaemonLoop:
                 continue
             if agent_slug not in assignment.agents:
                 continue
+            # The admission snapshot names roles, not tasks: who does each
+            # task is written by the engine once it has planned them, so
+            # read it back from there, as the engine's own resume does.
+            try:
+                assignees = self.store.task_assignees(handle.run_id)
+            except SbxloopError:
+                assignees = {}
+            tasks = assignment.with_tasks(assignees).tasks
             live = [
                 task_id
-                for task_id, slug in assignment.tasks.items()
+                for task_id, slug in tasks.items()
                 if slug == agent_slug and self._task_in_flight(handle.run_id, task_id)
             ]
             targets.append(MentionTarget(run_id=handle.run_id, task_ids=tuple(live)))
@@ -1032,8 +1040,11 @@ class DaemonLoop:
         cancelled) is left out rather than failing the whole stop: the
         person asked for the channel to stop, not for a transaction.
         """
-        from sbxloop.daemon.controls.service import ControlService
+        from sbxloop.daemon.controls.service import ControlService, require
 
+        # Refused as a whole, before anything is listed: a person who may
+        # not cancel a run may not cancel a channel's worth of them.
+        require(principal, "runs:control")
         if agent_slug is None:
             run_ids = self.live_runs_in_channel(channel_id)
         else:
