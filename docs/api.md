@@ -356,6 +356,48 @@ the next batch. Only the newest summary is kept, and its model call is charged
 to the channel. It is best effort, and a channel without a summary simply gets
 a shorter history.
 
+### What a run says in its channel
+
+A run linked to a channel posts into it under the name of the agent doing
+the work, advertised as `collaboration.run_progress`. A post is a message
+with `kind` `agent_update`, `role` `assistant`, `author`
+`{"kind": "agent", "id": <slug>}` and `agent_slug` set to the same slug.
+It carries `post_kind`, one of `plan`, `progress`, `review`, `delivery`,
+`reply` or `notice`; every other message reports `post_kind` as null. When
+the run names files, they are listed on the post's `work.artifacts` in the
+shape described above.
+
+A post belongs to the turn that asked for its work, the same turn that
+work's result is delivered on, and to no turn at all rather than to one
+from another channel. A run a channel asked for outside any turn of its
+own still posts and still names its files: `work.turn_id` is null on such
+a post, so a client reads it as nullable. A snapshot a run hands in that
+does not fit this shape is replaced by what sbxloop itself knows about
+the work, and a snapshot already recorded that a later build cannot read
+is reported as no snapshot: a message the reader cannot parse never costs
+the channel its message list.
+
+Each post names a dedupe key, which is what makes a replayed, resumed or
+re-observed run post a moment once: the same key returns the message
+already recorded rather than a second copy of it. A channel that was
+deleted receives nothing. A silenced channel drops the running commentary
+and still hears the posts that end a run: `delivery` and `notice`.
+
+Clients read posts with the message history they already poll, or
+incrementally with `GET /v1/channels/{id}/messages?after=<sequence>`, and
+see each one as a `collaboration.message.created` event carrying
+`post_kind` and the run's public `run_id`, the id
+`GET /v1/runs/{id}` answers to. The events of a run a channel asked for, and the
+run's catalogued files, belong to that channel: a member who can open it
+sees them. A workspace member without `artifacts:read` may list and download
+the files of a run a channel they can open asked for, through
+`GET /v1/runs/{id}/artifacts` and `GET /v1/artifacts/{id}[/content]`; every
+other run's files, and an id nobody catalogued, answer the same `403`
+naming `artifacts:read` that they always did.
+
+A `post_kind` sbxloop does not know is never stored: the post is dropped and
+its dedupe key stays free. One recorded by a later build reads back as null.
+
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
 configuration, using the `concierge`, `decompose`, `build`, `review`, and

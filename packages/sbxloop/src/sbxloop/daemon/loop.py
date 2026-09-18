@@ -47,6 +47,7 @@ from sbxloop.agents.assignment import (
     plan_assignment,
 )
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
+from sbxloop.agents.posts import ChannelPoster
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
@@ -362,6 +363,7 @@ class DaemonLoop:
         github: DaemonGithub | None = None,
         worker_python: str | None = None,
         install_workers: bool | None = None,
+        poster: ChannelPoster | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -371,6 +373,10 @@ class DaemonLoop:
         self.clock = clock
         self.started_at = clock()
         self.frontend = frontend
+        # How a run linked to a channel posts into it (S-P17). The API
+        # listener supplies one; a daemon without the API has none, and a
+        # run then reports through its events alone.
+        self.poster = poster
         # The daemon's own gh-ops box: what the gate-approve path merges
         # with. None only in tests that never approve.
         self.github = github
