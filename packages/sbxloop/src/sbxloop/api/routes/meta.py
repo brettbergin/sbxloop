@@ -63,6 +63,12 @@ FEATURES: tuple[str, ...] = (
     "events.scoped",
     "collaboration.bridges",
     "agents.initiative",
+    "collaboration.lead_orchestrator",
+    "collaboration.run_progress",
+    "collaboration.channel_stop",
+    "collaboration.silence",
+    "collaboration.read_state",
+    "collaboration.mention_steering",
 )
 
 

@@ -155,6 +155,143 @@ class TestApiHostProbe:
         assert outcome.verdict == verdict
         assert bool(outcome.drifts) == (verdict != "unreachable")
 
+    def test_the_configured_bind_address_is_probed_and_policy_checked(
+        self, fake_sbx: FakeSbx
+    ) -> None:
+        from sbxloop.sbx.conformance import ProbeContext, _probe_api_host_unreachable
+        from sbxloop.sbx.models import ExecResult
+
+        seen: list[list[str]] = []
+
+        class _Sandbox:
+            name = "scratch"
+
+            def exec(self, argv: list[str], **_: object) -> ExecResult:
+                seen.append(argv)
+                return ExecResult(
+                    argv=argv,
+                    returncode=0,
+                    stdout="unreachable gateway=10.0.2.2\n",
+                    stderr="",
+                    duration_s=0.0,
+                )
+
+        ctx = ProbeContext(
+            cli=make_cli(fake_sbx),
+            sandbox=_Sandbox(),  # type: ignore[arg-type]
+            api_bind="192.168.6.101",
+            api_port=9000,
+        )
+        verdict, detail = _probe_api_host_unreachable(ctx)
+        assert verdict == "unreachable"
+        assert seen and "9000" in seen[0] and "192.168.6.101" in seen[0]
+        assert "192.168.6.101" in detail
+        assert any(p[:3] == ["check", "network", "192.168.6.101"] for p in fake_sbx.policies())
+
+
+class _HandshakeOnly:
+    """A listener that accepts a connection and closes it unanswered: what
+    sbx's network layer does with traffic its policy denies."""
+
+    def __init__(self) -> None:
+        import socket
+        import threading
+
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            conn.close()
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+class _Http:
+    """A listener that answers every GET with ``status`` and ``body``."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_: object) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestApiProbeScript:
+    """The in-sandbox half of api-host-unreachable, run for real against
+    local listeners: reachable means the API itself answered, never that a
+    connection was accepted (sbx's network layer accepts connections its
+    policy then drops, so a bare connect is reachable on every host)."""
+
+    def _run(self, port: int) -> str:
+        import os
+        import subprocess  # nosec B404 - runs this test's own interpreter
+        import sys
+
+        from sbxloop.sbx.conformance import _API_PROBE_SCRIPT
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
+        }
+        out = subprocess.run(  # nosec B603 - fixed argv
+            [sys.executable, "-c", _API_PROBE_SCRIPT, str(port)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            check=False,
+        )
+        return out.stdout.strip().splitlines()[-1]
+
+    def test_an_accepted_but_unanswered_connection_is_unreachable(self) -> None:
+        listener = _HandshakeOnly()
+        try:
+            assert self._run(listener.port).startswith("unreachable")
+        finally:
+            listener.close()
+
+    def test_an_answer_that_is_not_the_api_is_unreachable(self) -> None:
+        listener = _Http(403, b"blocked by network policy")
+        try:
+            assert self._run(listener.port).startswith("unreachable")
+        finally:
+            listener.close()
+
+    def test_the_api_answering_its_liveness_route_is_reachable(self) -> None:
+        listener = _Http(200, b'{"status":"ok"}')
+        try:
+            line = self._run(listener.port)
+        finally:
+            listener.close()
+        assert line.startswith("reachable") and "127.0.0.1" in line
+
 
 class TestPageSizeProbe:
     """Verdict logic for the bundled-ripgrep page-size probe (issue #122),

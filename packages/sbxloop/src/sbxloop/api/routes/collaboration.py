@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from sbxloop.agents.registry import AgentRegistry
 from sbxloop.api.auth.deps import (
@@ -19,7 +20,7 @@ from sbxloop.api.auth.deps import (
     require,
 )
 from sbxloop.api.auth.store import AuthError
-from sbxloop.api.channel_artifacts import resolve as resolve_channel_artifact
+from sbxloop.api.channel_artifacts import attached as attached_channel_artifact
 from sbxloop.api.collaboration import (
     ArtifactRef,
     Author,
@@ -57,6 +58,9 @@ from sbxloop.api.collaboration_schemas import (
     ChannelParticipantOut,
     ChannelParticipantPage,
     ChannelParticipantUpdate,
+    ChannelReadUpdate,
+    ChannelSilence,
+    ChannelStopOut,
     ChannelUpdate,
     ChannelWorkOut,
     ConnectionMutation,
@@ -88,16 +92,21 @@ from sbxloop.api.collaboration_schemas import (
     WorkflowOut,
     WorkflowUpdate,
 )
-from sbxloop.api.context import PAGE_MAX, ApiContext
+from sbxloop.api.context import PAGE_MAX, WORK_INTENTS, ApiContext, work_roles
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import TokenResponse, rfc3339
 from sbxloop.api.routes.agents import addressable
 from sbxloop.api.routes.artifacts import stream_artifact
 from sbxloop.api.routes.auth import grant_tokens
 from sbxloop.chatservices import CHAT_SERVICES
+from sbxloop.log import get_logger
 
+log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
+#: How long a stop keeps the channel quiet before it lifts on its own; a
+#: person who wants it quiet for longer says so with `silence`.
+STOP_SILENCE_S = 3600.0
 
 PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
@@ -271,6 +280,7 @@ def _channel_out(channel: Channel) -> ChannelOut:
         visibility="workspace" if channel.visibility == "workspace" else "private",
         created_by=channel.created_by,
         silenced_until=channel.silenced_until,
+        unread_count=channel.unread_count,
         my_role=channel.my_role,
     )
 
@@ -328,6 +338,22 @@ def _messages_out(messages: list[Message], ctx: ApiContext) -> list[MessageOut]:
     return [_message_out(message, ctx) for message in messages]
 
 
+def _work_out(message: Message) -> ChannelWorkOut | None:
+    """The work snapshot a message carries, when a client can read it.
+
+    A snapshot written by a build that named a field this one does not is
+    shown as no snapshot: the message, and every other message in the
+    channel, still reads back.
+    """
+    if not message.work:
+        return None
+    try:
+        return ChannelWorkOut.model_validate(message.work)
+    except ValidationError:
+        log.warning("api.message_work_unreadable", message=message.id, channel=message.channel_id)
+        return None
+
+
 def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -339,9 +365,10 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         content=message.content,
         agent_slug=message.agent_slug,
         created_at=rfc3339(message.created_at) or "",
-        work=ChannelWorkOut.model_validate(message.work) if message.work else None,
+        work=_work_out(message),
         reactions=list(message.reactions),
         author=_author_out(message.author, ctx),
+        post_kind=message.post_kind,
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
         origin=_origin_out(message.origin),
     )
@@ -390,6 +417,9 @@ def _turn_out(turn: Turn) -> TurnOut:
         author_id=None if turn.author is None else turn.author.id,
         trigger=turn.trigger,
         parent_turn_id=turn.parent_turn_id,
+        intent=turn.intent,
+        chain_depth=turn.chain_depth,
+        steered_run_id=turn.steered_run_id,
     )
 
 
@@ -1137,6 +1167,13 @@ def _mentioned_agents(ctx: ApiContext, content: str, targets: tuple[str, ...]) -
     return tuple(dict.fromkeys(slugs))
 
 
+def _assignees(ctx: ApiContext, slugs: tuple[str, ...]) -> dict[str, str]:
+    """The run roles the turn's mentions declare, as ``role -> slug``.
+    Admission assigns the run from these. Reads the registry, so it runs
+    through ``ctx.call``."""
+    return work_roles(ctx.agents, slugs)
+
+
 def _addressable(ctx: ApiContext, slug: str) -> str | None:
     """``slug``, when it names an agent a mention may reach. Reads the
     registry, so it runs through ``ctx.call``."""
@@ -1170,8 +1207,13 @@ async def create_turn(
     # Agent mentions remain part of an explicit runner ask, but do not seed
     # parallel chat participants. The runner owns its own internal roles.
     targets = () if runner_selected else await _targets(ctx, user, body.content, body.target_slugs)
-    intent = "delegate" if targets else body.intent
+    # A mention is a request to reply. It records the agent as a target and
+    # joins it to the channel; it never rewrites what the caller asked for.
+    intent = body.intent
     participants = await ctx.call(_mentioned_agents, ctx, body.content, targets)
+    assignees = (
+        await ctx.call(_assignees, ctx, participants) if intent in WORK_INTENTS else None
+    ) or None
     try:
         turn, message, created = await ctx.call(
             ctx.accept_collaboration_turn,
@@ -1184,6 +1226,7 @@ async def create_turn(
             actor=auth.principal.audit(),
             intent=intent,
             participants=participants,
+            assignees=assignees,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
@@ -1242,6 +1285,93 @@ async def cancel_turn(
         raise Problem(404, "turn_not_found", "turn not found")
     ctx.hub.notify()
     return _turn_out(turn)
+
+
+# -- stopping, silencing and reading a channel -----------------------------------
+
+
+@router.post("/channels/{channel_id}/stop", response_model=ChannelStopOut)
+async def stop_channel(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelStopOut:
+    """Stop everything this channel has in flight and silence it.
+
+    Anyone who may post may stop a channel they are in: a person watching
+    agents go somewhere they should not is the only guard that matters, and
+    waiting for whoever owns the channel would defeat it. Queued and
+    running turns are cancelled, the runs the channel asked for are
+    cancelled and the work it queued is abandoned through the daemon's
+    control service (scoped to this channel's own work, so a member who
+    may post needs no run control), and the channel is silenced until
+    ``resume`` or a ``silence`` of its own lifts it.
+    """
+    until = ctx.clock() + STOP_SILENCE_S
+    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, until, ctx.clock())
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    outcome = await ctx.call(
+        ctx.cancel_channel, channel_id, channel.silenced_until, principal=auth.principal
+    )
+    return ChannelStopOut.model_validate(outcome)
+
+
+@router.post("/channels/{channel_id}/resume", response_model=ChannelOut)
+async def resume_channel(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelOut:
+    """Lift the channel's silence; it does not restart what stop cancelled."""
+    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, None, ctx.clock())
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    ctx.hub.notify()
+    return _channel_out(channel)
+
+
+@router.put("/channels/{channel_id}/silence", response_model=ChannelOut)
+async def silence_channel(
+    channel_id: str,
+    body: ChannelSilence,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelOut:
+    """Quiet the channel's agents until ``until``; null lifts it. Nothing in
+    flight is cancelled: that is what ``stop`` is for."""
+    channel = await ctx.call(
+        ctx.collaboration.set_silence, member, channel_id, body.until, ctx.clock()
+    )
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    ctx.hub.notify()
+    return _channel_out(channel)
+
+
+@router.put("/channels/{channel_id}/read", response_model=ChannelMemberOut)
+async def set_channel_read(
+    channel_id: str,
+    body: ChannelReadUpdate,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelMemberOut:
+    """Record how far the caller has read. The sequence only moves forward,
+    and never past the newest message."""
+    try:
+        entry = await ctx.call(
+            ctx.collaboration.set_read_sequence, member, channel_id, body.sequence, ctx.clock()
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    if entry is None:
+        raise Problem(404, "channel_member_not_found", "the user is not in this channel")
+    ctx.hub.notify()
+    return _channel_member_out(entry)
 
 
 # -- channel members and participants --------------------------------------------
@@ -1435,14 +1565,16 @@ async def download_channel_artifact(
 ) -> StreamingResponse:
     """The bytes of one of the channel's files, as an attachment.
 
-    Resolved through the channel: a file this channel does not carry is
-    ``404`` whatever else the caller may read, so an id from elsewhere
-    never leaks through here.
+    Resolved through the channel's own file list: a file this channel does
+    not carry is ``404`` whatever else the caller may read -- including a
+    catalogued file of a run the channel started but never delivered here,
+    such as a code run's checkout -- so an id from elsewhere never leaks
+    through here.
     """
     channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    artifact = await ctx.call(resolve_channel_artifact, ctx, channel_id, artifact_id)
+    artifact = await ctx.call(attached_channel_artifact, ctx, channel_id, artifact_id)
     if artifact is None:
         raise Problem(404, "artifact_not_found", "artifact not found")
     return await stream_artifact(ctx, artifact.id)

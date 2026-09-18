@@ -12,7 +12,20 @@ with the channel's latest summary, written after a turn settles by one
 tool-less call on the concierge's model. Agents answering in a channel get
 `read_channel_artifact`, which reads a file that channel can see -- for
 read-only roles too -- refuses one from anywhere else, truncates with a marker
-naming the next offset, and never hands back bytes that are not text.
+naming the next offset, and never hands back bytes that are not text. Each
+channel is summarised in a session of its own, so no channel's transcript is
+resumed into another's summary; the summary covers exactly the messages the
+model was shown, and is written whenever the history window trims, on the
+character budget as well as the message count. Compaction runs on its own
+thread with a bounded wait, so a slow model never holds a channel's turn lane.
+Once a channel has a summary it is rewritten per batch (50 messages or 20,000
+characters fallen out), not per turn; only the newest summary row is kept, and
+the call's usage is charged to the channel it summarises. Shutting down abandons a summary
+the model has not answered and waits for one that is writing, so no compaction
+touches the store after it closes.
+The channel content route serves the channel's own files and nothing else: a
+catalogued file of a run the channel started but never delivered there, such as
+a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
@@ -46,6 +59,28 @@ naming the next offset, and never hands back bytes that are not text.
   note saying where it does run. Commands on the control channel,
   run-thread steering and an unlinked surface behave exactly as before.
   Advertised as `collaboration.bridges`.
+
+- **Steer one task, or one agent, by naming it; stop a channel from chat.**
+  Every instruction used to go into one mailbox and be answered by whichever
+  task lane reached a phase boundary first, in the run's own steering voice,
+  so with several lanes in flight "steer the builder working on t2" could be
+  answered by the lane working on t1. `POST /v1/runs/{id}/steering` now takes
+  an optional `task_id`, which puts the instruction in that task's own
+  mailbox so that lane answers it, and an optional `agent_slug`, which makes
+  the answer come back in that agent's persona and with its model; the run's
+  `chat.reply` event carries both. A task that ends with instructions still
+  waiting hands them to the run rather than dropping them. In a channel, a
+  mention of an agent already working live work there is taken as direction
+  for that run instead of a fresh answer, and the turn records
+  `steered_run_id`; the mention has to be unambiguous, or it stays an
+  ordinary turn. Only a person's own mention steers: an agent another agent
+  hands off to answers the request it was handed. Stopping stays explicit:
+  `/stop`, `/cancel` or exactly `@agent stop` cancels that channel's runs
+  through the same control service the API's cancel uses, as the person who
+  typed it and with their workspace role's capabilities, so a `member` (who
+  may steer but not cancel) is told they may not stop runs. New capability `collaboration.mention_steering`;
+  revision 0031 adds the turn column. An instruction that names no target is
+  answered exactly as before.
 
 - **Agents can start work and file issues themselves.** An agent whose
   `[[agents]]` entry declares `can_start` is offered two new tools in a chat
@@ -81,6 +116,145 @@ naming the next offset, and never hands back bytes that are not text.
   concierge's own filings do, so the code run a poll builds from it reports
   back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
+
+- **A listening agent may speak without being asked.** A channel
+  participant whose `mode` is `ambient` was listed and never heard from: it
+  answered only when named, like every other participant. With the new
+  `[collaboration] ambient = true` it may answer a message nobody addressed
+  to it, through three gates in order. Its `interests` are matched, case
+  insensitively, over the last `ambient_window_messages`; an agent none of
+  whose interests match is dropped there and no model is called for it.
+  What matches passes the mention guardrails with `trigger: "ambient"` —
+  the chain depth, the rate caps, the channel's silence and the token
+  budget — plus `ambient_max_per_hour` for that agent in that channel. What
+  survives gets one short relevance call on `ambient_model` (the
+  concierge's model when unset) that answers RELEVANT or PASS; a PASS posts
+  nothing and records `collaboration.followup.suppressed` with reason
+  `ambient_pass`, and being over the hourly cap records `ambient_cap`. What
+  passes all three becomes a turn whose reply is an ordinary agent
+  message, but the turn carries no authority: it runs read-only, with no
+  actions and no handoff, and the agent is told the message was not a
+  request to it. The relevance call is one-shot and resumes no session, so
+  no earlier verdict colours the next. Each decision is audited once, as its
+  final outcome. An agent never answers its own message; one already
+  answering the turn, or named in the message it would answer, does not
+  also volunteer; and each message is looked at once, by the turn that
+  posted it. `ambient = false`, the default, leaves every channel exactly
+  as it was.
+
+- **Agents address each other, under a person's control.** An agent's
+  reply is prose in a shared channel, so naming another agent in it now
+  addresses that agent: a follow-up turn is accepted for it, carrying
+  `trigger: "mention"`, the replying agent as its author, the reply as its
+  input message and one more `chain_depth`. A mention inside a code fence,
+  an inline code span or a block quote addresses nobody, an agent never
+  addresses itself, and one reply reaches at most four agents. Every
+  follow-up passes the new `[collaboration]` guardrails first — a chain
+  depth (default 4), a per-channel and a per-agent cap within a window
+  (20 and 6 per 10 minutes), a cooldown per ordered pair (60s), the
+  channel's silence and the workspace token budget — and each decision,
+  allowed or refused, records `collaboration.followup.queued` or
+  `collaboration.followup.suppressed` with its reason and never the
+  message text. A follow-up answers as a peer request, never as the
+  person's: the other agent's message is framed as that agent speaking,
+  with read-only tools and no handoff, and an agent still to answer in the
+  same turn is not addressed a second time. `POST /v1/channels/{id}/stop`
+  cancels the channel's turns, the runs its work is executing and the work
+  it queued (`cancelled_items`), for any member who may post, and silences
+  it,
+  `POST /v1/channels/{id}/resume` lifts that, and
+  `PUT /v1/channels/{id}/silence` quiets the agents without cancelling
+  anything; all three need only the right to post, because the person
+  watching is the guard that matters. `PUT /v1/channels/{id}/read` records
+  how far the caller has read, and the channel now reports `unread_count`.
+  Advertised as `collaboration.channel_stop`, `collaboration.silence` and
+  `collaboration.read_state`. `handoff_agent`, the peer request inside one
+  turn, is unchanged.
+
+- **A mention asks an agent to answer, not to queue a run.** Naming an
+  agent in a chat turn used to rewrite the turn's intent to `delegate`,
+  and the agent was told that anything it could not produce in the chat is
+  a workload to queue with one call and no confirmation, so an ask as
+  ordinary as a list came back as a queued run instead of an answer. The
+  caller's intent now survives a mention — a conversation stays a
+  conversation, and the mention still records the agent as a target and
+  joins it to the channel. A conversation that mentions an agent keeps
+  that agent's read tools but not the ones that start managed work
+  (`start_workload`, `start_entrygraph`, `create_schedule`, `create_issue`,
+  `label_issue_for_run`, nor an agent's own `start_run` and `file_issue`
+  whatever its `can_start` declares), so a reply is the only outcome it
+  can have, and the agent says which mode to pick when the ask needs work. Turns that may
+  start work carry the rule that an ask the reply itself can satisfy (a
+  list, an explanation, a short plan, an opinion, a judgement about work
+  already in the channel) is answered inline, with managed work reserved
+  for asks that need execution, external sources, a repository change or
+  a produced file. A turn with no tools at all now points the person at the
+  Code, Workload or Auto mode instead of at a mention. `TurnCreate`
+  also accepts `intent: "auto"` for a client that does not know which it
+  is and wants the lead to decide, advertised as
+  `collaboration.lead_orchestrator`; `TurnOut` now reports the recorded
+  `intent`. On a turn that may start work (`code`, `workload` or `auto`),
+  the mentioned agents that declare a run role are recorded as the first
+  participant's `assignees` (`role -> slug`), which admission assigns the
+  run from. An ask that genuinely needs work is still started without
+  asking for confirmation, and nothing is ever refused as out of scope.
+
+- **A run tells the channel that asked for it what it is doing.** The new
+  `RunChronicle` turns a run's events into short posts under the name of
+  the agent that did the work: the plan by the planner ("Split the ask
+  into 5 tasks"), each task by its agent ("Finished task 2 of 5: ...", or
+  "Task failed: ..." when it broke), the verdict by the critic ("2
+  findings, 1 blocking"), a steering reply by the agent that was asked,
+  and the delivery (with the run's files and the pull request link) or a
+  notice by the lead. Only work that finished is counted, so a failed or
+  skipped task never reads as one more task done. A run publishing to
+  several sinks makes one delivery post, and it is the answer the chat
+  sink carried rather than the line about where a file landed; a run with
+  no chat sink names where its result went instead. Each post names the
+  message that asked for the work, so it joins that turn in a channel
+  running several at once. It is attached to a run whose item names a
+  channel, and re-attached on a resume, where the re-announced roster
+  restores the count of tasks already finished; each post carries a key
+  naming its moment, so a resumed or replayed run says each thing once. A
+  stop belongs to the segment that reached it, so a run an operator
+  resumes that fails again says so again. A merge a person approves at a
+  `[landing] merge_gate` or a review wait is the run's delivery, posted
+  as the engine's own merge would be.
+  `[agent_team] chronicle` (`normal`, `quiet`, `off`),
+  `max_posts_per_run` (12) and `progress_interval_s` (120) bound it:
+  progress is coalesced to one post per interval and a run is capped
+  across its resumes, but the delivery and a terminal notice are always
+  posted. A run no channel
+  asked for posts nothing, and nothing about a run with the built-in team
+  changes.
+
+- **A run can say what it is doing in the channel that asked for it.** A
+  run linked to a channel posts under the name of the agent doing the
+  work: an `agent_update` message with that agent as its author, the kind
+  of post it is (`plan`, `progress`, `review`, `delivery`, `reply` or
+  `notice`) on the new `post_kind` field, and the files it delivered on
+  the work snapshot beside it. Every post names a dedupe key, recorded in
+  the new `channel_run_posts` table, so a replayed or resumed run posts a
+  moment once. A deleted channel receives nothing; a silenced channel
+  drops the running commentary and still hears a `delivery` or a
+  `notice`, because nobody is coming to look. A post hangs on the turn
+  that asked for its work, the same turn the work's result is delivered
+  on, so a run's commentary and its delivery do not split across two; a
+  turn belonging to another channel is never borrowed. A run a channel
+  asked for outside any turn of its own keeps its files all the same:
+  `work.turn_id` is now nullable. A snapshot is shown only if a client
+  can read it back, and one already recorded that this build cannot read
+  hides itself rather than the channel's whole message list. An item
+  admitted with a `channel_id` now belongs to that channel for event
+  visibility too, so a member who can open the channel sees the run's
+  events even when no message there names the work, and a workspace member
+  without `artifacts:read` may list and download the files of a run a
+  channel they can open asked for (anything else answers the same `403` as
+  before). A post of a kind this build does not know is dropped before it
+  is stored, and a stored kind a later build wrote reads back as a null
+  `post_kind`, so one row never fails the channel's message list. Nothing posts yet:
+  this is the contract (`ChannelPoster`) the daemon and engine will use,
+  advertised as `collaboration.run_progress`.
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
@@ -466,6 +640,15 @@ naming the next offset, and never hands back bytes that are not text.
   or a stream's access re-check. The single local user sees no change.
 
 ### Fixed
+
+- **`doctor --deep` no longer reports a sandbox reaching the remote API
+  when nothing got through.** The `api-host-unreachable` probe counted any
+  accepted connection as reachable, and sbx accepts connections its
+  network policy then closes unanswered, so on sbx 0.43 it drifted with
+  the API out of reach. It now counts the API as reachable only when the API's own
+  `/health/live` answer comes back, tried directly and through the
+  sandbox's proxy, and it also tries `host.docker.internal` and the
+  `[api] bind` address on `[api] port`, which it never did before.
 
 - **A runner's result in a conversation is credited to Angie.** A code
   or workload turn names no participant, so the `work_result` message and

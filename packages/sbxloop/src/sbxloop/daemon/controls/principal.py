@@ -54,7 +54,9 @@ ROLES: tuple[Role, ...] = get_args(Role)
 #: owner holds everything. An admin holds everything except managing
 #: credentials. A member may read and steer runs, ask for new work and take
 #: part in collaboration; run artifacts, controls, gates, budgets, daemon
-#: management, credentials, audit and diagnostics stay with admins.
+#: management, credentials, audit and diagnostics stay with admins. (The
+#: artifact routes still let a member read the files of a run a channel
+#: they can read asked for: see ``api/routes/artifacts.py``.)
 ROLE_CAPABILITIES: dict[Role, frozenset[Capability]] = {
     "owner": ALL_CAPABILITIES,
     "admin": ALL_CAPABILITIES - {"credentials:manage"},

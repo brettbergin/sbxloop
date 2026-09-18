@@ -175,6 +175,8 @@ class MessageRow(Base):
     author_id: Mapped[str | None] = mapped_column(Text)
     #: Where a message that arrived over a bridge came from, when it did.
     origin_json: Mapped[str | None] = mapped_column(Text)
+    #: What an ``agent_update`` message is (revision 0030); null otherwise.
+    post_kind: Mapped[str | None] = mapped_column(Text)
 
 
 class ChannelLinkRow(Base):
@@ -220,6 +222,24 @@ class ExternalIdentityRow(Base):
     verified_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
+class ChannelRunPostRow(Base):
+    """One post a run made in a channel (revision 0030).
+
+    The dedupe key is the run's own name for the moment it is posting
+    about, so a replayed, resumed or re-observed run finds its own row
+    instead of writing a second message.
+    """
+
+    __tablename__ = "channel_run_posts"
+    __table_args__ = (Index("idx_channel_run_posts_run", "run_id", "posted_at"),)
+
+    dedupe_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    posted_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
 class TurnRow(Base):
     __tablename__ = "collaboration_turns"
     __table_args__ = (
@@ -248,6 +268,9 @@ class TurnRow(Base):
     parent_turn_id: Mapped[str | None] = mapped_column(Text)
     source_message_id: Mapped[str | None] = mapped_column(Text)
     chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    #: The run this turn steered instead of answering (S-A11): a mention of
+    #: an agent working live work in this channel goes to that run.
+    steered_run_id: Mapped[str | None] = mapped_column(Text)
 
 
 class TeamRow(Base):

@@ -1347,6 +1347,17 @@
             "title": "Title",
             "type": "string"
           },
+          "unread_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unread Count"
+          },
           "updated_at": {
             "title": "Updated At",
             "type": "string"
@@ -1520,6 +1531,81 @@
         "title": "ChannelParticipantUpdate",
         "type": "object"
       },
+      "ChannelReadUpdate": {
+        "additionalProperties": false,
+        "description": "How far the caller has read this channel.",
+        "properties": {
+          "sequence": {
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence"
+        ],
+        "title": "ChannelReadUpdate",
+        "type": "object"
+      },
+      "ChannelSilence": {
+        "additionalProperties": false,
+        "description": "How long the channel's agents stay quiet; null lifts the silence.",
+        "properties": {
+          "until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until"
+          }
+        },
+        "title": "ChannelSilence",
+        "type": "object"
+      },
+      "ChannelStopOut": {
+        "additionalProperties": false,
+        "description": "What a stop actually stopped.",
+        "properties": {
+          "cancelled_items": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Items",
+            "type": "array"
+          },
+          "cancelled_runs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Runs",
+            "type": "array"
+          },
+          "cancelled_turns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Turns",
+            "type": "array"
+          },
+          "silenced_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Silenced Until"
+          }
+        },
+        "title": "ChannelStopOut",
+        "type": "object"
+      },
       "ChannelUpdate": {
         "additionalProperties": false,
         "description": "Only the fields sent change. Changing either one takes managing the\nchannel: its owner, or a workspace owner or admin.",
@@ -1646,13 +1732,19 @@
             "type": "string"
           },
           "turn_id": {
-            "title": "Turn Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Id"
           }
         },
         "required": [
           "item_id",
-          "turn_id",
           "agent_slug",
           "title",
           "kind",
@@ -3761,6 +3853,25 @@
               }
             ]
           },
+          "post_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "plan",
+                  "progress",
+                  "review",
+                  "delivery",
+                  "reply",
+                  "notice"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Kind"
+          },
           "reactions": {
             "items": {
               "type": "string"
@@ -4457,6 +4568,7 @@
       },
       "ParticipantOut": {
         "additionalProperties": false,
+        "description": "One agent's slot in a turn. ``assignees`` is set on the first slot of\na turn that may start managed work: the run roles the turn's mentions\ndeclare, as ``role -> agent slug``, which admission uses to assign the\nrun.",
         "properties": {
           "agent_slug": {
             "anyOf": [
@@ -4468,6 +4580,20 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "assignees": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignees"
           },
           "error": {
             "anyOf": [
@@ -5949,6 +6075,18 @@
       "SteerRequest": {
         "additionalProperties": false,
         "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
           "expected_revision": {
             "anyOf": [
               {
@@ -5968,6 +6106,18 @@
             "maxItems": 32,
             "title": "Source Refs",
             "type": "array"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
           },
           "text": {
             "maxLength": 16384,
@@ -6639,7 +6789,8 @@
               "conversation",
               "delegate",
               "code",
-              "workload"
+              "workload",
+              "auto"
             ],
             "title": "Intent",
             "type": "string"
@@ -6672,6 +6823,11 @@
               }
             ],
             "title": "Author Id"
+          },
+          "chain_depth": {
+            "default": 0,
+            "title": "Chain Depth",
+            "type": "integer"
           },
           "channel_id": {
             "title": "Channel Id",
@@ -6711,6 +6867,17 @@
             "title": "Input Message Id",
             "type": "string"
           },
+          "intent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intent"
+          },
           "parent_turn_id": {
             "anyOf": [
               {
@@ -6743,6 +6910,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "steered_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steered Run Id"
           },
           "targets": {
             "items": {
@@ -8775,7 +8953,7 @@
     },
     "/v1/channels/{channel_id}/artifacts/{artifact_id}/content": {
       "get": {
-        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel: a file this channel does not carry is\n``404`` whatever else the caller may read, so an id from elsewhere\nnever leaks through here.",
+        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel's own file list: a file this channel does\nnot carry is ``404`` whatever else the caller may read -- including a\ncatalogued file of a run the channel started but never delivered here,\nsuch as a code run's checkout -- so an id from elsewhere never leaks\nthrough here.",
         "operationId": "download_channel_artifact_v1_channels__channel_id__artifacts__artifact_id__content_get",
         "parameters": [
           {
@@ -9368,6 +9546,198 @@
           }
         },
         "summary": "Put Channel Participant",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/read": {
+      "put": {
+        "description": "Record how far the caller has read. The sequence only moves forward,\nand never past the newest message.",
+        "operationId": "set_channel_read_v1_channels__channel_id__read_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelReadUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Channel Read",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/resume": {
+      "post": {
+        "description": "Lift the channel's silence; it does not restart what stop cancelled.",
+        "operationId": "resume_channel_v1_channels__channel_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/silence": {
+      "put": {
+        "description": "Quiet the channel's agents until ``until``; null lifts it. Nothing in\nflight is cancelled: that is what ``stop`` is for.",
+        "operationId": "silence_channel_v1_channels__channel_id__silence_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelSilence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Silence Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/stop": {
+      "post": {
+        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced until\n``resume`` or a ``silence`` of its own lifts it.",
+        "operationId": "stop_channel_v1_channels__channel_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelStopOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Channel",
         "tags": [
           "collaboration"
         ]

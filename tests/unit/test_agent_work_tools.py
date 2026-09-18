@@ -517,7 +517,7 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
         assert self.UNGUARDED == UNGUARDED_START_TOOLS
 
     @staticmethod
-    def _offered(tmp_path: Path, agent_tools: list[Any]) -> set[str]:
+    def _offered(tmp_path: Path, agent_tools: list[Any], *, start_work: bool = True) -> set[str]:
         from tests.unit.test_daemon_concierge import FakeGithub as ConciergeGithub, make
 
         concierge, client, *_ = make(tmp_path, [{"text": "ok"}], github=ConciergeGithub())
@@ -525,6 +525,7 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
             "@scout look into it",
             author="ana",
             allow_actions=True,
+            start_work=start_work,
             agent_role="planner",
             agent_tools=agent_tools,
         ).result(timeout=10)
@@ -535,6 +536,16 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
         work, _, _ = service(tmp_path / "work")
         names = self._offered(tmp_path, offered(work, scout(can_start=["workload"])))
         assert {"start_run", "file_issue"} <= names
+        assert names.isdisjoint(self.UNGUARDED)
+
+    def test_a_turn_that_may_not_start_work_gets_neither_start_tool(self, tmp_path: Path) -> None:
+        """A conversation that mentions an agent asks it to reply, so even an
+        agent that declares ``can_start`` is offered no way to start work."""
+        work, _, _ = service(tmp_path / "work")
+        names = self._offered(
+            tmp_path, offered(work, scout(can_start=["workload"])), start_work=False
+        )
+        assert names.isdisjoint({"start_run", "file_issue"})
         assert names.isdisjoint(self.UNGUARDED)
 
     def test_an_agent_that_declares_nothing_keeps_the_tools_it_had(self, tmp_path: Path) -> None:

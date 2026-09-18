@@ -2810,6 +2810,19 @@ class DaemonStore:
                 or 0
             )
 
+    def resumes_for_run(self, run_id: str) -> int:
+        """How many times ``run_id`` was resumed (a provider recovery is
+        the same segment carrying on, and is not recorded as one)."""
+        with self._read() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(RunResumeRow)
+                    .where(RunResumeRow.run_id == run_id)
+                )
+                or 0
+            )
+
     def resumes_for_item(self, item_id: str) -> int:
         """Resumes across ALL of the item's runs: the budget bounds total
         effort per item, not per plan."""

@@ -771,8 +771,9 @@ def test_example_memory_section_documents_the_defaults() -> None:
 
 def test_example_agent_team_section_documents_the_defaults() -> None:
     """The commented `[agent_team]` block, uncommented whole, loads and
-    equals the model's defaults: the example never advertises a chain depth
-    or a per-agent cap the daemon does not actually apply."""
+    equals the model's defaults: the example never advertises a chain depth,
+    a per-agent cap or a value for what a run says in its channel that the
+    daemon does not actually apply."""
     text = ""
     in_block = False
     for line in DEFAULT_CONFIG_TOML.splitlines():
@@ -784,8 +785,55 @@ def test_example_agent_team_section_documents_the_defaults() -> None:
         elif in_block and not line.strip():
             break
     block = tomllib.loads(text)
-    assert set(block) == {"max_chain_depth", "max_agent_runs_per_day"}
+    assert set(block) == {
+        "max_chain_depth",
+        "max_agent_runs_per_day",
+        "chronicle",
+        "max_posts_per_run",
+        "progress_interval_s",
+    }
     assert Config.model_validate({"agent_team": block}).agent_team == Config().agent_team
+
+
+def test_example_collaboration_section_documents_the_defaults() -> None:
+    """The commented `[collaboration]` block, uncommented whole, loads and
+    equals the model's defaults, so the guardrail example never advertises
+    a cap the daemon does not apply."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[collaboration]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "max_chain_depth",
+        "window_s",
+        "channel_turns_per_window",
+        "agent_turns_per_window",
+        "pair_cooldown_s",
+        "ambient",
+        "ambient_window_messages",
+        "ambient_max_per_hour",
+    }
+    assert Config.model_validate({"collaboration": block}).collaboration == Config().collaboration
+
+
+def test_example_documents_the_ambient_model_as_an_opt_in() -> None:
+    """`[collaboration] ambient_model` ships unset, so the classifier reuses
+    the concierge's model until an operator names a cheaper one. It is shown
+    outside the defaults block with a value that loads."""
+    text = DEFAULT_CONFIG_TOML
+    section = text[text.index("# [collaboration]") :]
+    match = re.search(r'^# ambient_model = "([^"]+)"', section, re.MULTILINE)
+    assert match is not None, "[collaboration] ambient_model is not in the example"
+    assert Config().collaboration.ambient_model is None
+    loaded = Config.model_validate({"collaboration": {"ambient_model": match.group(1)}})
+    assert loaded.collaboration.ambient_model == match.group(1)
 
 
 def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:

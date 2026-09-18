@@ -1944,6 +1944,8 @@ def doctor_report(
                 template=config.sandbox.template,
                 resources=config.sandbox_resources_for("service"),
                 progress=report,
+                api_bind=config.api.bind,
+                api_port=config.api.port,
             )
         except SbxError as exc:
             note = f"sbx conformance suite failed to run: {_clean(str(exc))}"

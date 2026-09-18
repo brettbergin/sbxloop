@@ -46,7 +46,9 @@ from sbxloop.agents.assignment import (
     RunRole,
     plan_assignment,
 )
+from sbxloop.agents.chronicle import RunChronicle
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
+from sbxloop.agents.posts import ChannelPoster, RunArtifacts
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
@@ -56,7 +58,13 @@ from sbxloop.daemon.controls.generation import (
     new_generation_id,
 )
 from sbxloop.daemon.controls.operations import OperationStore, reconcile_operations
-from sbxloop.daemon.controls.results import CancelOutcome, ControlError, ResumeOutcome
+from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.results import (
+    CancelOutcome,
+    ControlError,
+    ResumeOutcome,
+    SteerOutcome,
+)
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -112,7 +120,7 @@ from sbxloop.errors import (
     SbxloopError,
     StateError,
 )
-from sbxloop.events import Event, EventBus
+from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
 from sbxloop.ghids import (
     is_api_id,
@@ -248,6 +256,14 @@ class CancelRequest(NamedTuple):
     operation_id: str | None = None
 
 
+class MentionTarget(NamedTuple):
+    """A live run an ``@agent`` mention could be about, and the tasks in it
+    bound to that agent which are still in flight (S-A11)."""
+
+    run_id: str
+    task_ids: tuple[str, ...]
+
+
 class RunHandle:
     """A run in flight: what shutdown, a control and a frontend need to
     reach, and what the loop needs to settle it once its thread ends."""
@@ -362,6 +378,7 @@ class DaemonLoop:
         github: DaemonGithub | None = None,
         worker_python: str | None = None,
         install_workers: bool | None = None,
+        poster: ChannelPoster | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -371,6 +388,10 @@ class DaemonLoop:
         self.clock = clock
         self.started_at = clock()
         self.frontend = frontend
+        # How a run linked to a channel posts into it (S-P17). The API
+        # listener supplies one; a daemon without the API has none, and a
+        # run then reports through its events alone.
+        self.poster = poster
         # The daemon's own gh-ops box: what the gate-approve path merges
         # with. None only in tests that never approve.
         self.github = github
@@ -893,6 +914,8 @@ class DaemonLoop:
         *,
         by: str | None = None,
         expected_revision: int | None = None,
+        task_id: str | None = None,
+        agent_slug: str | None = None,
     ) -> str:
         """Hand an instruction to the run in flight (#1038): the same
         ``post_user_message`` a chat thread uses, so the agent pauses at
@@ -903,13 +926,23 @@ class DaemonLoop:
         when it is a tool run (nothing to steer), or when
         ``expected_revision`` is not the run's — all judged under the
         current-run lock, so the run cannot end between the check and the
-        hand-over."""
+        hand-over.
+
+        ``task_id`` addresses one task lane, so the instruction is answered
+        by that task rather than by whichever lane reaches a boundary first;
+        ``agent_slug`` names the agent that was mentioned, and the answer
+        comes back in its persona (S-A11). Neither is validated here: the
+        engine holds the task board and the run's assignment, and falls back
+        to run-level steering in its own default voice for a target it does
+        not have."""
         with self._current_lock:
             handle = self._runs.get(run_id)
             if handle is not None:
                 check_eligibility("steer", Subject(run_kind=handle.item.kind, is_current=True))
                 self._check_revision(run_id, expected_revision)
-                message_id = handle.engine.post_user_message(text)
+                message_id = handle.engine.post_user_message(
+                    text, task_id=task_id, agent_slug=agent_slug
+                )
         if handle is None:
             try:
                 record = self.store.get_run(run_id)
@@ -926,8 +959,139 @@ class DaemonLoop:
             by=by or "operator",
             message=message_id,
             chars=len(text),
+            task=task_id,
+            agent=agent_slug,
         )
         return message_id
+
+    # -- mentions ------------------------------------------------------------------
+
+    def live_runs_for_agent(self, channel_id: str, agent_slug: str) -> list[MentionTarget]:
+        """Every run in flight for ``channel_id`` that ``agent_slug`` works
+        on, with the tasks bound to that agent which are still in flight.
+
+        Read under the current-run lock so a run cannot finish between
+        being listed and being steered.
+        """
+        targets: list[MentionTarget] = []
+        with self._current_lock:
+            handles = list(self._runs.values())
+        for handle in handles:
+            if (handle.item.channel_id or "") != channel_id:
+                continue
+            if not is_planned_assignment(handle.item.assignment_json):
+                continue
+            assert handle.item.assignment_json is not None
+            try:
+                assignment = AgentAssignment.from_json(handle.item.assignment_json)
+            except ValueError:
+                continue
+            if agent_slug not in assignment.agents:
+                continue
+            # The admission snapshot names roles, not tasks: who does each
+            # task is written by the engine once it has planned them, so
+            # read it back from there, as the engine's own resume does.
+            try:
+                assignees = self.store.task_assignees(handle.run_id)
+            except SbxloopError:
+                assignees = {}
+            tasks = assignment.with_tasks(assignees).tasks
+            live = [
+                task_id
+                for task_id, slug in tasks.items()
+                if slug == agent_slug and self._task_in_flight(handle.run_id, task_id)
+            ]
+            targets.append(MentionTarget(run_id=handle.run_id, task_ids=tuple(live)))
+        return targets
+
+    def _task_in_flight(self, run_id: str, task_id: str) -> bool:
+        """Whether ``task_id`` is a task this run is still working on."""
+        try:
+            tasks = self.store.get_tasks(run_id)
+        except SbxloopError:
+            return False
+        return any(task.spec.id == task_id and not task.terminal for task in tasks)
+
+    def live_runs_in_channel(self, channel_id: str) -> list[str]:
+        """Every run in flight that answers to ``channel_id``."""
+        with self._current_lock:
+            return [
+                handle.run_id
+                for handle in self._runs.values()
+                if (handle.item.channel_id or "") == channel_id
+            ]
+
+    def stop_channel(
+        self,
+        channel_id: str,
+        principal: Principal,
+        *,
+        agent_slug: str | None = None,
+    ) -> list[str]:
+        """Cancel the runs a channel's ``/stop`` means, and say which (S-A11).
+
+        ``agent_slug`` narrows it to the runs that agent works on, which is
+        what an exact ``@agent stop`` asks for. Every cancel goes through
+        :class:`ControlService`, so a stop from chat is recorded as the same
+        operation a stop from the API is -- there is one way to cancel a
+        run, whichever surface asked.
+
+        A run that refuses (it settled between being listed and being
+        cancelled) is left out rather than failing the whole stop: the
+        person asked for the channel to stop, not for a transaction.
+        """
+        from sbxloop.daemon.controls.service import ControlService, require
+
+        # Refused as a whole, before anything is listed: a person who may
+        # not cancel a run may not cancel a channel's worth of them.
+        require(principal, "runs:control")
+        if agent_slug is None:
+            run_ids = self.live_runs_in_channel(channel_id)
+        else:
+            run_ids = [t.run_id for t in self.live_runs_for_agent(channel_id, agent_slug)]
+        service = ControlService(self)
+        stopped: list[str] = []
+        for run_id in run_ids:
+            try:
+                service.cancel_run(principal, run_id)
+            except ControlError as exc:
+                log.info("channel.stop_refused", channel=channel_id, run=run_id, why=exc.message)
+                continue
+            stopped.append(run_id)
+        log.info("channel.stopped", channel=channel_id, agent=agent_slug, runs=stopped)
+        return stopped
+
+    def route_mention(
+        self,
+        channel_id: str,
+        agent_slug: str,
+        text: str,
+        principal: Principal,
+    ) -> SteerOutcome | None:
+        """Steer the run an ``@agent`` mention in ``channel_id`` is about
+        (S-A11), or None when the mention is not about live work.
+
+        One run, one target: when exactly one task in that run is bound to
+        the agent and still in flight, the instruction goes to that task's
+        lane; otherwise it goes to the run, which is where steering has
+        always landed. Several live runs in one channel name the agent is
+        the same ambiguity — there is no "the" run to steer — so the
+        mention is left to be an ordinary turn.
+        """
+        targets = self.live_runs_for_agent(channel_id, agent_slug)
+        if len(targets) != 1:
+            return None
+        target = targets[0]
+        task_id = target.task_ids[0] if len(target.task_ids) == 1 else None
+        from sbxloop.daemon.controls.service import ControlService
+
+        return ControlService(self).steer(
+            principal,
+            target.run_id,
+            text,
+            task_id=task_id,
+            agent_slug=agent_slug,
+        )
 
     def _check_revision(self, run_id: str, expected: int | None) -> None:
         if expected is None:
@@ -2476,6 +2640,37 @@ class DaemonLoop:
         )
         return item.model_copy(update={"assignment_json": text})
 
+    def _chronicle(
+        self, item: WorkItem, run_id: str, item_config: Config | None = None
+    ) -> RunChronicle | None:
+        """The chronicle telling ``run_id``'s story in the channel that asked
+        for ``item``, or None when nobody asked. The poster the API listener
+        supplies also lists a run's files; one that does not simply posts
+        without them. A resumed segment is numbered by the resumes the run
+        has had, so a stop it reaches is said even when an earlier segment
+        stopped the same way."""
+        posts: object = self.poster
+        return RunChronicle.for_item(
+            self.poster,
+            _item_assignment(item),
+            item,
+            item_config or self._item_config(item),
+            self.clock,
+            artifacts=posts if isinstance(posts, RunArtifacts) else None,
+            resumes=self.dstore.resumes_for_run(run_id) if self.poster is not None else 0,
+        )
+
+    def _chronicle_landed(
+        self, item: WorkItem | None, run_id: str, pr: int | None, url: str | None
+    ) -> None:
+        """A parked run a person approved has merged, outside its engine:
+        tell its channel, as the engine's own merge would have."""
+        if item is None:
+            return
+        chronicle = self._chronicle(item, run_id)
+        if chronicle is not None:
+            chronicle.on_event(Event.now(HostEventTypes.RUN_MERGED, run_id, pr=pr, url=url))
+
     def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
@@ -2511,6 +2706,12 @@ class DaemonLoop:
         bus.subscribe(event_log_subscriber)
         # What the run's agents report spending is charged to the pool.
         bus.subscribe(self.usage_pool.subscriber(getattr(item, "channel_id", None)))
+        # What the run does is told in the channel that asked for it, under
+        # the names of the agents doing it. A resume re-attaches it: the
+        # posts a run already made are keyed, so nothing is said twice.
+        chronicle = self._chronicle(item, run_id, item_config)
+        if chronicle is not None:
+            bus.subscribe(chronicle.on_event)
         engine = LoopEngine(
             item_config,
             store=self.store,
@@ -3528,6 +3729,7 @@ class DaemonLoop:
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            self._chronicle_landed(fresh, run_id, hold.pr_number, hold.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} {how} · PR #{hold.pr_number}",
@@ -3767,6 +3969,7 @@ class DaemonLoop:
                 self._deliver_report(fresh)
             if item is not None:
                 self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
+            self._chronicle_landed(fresh or item, run_id, gate.pr_number, gate.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} merged after approval by {by} · PR #{gate.pr_number}",

@@ -2927,7 +2927,8 @@ class MemoryConfig(_ConfigModel):
 
 
 class AgentTeamConfig(_ConfigModel):
-    """What the agent team may do on its own initiative (S-A12).
+    """What the agent team may do on its own initiative (S-A12), and what a
+    run tells the channel that asked for it.
 
     An agent that declares ``can_start`` gets ``start_run`` and
     ``file_issue``. Two bounds keep that from becoming a spiral: how deep
@@ -2937,6 +2938,12 @@ class AgentTeamConfig(_ConfigModel):
     ``max_chain_depth = 0`` stops agent-started work entirely without
     editing every agent; ``max_agent_runs_per_day`` is the default an
     ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+
+    ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
+    replies, the delivery and any notice; ``"quiet"`` posts only what ends
+    a run (its delivery, and a notice when it stopped); ``"off"`` posts
+    nothing. The delivery and a terminal notice are posted whatever the
+    cap, because a run nobody hears finish is a run nobody can act on.
     """
 
     # Work a person asked for is depth 0; the run an agent starts from it
@@ -2944,6 +2951,49 @@ class AgentTeamConfig(_ConfigModel):
     max_chain_depth: int = Field(default=2, ge=0)
     # The daily cap for an agent whose spec names none.
     max_agent_runs_per_day: int = Field(default=4, ge=0)
+    # What a run posts in the channel that asked for it.
+    chronicle: Literal["normal", "quiet", "off"] = "normal"
+    # The most posts one run makes, across its resumes; the delivery and
+    # terminal notices are above it.
+    max_posts_per_run: int = Field(default=12, ge=1)
+    # Progress posts are coalesced to at most one this often.
+    progress_interval_s: float = Field(default=120.0, ge=0)
+
+
+class CollaborationConfig(_ConfigModel):
+    """What keeps agents talking to each other from running away.
+
+    An agent's reply is prose in a shared channel, so naming another agent
+    in it queues a turn by that agent. Without bounds two agents would
+    answer each other forever, so every follow-up passes these: how deep a
+    chain of agent-started turns may go, how many agent turns a channel and
+    a single agent may take within one window, and how long one agent waits
+    before addressing the same agent again. The channel's own silence and
+    the workspace token budget apply on top of them.
+    """
+
+    # How many agent-started turns may follow one human turn.
+    max_chain_depth: int = Field(default=4, ge=0, le=32)
+    # The window the two rate caps count within, in seconds.
+    window_s: float = Field(default=600.0, gt=0)
+    # Agent turns one channel may take within the window.
+    channel_turns_per_window: int = Field(default=20, ge=0)
+    # Agent turns one agent may take in a channel within the window.
+    agent_turns_per_window: int = Field(default=6, ge=0)
+    # How long one agent waits before addressing the same agent again.
+    pair_cooldown_s: float = Field(default=60.0, ge=0)
+    # Whether a channel participant in `ambient` mode may speak without
+    # being addressed. Off until an operator turns it on: an agent that
+    # answers uninvited is a surprise, and a surprise that spends tokens.
+    ambient: bool = False
+    # The model the relevance classifier uses; None reuses the concierge's.
+    # A cheap one belongs here: it runs once per ambient participant per
+    # message that gets past the interest prefilter.
+    ambient_model: str | None = None
+    # How many recent messages the prefilter and the classifier read.
+    ambient_window_messages: int = Field(default=5, ge=1, le=50)
+    # How often one ambient agent may speak in a channel, per hour.
+    ambient_max_per_hour: int = Field(default=6, ge=0)
 
 
 class Config(_ConfigModel):
@@ -3022,8 +3072,11 @@ class Config(_ConfigModel):
     agents: list[AgentSpec] = Field(default_factory=list)
     # Each agent's long-term memory (bounds and the on/off switch).
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
-    # What agents may start on their own, and how much of it.
+    # What agents may start on their own, how much of it, and what a run
+    # says in the channel that asked for it.
     agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
+    # The bounds on agents addressing each other in a channel.
+    collaboration: CollaborationConfig = Field(default_factory=CollaborationConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:
