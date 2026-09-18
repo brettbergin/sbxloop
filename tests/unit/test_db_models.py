@@ -47,6 +47,7 @@ DAEMON_TABLES = (
     "daemon_local_messages",
     "daemon_schedules",
     "daemon_holds",
+    "workspace_usage",
 )
 API_TABLES = (
     "api_operations",
@@ -64,6 +65,8 @@ COLLABORATION_TABLES = (
     "collaboration_channel_members",
     "collaboration_channel_participants",
     "collaboration_messages",
+    "collaboration_message_artifacts",
+    "collaboration_channel_summaries",
     "collaboration_turns",
     "collaboration_teams",
     "collaboration_preferences",
@@ -72,6 +75,9 @@ COLLABORATION_TABLES = (
     "workspace_invites",
     "agents",
     "agent_memories",
+    "collaboration_channel_links",
+    "collaboration_external_identities",
+    "channel_run_posts",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 

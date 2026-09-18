@@ -386,14 +386,21 @@ class ServiceOps:
             },
         )
 
-    def tool_spec(self) -> HostToolSpec:
+    def narrowed_tool_spec(self, allowed: Sequence[str]) -> HostToolSpec | None:
+        """The ``call_service`` tool for an agent limited to ``allowed`` of
+        the granted credentials; None when it may use none of them."""
+        names = [name for name in self.credentials if name in allowed]
+        return self.tool_spec(only=names) if names else None
+
+    def tool_spec(self, only: Sequence[str] | None = None) -> HostToolSpec:
         """The ``call_service`` tool as the agent session sees it: the
         granted credential names are the enum, so the model cannot even
-        spell one it was not given."""
-        names = list(self.credentials)
+        spell one it was not given. ``only`` narrows the enum further."""
+        entries = [c for c in self.catalogue.values() if only is None or c.name in only]
+        names = [c.name for c in entries]
         granted = "; ".join(
             f"{c.name} → https://{c.host}" + (f" ({c.description})" if c.description else "")
-            for c in self.catalogue.values()
+            for c in entries
         )
         return HostToolSpec(
             name=TOOL_NAME,

@@ -294,6 +294,11 @@ class SlackBridge(ChatBridge):
             return SlackTarget(thread_id)
         return SlackTarget(self.slack.channel_id or "", thread_ts=thread_id)
 
+    async def _link_target(self, surface_id: str, thread_id: str | None) -> Any:
+        """A linked surface is any channel, not only the control one, and
+        Slack addresses a thread as (channel, thread_ts) — so both ride."""
+        return SlackTarget(surface_id, thread_ts=thread_id)
+
     async def _fetch_message(self, channel: Any, message_id: str) -> Any:
         return SlackMessage(channel.channel, message_id, getattr(channel, "thread_ts", None))
 

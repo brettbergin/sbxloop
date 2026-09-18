@@ -14,6 +14,8 @@ from sbxloop_worker.protocol import Event, EventTypes
 log = get_logger(__name__)
 
 Subscriber = Callable[[Event], None]
+#: Adds to one host event's data in place, given its type (`EventBus.stamp_run`).
+Stamp = Callable[[str, dict[str, Any]], None]
 
 
 @runtime_checkable
@@ -45,6 +47,9 @@ class EventBus:
     def __init__(self) -> None:
         self._subscribers: list[Subscriber] = []
         self._publish_lock = threading.RLock()
+        # run_id -> what a host emit for that run is stamped with first
+        # (the named agent it is credited to); see `stamp_run`.
+        self._stamps: dict[str, Stamp] = {}
 
     def subscribe(self, fn: Subscriber) -> Callable[[], None]:
         """Register a subscriber; returns an unsubscribe callable."""
@@ -55,6 +60,18 @@ class EventBus:
                 self._subscribers.remove(fn)
 
         return unsubscribe
+
+    def stamp_run(self, run_id: str, stamp: Stamp) -> Callable[[], None]:
+        """Let ``stamp`` add to the data of every event :meth:`emit` builds
+        for ``run_id`` until the returned callable is called. Only host
+        emits are stamped: a published event (what a worker sent) is not."""
+        self._stamps[run_id] = stamp
+
+        def unstamp() -> None:
+            if self._stamps.get(run_id) is stamp:
+                del self._stamps[run_id]
+
+        return unstamp
 
     def attach_hook(self, hook: Hook) -> Callable[[], None]:
         return self.subscribe(hook.on_event)
@@ -80,6 +97,9 @@ class EventBus:
         **data: Any,
     ) -> Event:
         """Construct an Event stamped now, publish it, and return it."""
+        stamp = self._stamps.get(run_id)
+        if stamp is not None:
+            stamp(type, data)
         event = Event.now(type, run_id, job_id=job_id, **data)
         self.publish(event)
         return event

@@ -22,10 +22,17 @@ do the same.
 Threading: turns run on the concierge's own worker pool, at most
 ``[concierge] max_concurrent_turns`` at once (one by default;
 ``submit_turn`` returns a Future; ``pending`` says how many are queued
-behind the running ones). What a turn's tools need to know about it (the
-speaker, the session, the handoff callback...) is a :class:`TurnContext`
-held in a context variable, never in shared instance state, so overlapping
-turns cannot read each other's. Tool handlers run on the WorkerClient's
+behind the running ones), each on a worker client of its own leased from
+the session host (:meth:`~sbxloop.daemon.agentbox.DaemonAgent.lease`).
+Turns that resume the same SDK session are serialised into one FIFO lane
+by their ``session_key``, so however wide the pool is set, no two turns
+share a ``resume_session_id`` at once and a surface's messages are still
+answered in the order they arrived; every chat bridge turn carries no
+``session_key`` and so shares the one default session's lane.
+What a turn's tools need to know about it (the speaker, the session, the
+handoff callback...) is a :class:`TurnContext` held in a context
+variable, never in shared instance state, so overlapping turns cannot
+read each other's. Tool handlers run on the WorkerClient's
 host-tool pool while the session is blocked; each handler carries its
 turn's context onto that thread, and the handlers are serialised by
 ``_tool_lock`` — the daemon loop and the daemon store have their own
@@ -41,14 +48,17 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
+from sbxloop.agents.tools import UNGUARDED_START_TOOLS, WORK_TOOL_NAMES, AgentTool
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
@@ -62,7 +72,7 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
-from sbxloop.daemon.model import WorkItem, live_runs
+from sbxloop.daemon.model import WorkItem, live_runs, requested_roles_json
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
@@ -72,6 +82,7 @@ from sbxloop.daemon.usage import (
     usage_row,
     usage_rows,
 )
+from sbxloop.daemon.usagepool import UsagePool
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.harness import ROLE_BY_PHASE, Role, harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
@@ -193,6 +204,10 @@ class TurnContext:
     history: str | None = None
     persona: str | None = None
     allow_actions: bool = True
+    #: Whether the turn may start managed work (a workload, an issue for a
+    #: run, a scan or a schedule); a turn that may only reply keeps its
+    #: other tools.
+    start_work: bool = True
     role: Role = "concierge"
     read_only: bool = False
     handoff: Callable[[str, str], str] | None = None
@@ -203,7 +218,29 @@ class TurnContext:
     model_override: str | None = None
     tool_activity: Callable[[str, str, bool | None], None] | None = None
     code_work: Callable[[str, int, str], None] | None = None
+    #: Where the turn's reported usage is charged in the workspace budget
+    #: pool: the product channel it answers and the agent that speaks.
+    usage_channel_id: str | None = None
+    usage_agent_slug: str | None = None
+    #: The answering agent's own tools (its memory), offered beside the
+    #: turn's host tools when the turn may act.
+    agent_tools: tuple[AgentTool, ...] = ()
+    #: Tools over the turn's channel itself (reading a file delivered
+    #: there). Unlike ``agent_tools`` these belong to the conversation, not
+    #: to the speaker, so they are offered through the roster's own
+    #: allowlist and a read-only role keeps the ones that only read.
+    channel_tools: tuple[AgentTool, ...] = ()
+    #: The channel the turn belongs to, and the lead and the agent per run
+    #: role the turn asked for: what work the turn starts is admitted with.
+    channel_id: str | None = None
+    work_lead: str | None = None
+    work_roles: Mapping[str, str] = field(default_factory=dict)
+    #: A one-shot call: it resumes no session and leaves none behind.
+    stateless: bool = False
     work_products: list[str] = field(default_factory=list)
+    #: The sandbox generation of the turn's last session call, so a failure
+    #: is blamed on the box it happened in.
+    lease_generation: int | None = None
     #: Effects the turn's tools promised for after the reply (#969).
     after: list[Callable[[], None]] = field(default_factory=list)
 
@@ -252,9 +289,13 @@ class SessionHost(Protocol):
 
     def client(self) -> WorkerClient: ...
 
+    def lease(self, timeout: float | None = None) -> AbstractContextManager[WorkerClient]: ...
+
+    def lease_generation(self, client: WorkerClient) -> int | None: ...
+
     def agent_rate_limits(self) -> RateLimitReport: ...
 
-    def note_failure(self, exc: BaseException) -> bool: ...
+    def note_failure(self, exc: BaseException, generation: int | None = None) -> bool: ...
 
     def close(self) -> None: ...
 
@@ -266,6 +307,15 @@ ToolImpl = Callable[[dict[str, Any], str], str]
 class HostTool(NamedTuple):
     spec: HostToolSpec
     impl: ToolImpl
+
+
+def _as_roster_impl(tool: AgentTool) -> ToolImpl:
+    """An agent tool in the roster's ``(args, by)`` shape."""
+
+    def impl(args: dict[str, Any], _by: str) -> str:
+        return tool.impl(args)
+
+    return impl
 
 
 def compose_issue_body(args: Mapping[str, Any]) -> str:
@@ -367,6 +417,9 @@ class Concierge:
         self._store_factory = store_factory
         self._store: StateStore | None = None
         self.github = github if config.concierge.github_tools else None
+        # The workspace budget pool chat turns are charged to; it keeps its
+        # state in the store, so it agrees with the loop's.
+        self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
 
         self.host = host
         self.bus = bus
@@ -387,6 +440,16 @@ class Concierge:
         )
         self._pending = 0
         self._state_lock = threading.Lock()
+        # Turns that resume the same SDK session must not overlap: they share
+        # one ``resume_session_id``, its turn counter and its model, all kept
+        # under one ``session_key`` in ``daemon_state``. Every chat bridge
+        # turn (Discord, Slack, Mattermost, the TUI) carries ``session_key``
+        # None and so resumes the one default session, so they all share a
+        # single reserved lane. Each lane is FIFO in arrival order, so a
+        # surface's messages are still answered in the order they were sent
+        # whatever ``[concierge] max_concurrent_turns`` is set to.
+        self._lanes: dict[str, deque[object]] = {}
+        self._lanes_changed = threading.Condition()
         self._tool_lock = threading.Lock()
         self._closed = False
         self._tools: dict[str, HostTool] = {t.spec.name: t for t in self._build_tools()}
@@ -472,6 +535,10 @@ class Concierge:
         return self._turn.allow_actions
 
     @property
+    def _turn_start_work(self) -> bool:
+        return self._turn.start_work
+
+    @property
     def _turn_role(self) -> Role:
         return self._turn.role
 
@@ -490,6 +557,14 @@ class Concierge:
     @property
     def _turn_code_work(self) -> Callable[[str, int, str], None] | None:
         return self._turn.code_work
+
+    @property
+    def _turn_agent_tools(self) -> tuple[AgentTool, ...]:
+        return self._turn.agent_tools
+
+    @property
+    def _turn_channel_tools(self) -> tuple[AgentTool, ...]:
+        return self._turn.channel_tools
 
     @property
     def _turn_work_products(self) -> list[str]:
@@ -527,6 +602,7 @@ class Concierge:
         session_key: str | None = None,
         persona: str | None = None,
         allow_actions: bool = True,
+        start_work: bool = True,
         history: str | None = None,
         agent_role: Role = "concierge",
         read_only: bool = False,
@@ -535,6 +611,13 @@ class Concierge:
         on_code_work: Callable[[str, int, str], None] | None = None,
         model: str | None = None,
         handoff_agents: Sequence[str] | None = None,
+        channel_id: str | None = None,
+        agent_slug: str | None = None,
+        agent_tools: Sequence[AgentTool] = (),
+        channel_tools: Sequence[AgentTool] = (),
+        work_lead: str | None = None,
+        work_roles: Mapping[str, str] | None = None,
+        stateless: bool = False,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -544,15 +627,30 @@ class Concierge:
         workload this turn starts (#760) so asking twice queues once.
         ``model`` is the model the answering agent names for itself, used
         instead of the role's configured one; ``handoff_agents`` is who
-        ``handoff_agent`` may address (the built-ins when omitted)."""
+        ``handoff_agent`` may address (the built-ins when omitted).
+        ``channel_id`` and ``agent_slug`` are where the turn's reported
+        usage is charged in the workspace budget pool: the product channel
+        it answers and the agent that speaks (the role when unset);
+        ``agent_tools`` are the answering agent's own tools (its memory),
+        offered only when the turn may act. ``start_work`` false withholds
+        the tools that start managed work, so the turn can only reply.
+        ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
+        this turn starts is admitted with: the channel it answers to, the
+        lead and the agent per run role (already checked by the caller).
+        ``stateless`` makes the turn a one-shot call: it resumes no stored
+        session for ``session_key`` and records none, so nothing it says
+        reaches a later turn."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
             self._pending += 1
+        # Take this turn's place in its session's lane now, under the
+        # caller's ordering, not when a pool thread happens to pick it up.
+        lane_key, ticket = self._join_lane(session_key)
 
-        def run() -> ConciergeReply:
+        def turn() -> ConciergeReply:
             with self._state_lock:
                 self._pending -= 1
             context = TurnContext(
@@ -565,6 +663,7 @@ class Concierge:
                 history=history,
                 persona=persona,
                 allow_actions=allow_actions,
+                start_work=start_work,
                 role=agent_role,
                 read_only=read_only,
                 handoff=handoff,
@@ -572,6 +671,14 @@ class Concierge:
                 model_override=model,
                 tool_activity=on_tool_activity,
                 code_work=on_code_work,
+                usage_channel_id=channel_id,
+                usage_agent_slug=agent_slug or agent_role,
+                agent_tools=tuple(agent_tools),
+                channel_tools=tuple(channel_tools),
+                channel_id=channel_id,
+                work_lead=work_lead,
+                work_roles=dict(work_roles or {}),
+                stateless=stateless,
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -596,7 +703,64 @@ class Concierge:
                 updates["work_products"] = tuple(dict.fromkeys(turn_work_products))
             return reply._replace(**updates) if updates else reply
 
-        return self._executor.submit(run)
+        def run() -> ConciergeReply:
+            # One turn at a time per session: the next one in the lane starts
+            # only once this one has written the session back.
+            self._await_lane(lane_key, ticket)
+            try:
+                return turn()
+            finally:
+                self._leave_lane(lane_key, ticket)
+
+        def release(future: Future[ConciergeReply]) -> None:
+            # A cancelled turn never runs, so nothing else would give its
+            # lane place back and the turns behind it would wait forever.
+            if future.cancelled():
+                self._leave_lane(lane_key, ticket)
+
+        try:
+            future = self._executor.submit(run)
+        except BaseException:
+            self._leave_lane(lane_key, ticket)
+            with self._state_lock:
+                self._pending -= 1
+            raise
+        future.add_done_callback(release)
+        return future
+
+    # -- session lanes ----------------------------------------------------------
+
+    def _join_lane(self, session_key: str | None) -> tuple[str, object]:
+        """Reserve the back of the lane a turn on ``session_key`` runs in.
+
+        The reserved key ``""`` is the default session every bridge turn
+        resumes; a keyed turn (one product channel's participant) has a lane
+        of its own.
+        """
+        lane_key = session_key or ""
+        ticket = object()
+        with self._lanes_changed:
+            self._lanes.setdefault(lane_key, deque()).append(ticket)
+        return lane_key, ticket
+
+    def _await_lane(self, lane_key: str, ticket: object) -> None:
+        """Block until every turn reserved before this one has finished."""
+        with self._lanes_changed:
+            self._lanes_changed.wait_for(lambda: self._head_of(lane_key) is ticket)
+
+    def _leave_lane(self, lane_key: str, ticket: object) -> None:
+        with self._lanes_changed:
+            lane = self._lanes.get(lane_key)
+            if lane is not None:
+                with suppress(ValueError):
+                    lane.remove(ticket)
+                if not lane:
+                    del self._lanes[lane_key]
+            self._lanes_changed.notify_all()
+
+    def _head_of(self, lane_key: str) -> object | None:
+        lane = self._lanes.get(lane_key)
+        return lane[0] if lane else None
 
     def reset_session(self, session_key: str | None = None) -> None:
         self.dstore.set_value(self._session_state_key(STATE_SESSION_ID, session_key), None)
@@ -652,7 +816,9 @@ class Concierge:
             self.reset_session(session_key)
         self._update_turn(model=selection)
         session_id, turns = self._session(session_key)
-        if turns >= self.config.concierge.session_turns:
+        if self._turn.stateless:
+            session_id, turns = None, 0
+        elif turns >= self.config.concierge.session_turns:
             log.info("concierge.session_rotated", turns=turns)
             session_id, turns = None, 0
         started = time.monotonic()
@@ -674,7 +840,7 @@ class Concierge:
                 # A dead sandbox costs one hiccup: DaemonAgent drops it
                 # (rate-limited) and the retry re-provisions — with a fresh
                 # session store, so the resume id is gone too.
-                if self.host.note_failure(exc):
+                if self.host.note_failure(exc, generation=self._turn.lease_generation):
                     self.reset_session(session_key)
                     session_id, turns, retry = None, 0, True
             if not retry:
@@ -684,7 +850,7 @@ class Concierge:
             except SbxloopError as exc2:
                 return self._error_reply(exc2, started)
         new_session, output = reply
-        if new_session:
+        if new_session and not self._turn.stateless:
             self.dstore.set_value(
                 self._session_state_key(STATE_SESSION_ID, session_key), new_session
             )
@@ -760,7 +926,12 @@ class Concierge:
             persona += (
                 "\n\nThis is an ordinary conversation turn. Do not perform or promise any "
                 "operation. No host or MCP tools are available. Explain that the person can "
-                "explicitly delegate work or mention an agent when action is wanted."
+                "select the Code, Workload or Auto mode when action is wanted."
+            )
+        elif not self._turn_start_work:
+            persona += (
+                "\n\nThis turn cannot start managed work: no workload, issue, scan or "
+                "schedule tools are available. Answer in this reply."
             )
         history = ""
         if self._turn_history:
@@ -833,14 +1004,18 @@ class Concierge:
                     log.debug("concierge.on_tool_failed", exc_info=True)
             return response
 
-        client = self.host.client()
-        result = client.submit(
-            job,
-            agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
-            tool_handler=handler if available_tools else None,
-            agent_phase="concierge",
-            model_source=self._turn_model.source,
-        )
+        # The turn holds its own client for the whole session call, so
+        # overlapping turns never share one worker process.
+        with self.host.lease() as client:
+            self._update_turn(lease_generation=self.host.lease_generation(client))
+            result = client.submit(
+                job,
+                agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
+                tool_handler=handler if available_tools else None,
+                agent_phase="concierge",
+                model_source=self._turn_model.source,
+            )
+        self._charge_turn(job.job_id, result.usage)
         if result.status != "ok":
             if result.error is not None and result.error.provider is not None:
                 raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
@@ -870,6 +1045,22 @@ class Concierge:
         if recovery.checkpoint(CONCIERGE_RUN_ID, key) is None:
             return job
         return legacy
+
+    def _charge_turn(self, job_id: str, usage: Usage | None) -> None:
+        """Charge what the turn's job reported to the workspace budget pool,
+        whether or not the job succeeded: the tokens were spent either way.
+        Accounting never fails a turn."""
+        turn = self._turn
+        try:
+            self.usage_pool.charge(
+                source="turn",
+                ref_id=turn.message_id or job_id,
+                agent_slug=turn.usage_agent_slug,
+                channel_id=turn.usage_channel_id,
+                usage=usage,
+            )
+        except Exception:
+            log.warning("concierge.usage_charge_failed", exc_info=True)
 
     def _error_reply(self, exc: BaseException, started: float) -> ConciergeReply:
         if isinstance(exc, WorkerTimeoutError) or "timed out" in str(exc).lower():
@@ -1052,12 +1243,26 @@ class Concierge:
             "github_get",
             "pr_status",
             "list_issues",
+            # A file delivered into this conversation: a reviewer has to be
+            # able to read what it is reviewing.
+            "read_channel_artifact",
         }
+        offered = dict(self._tools)
+        for tool in self._turn_channel_tools:
+            # Adapted to the roster's (args, by) shape: the tool reads the
+            # channel, so who asked does not change what it may see.
+            offered[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
         available = (
-            {name: tool for name, tool in self._tools.items() if name in reads}
+            {name: tool for name, tool in offered.items() if name in reads}
             if self._turn_role == "critic" or self._turn_read_only
-            else dict(self._tools)
+            else offered
         )
+        if not self._turn_start_work:
+            # A turn that may only reply (a conversation that mentions an
+            # agent) keeps its read tools but none that start managed work.
+            available = {
+                name: tool for name, tool in available.items() if name not in UNGUARDED_START_TOOLS
+            }
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]
             if self._turn_role != "concierge":
@@ -1101,6 +1306,21 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
+        if any(tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools):
+            # An agent offered its own guarded start_run / file_issue starts
+            # work only through them: these check none of its can_start,
+            # chain depth, daily cap or dedupe, so leaving them beside the
+            # guarded pair would make every one of those a suggestion.
+            for name in UNGUARDED_START_TOOLS:
+                available.pop(name, None)
+        for tool in self._turn_agent_tools:
+            if not self._turn_start_work and tool.spec.name in WORK_TOOL_NAMES:
+                # A turn that may only reply gets none of an agent's own
+                # start tools either, whatever its can_start declares.
+                continue
+            # Adapted to the roster's (args, by) shape; the agent acts as
+            # itself, so who asked does not change what it keeps.
+            available[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
         return available
 
     def _tool_handoff(self, args: dict[str, Any], _by: str) -> str:
@@ -2114,6 +2334,11 @@ class Concierge:
             kind="workload",
             profile=profile.name if profile is not None else None,
             requested_by=self._turn_author_id,
+            channel_id=self._turn.channel_id,
+            lead_agent=self._turn.work_lead,
+            assignment_json=(
+                requested_roles_json(self._turn.work_roles) if self._turn.work_roles else None
+            ),
         )
         try:
             queued = self.dstore.upsert_new(item, self.clock())
@@ -2618,6 +2843,7 @@ class Concierge:
             title=title[:80],
             queued=queued,
         )
+        self._note_code_admission(str(ref.number), repo)
         if not queued:
             return (
                 f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
@@ -2746,6 +2972,19 @@ class Concierge:
         )
         return "\n".join(lines)
 
+    def _note_code_admission(self, number: str, repo: str) -> None:
+        """Leave the turn's channel and agents for the item a poll builds
+        from the issue, as its requester is left."""
+        turn = self._turn
+        self.dstore.note_admission(
+            number,
+            self.clock(),
+            repo=repo,
+            channel_id=turn.channel_id,
+            lead=turn.work_lead,
+            roles=turn.work_roles,
+        )
+
     def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
         repo, repo_error = self._resolve_repo(args)
@@ -2761,6 +3000,7 @@ class Concierge:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
         log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
+        self._note_code_admission(str(number), repo)
         if self._turn_code_work is not None:
             self._turn_code_work(repo, number, f"Issue #{number}")
         return (
@@ -2910,19 +3150,31 @@ class Concierge:
 
 
 def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
-    """The call's arguments, with the ones that can carry a credential hidden.
+    """The call's arguments, with the ones that can carry a credential or a
+    memory's text hidden.
 
     A URL a person types can embed a username and password, and a rejected
     one is never canonicalised — so the raw value never reaches the logs or
-    the chat chronology. Every other selector stays visible: a tool call
-    that shows up with no arguments cannot be followed or steered, and the
-    resolved targets are named in the reply either way.
+    the chat chronology. What an agent remembers is scoped to one channel,
+    but the daemon log is not: any agent can read it from any channel
+    through ``daemon_log``, so a memory's text never goes there either — its
+    length is what the call can be followed by, and the reply names the id.
+    Every other selector stays visible: a tool call that shows up with no
+    arguments cannot be followed or steered, and the resolved targets are
+    named in the reply either way.
     """
     arguments = dict(call.arguments)
     if call.name == "handoff_agent":
         return {"agent_slug": arguments.get("agent_slug")}
     if call.name == "start_entrygraph" and arguments.get("url") is not None:
         arguments["url"] = "<redacted url>"
+    if call.name == "remember":
+        content = arguments.get("content")
+        arguments["content"] = f"<{len(content)} chars>" if isinstance(content, str) else "<hidden>"
+    if call.name == "recall" and arguments.get("query") is not None:
+        # A query is written from what the agent remembers; it quotes it
+        # often enough that it belongs on the same side of this line.
+        arguments["query"] = "<redacted query>"
     return arguments
 
 

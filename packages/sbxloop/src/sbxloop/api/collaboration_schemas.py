@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 
 from sbxloop.agents.definition import AgentRoleName, AgentSpec, AgentStartKind
 from sbxloop.api.models import ApiModel
+
+WorkspaceRole = Literal["owner", "admin", "member"]
+AuthSource = Literal["local", "oidc"]
 
 
 class LocalRegisterRequest(ApiModel):
@@ -35,6 +38,80 @@ class LocalUserOut(ApiModel):
     is_active: bool
     created_at: str
     updated_at: str
+    #: The caller's workspace role (feature ``workspace.members``).
+    role: WorkspaceRole | None = None
+    #: The identity provider's picture URL, when it supplied one.
+    avatar_url: str | None = None
+    #: How the user signs in.
+    auth_source: AuthSource | None = None
+
+
+class WorkspaceUserOut(ApiModel):
+    """One person in the workspace directory."""
+
+    id: str
+    username: str
+    email: str
+    full_name: str | None
+    avatar_url: str | None
+    role: WorkspaceRole
+    is_active: bool
+    auth_source: AuthSource
+    last_seen_at: str | None
+
+
+class WorkspaceUserPage(ApiModel):
+    data: list[WorkspaceUserOut]
+
+
+class WorkspaceMemberUpdate(ApiModel):
+    role: WorkspaceRole | None = None
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def _something(self) -> Self:
+        if self.role is None and self.is_active is None:
+            raise ValueError("name a role or is_active to change")
+        return self
+
+
+class WorkspaceInviteCreate(ApiModel):
+    role: WorkspaceRole
+    #: When given, only a user registering with this email (in any case)
+    #: can spend the invite. Surrounding whitespace is trimmed first, and an
+    #: empty or all-whitespace email counts as no email at all.
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    ttl_hours: int = Field(default=72, ge=1, le=720)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _trim_email(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+class WorkspaceInviteCreated(ApiModel):
+    """A new invite. ``token`` appears here and nowhere else."""
+
+    id: str
+    token: str
+    expires_at: str
+    role: WorkspaceRole
+    email: str | None
+
+
+class WorkspaceInviteOut(ApiModel):
+    id: str
+    role: WorkspaceRole
+    email: str | None
+    expires_at: str
+    accepted_at: str | None
+    created_by: str | None
+
+
+class WorkspaceInvitePage(ApiModel):
+    data: list[WorkspaceInviteOut]
 
 
 class LocalUserUpdate(ApiModel):
@@ -258,8 +335,16 @@ class ChannelCreate(ApiModel):
     title: str | None = Field(default=None, max_length=200)
 
 
+ChannelVisibility = Literal["private", "workspace"]
+ChannelRoleName = Literal["owner", "member"]
+
+
 class ChannelUpdate(ApiModel):
-    title: str = Field(min_length=1, max_length=200)
+    """Only the fields sent change. Changing either one takes managing the
+    channel: its owner, or a workspace owner or admin."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    visibility: ChannelVisibility | None = None
 
 
 class ChannelOut(ApiModel):
@@ -270,12 +355,48 @@ class ChannelOut(ApiModel):
     revision: int
     created_at: str
     updated_at: str
+    #: ``private``: channel members only; ``workspace``: every workspace member.
+    visibility: ChannelVisibility = "private"
+    created_by: str | None = None
+    silenced_until: float | None = None
+    #: Messages past the reader's last read sequence. Null for a caller
+    #: with no channel membership to measure against.
+    unread_count: int | None = None
+    #: The caller's role in the channel; ``null`` when not a member.
+    my_role: ChannelRoleName | None = None
 
 
 class ChannelPage(ApiModel):
     items: list[ChannelOut]
     total: int
     has_more: bool
+
+
+class ChannelMemberUserOut(ApiModel):
+    id: str
+    username: str
+    full_name: str | None = None
+    avatar_url: str | None = None
+
+
+class ChannelMemberOut(ApiModel):
+    user_id: str
+    role: ChannelRoleName
+    joined_at: str
+    last_read_sequence: int = 0
+    user: ChannelMemberUserOut
+
+
+class ChannelMemberPage(ApiModel):
+    data: list[ChannelMemberOut]
+
+
+class ChannelMemberCreate(ApiModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    role: ChannelRoleName = "member"
+
+
+ParticipantModeName = Literal["mention", "ambient"]
 
 
 class ArtifactRefOut(ApiModel):
@@ -291,7 +412,9 @@ class ArtifactRefOut(ApiModel):
 
 class ChannelWorkOut(ApiModel):
     item_id: str
-    turn_id: str
+    #: The turn the work hangs on; null for a run a channel asked for
+    #: outside any turn of its own.
+    turn_id: str | None = None
     agent_slug: str | None
     title: str
     kind: str
@@ -307,12 +430,92 @@ class ChannelWorkOut(ApiModel):
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
+class ChannelArtifactPage(ApiModel):
+    """Every file a channel's messages carry."""
+
+    data: list[ArtifactRefOut]
+
+
 class AuthorOut(ApiModel):
     """Who wrote a message: a person, an agent, or sbxloop itself."""
 
     kind: Literal["human", "agent", "system"]
     id: str | None = None
     display_name: str | None = None
+
+
+BridgeBackendName = Literal["discord", "slack", "mattermost"]
+
+
+class MessageOriginOut(ApiModel):
+    """The bridge surface a message arrived on, for a message that did."""
+
+    backend: str
+    surface_id: str
+    external_message_id: str | None = None
+
+
+class BridgeOut(ApiModel):
+    """A chat service this release can bridge, and whether it is set up."""
+
+    backend: BridgeBackendName
+    configured: bool
+    label: str
+
+
+class BridgePage(ApiModel):
+    data: list[BridgeOut]
+
+
+class ChannelLinkCreate(ApiModel):
+    """Link a surface of a chat service to this channel.
+
+    ``allow_guests`` admits people on that surface who have linked no
+    account: their messages are stored under the name they use there.
+    """
+
+    backend: BridgeBackendName
+    surface_id: str = Field(min_length=1, max_length=200)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=200)
+    allow_guests: bool = False
+
+
+class ChannelLinkOut(ApiModel):
+    id: str
+    channel_id: str
+    backend: BridgeBackendName
+    surface_id: str
+    thread_id: str | None = None
+    allow_guests: bool = False
+    created_by: str | None = None
+    created_at: str
+    active: bool = True
+
+
+class ChannelLinkPage(ApiModel):
+    data: list[ChannelLinkOut]
+
+
+class LinkCodeOut(ApiModel):
+    """A code to type on a bridge, once, to prove an account is yours."""
+
+    code: str
+    expires_at: str
+
+
+class ExternalIdentityOut(ApiModel):
+    backend: BridgeBackendName
+    external_user_id: str
+    display_name: str | None = None
+    verified_at: str
+
+
+class ExternalIdentityPage(ApiModel):
+    data: list[ExternalIdentityOut]
+
+
+#: What an ``agent_update`` a run posted is.
+PostKindName = Literal["plan", "progress", "review", "delivery", "reply", "notice"]
 
 
 class MessageOut(ApiModel):
@@ -328,6 +531,13 @@ class MessageOut(ApiModel):
     work: ChannelWorkOut | None = None
     reactions: list[str] = Field(default_factory=list)
     author: AuthorOut | None = None
+    #: Files this message carries, readable by anyone who can read the
+    #: channel (feature ``collaboration.message_artifacts``).
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    #: Where the message arrived from, when it came over a bridge.
+    origin: MessageOriginOut | None = None
+    #: Set on the ``agent_update`` messages a run posts; null otherwise.
+    post_kind: PostKindName | None = None
 
 
 class ReactionSet(ApiModel):
@@ -340,10 +550,15 @@ class TurnCreate(ApiModel):
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)
-    intent: Literal["conversation", "delegate", "code", "workload"] = "conversation"
+    intent: Literal["conversation", "delegate", "code", "workload", "auto"] = "conversation"
 
 
 class ParticipantOut(ApiModel):
+    """One agent's slot in a turn. ``assignees`` is set on the first slot of
+    a turn that may start managed work: the run roles the turn's mentions
+    declare, as ``role -> agent slug``, which admission uses to assign the
+    run."""
+
     agent_slug: str | None
     status: str
     error: str | None = None
@@ -351,6 +566,32 @@ class ParticipantOut(ApiModel):
     parent_index: int | None = None
     request: str | None = None
     read_only: bool = False
+    assignees: dict[str, str] | None = None
+
+
+class ChannelParticipantOut(ApiModel):
+    """An agent in a channel. ``status`` is ``thinking`` while it answers a
+    running turn here, ``working`` while a live run in this channel is
+    credited to it, and ``idle`` otherwise; ``activity`` names that run."""
+
+    agent_slug: str
+    mode: ParticipantModeName
+    added_by: AuthorOut
+    muted_until: float | None = None
+    created_at: str
+    status: Literal["idle", "thinking", "working"] = "idle"
+    activity: str | None = None
+
+
+class ChannelParticipantPage(ApiModel):
+    data: list[ChannelParticipantOut]
+
+
+class ChannelParticipantUpdate(ApiModel):
+    """Only the fields sent change; a new participant answers when mentioned."""
+
+    mode: ParticipantModeName | None = None
+    muted_until: float | None = None
 
 
 class TurnOut(ApiModel):
@@ -367,6 +608,35 @@ class TurnOut(ApiModel):
     author_id: str | None = None
     trigger: str | None = None
     parent_turn_id: str | None = None
+    intent: str | None = None
+    #: How many agent-started turns separate this one from the human turn
+    #: that started the chain; zero for a turn a person asked for.
+    chain_depth: int = 0
+    #: The run this turn steered instead of answering (S-A11); null for an
+    #: ordinary turn, so an old client reads what it always did.
+    steered_run_id: str | None = None
+
+
+class ChannelSilence(ApiModel):
+    """How long the channel's agents stay quiet; null lifts the silence."""
+
+    until: float | None = None
+
+
+class ChannelReadUpdate(ApiModel):
+    """How far the caller has read this channel."""
+
+    sequence: int = Field(ge=0)
+
+
+class ChannelStopOut(ApiModel):
+    """What a stop actually stopped."""
+
+    cancelled_turns: list[str] = Field(default_factory=list)
+    cancelled_runs: list[str] = Field(default_factory=list)
+    #: Work items the channel queued that had not started, abandoned.
+    cancelled_items: list[str] = Field(default_factory=list)
+    silenced_until: float | None = None
 
 
 class TurnAccepted(ApiModel):

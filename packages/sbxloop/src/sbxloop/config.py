@@ -74,6 +74,10 @@ from sbxloop_worker.protocol import (
 log = get_logger(__name__)
 
 ENV_PREFIX = "SBXLOOP_"
+#: The environment variable ``[api.oidc] client_secret_env`` names by
+#: default. It carries the ``SBXLOOP_`` prefix, so the env config layer is
+#: told (``RESERVED_ENV_KEYS``) that it is a credential, never a setting.
+OIDC_CLIENT_SECRET_ENV = "SBXLOOP_OIDC_CLIENT_SECRET"  # nosec B105 - env var name
 
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
@@ -88,6 +92,7 @@ RESERVED_ENV_KEYS = frozenset(
         *(
             name[len(ENV_PREFIX) :].lower()
             for name in (
+                OIDC_CLIENT_SECRET_ENV,
                 OPENAI_KEY_NAME_ENV,
                 OPENAI_TIMEOUT_ENV,
                 OPENAI_RETRIES_ENV,
@@ -1850,6 +1855,11 @@ class DaemonConfig(_ConfigModel):
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"
+    # The workspace's daily token budget: input plus output tokens reported
+    # by every run and every chat turn since 00:00 in `run_cap_timezone`.
+    # Once reached, no new run starts (and a chat guardrail may refuse a
+    # turn) until the next day. Unset: tokens never refuse work.
+    daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
     # fresh engine wall clock; past this many per item the interrupted run is
@@ -2245,8 +2255,11 @@ class ConciergeConfig(_ConfigModel):
     # The SDK session is resumed message after message; after this many
     # turns a fresh session is started so context does not grow forever.
     session_turns: int = Field(default=40, ge=1, le=500)
-    # How many chat turns may run at once. Each turn keeps its own speaker,
-    # session and provider recovery; host tools still run one at a time.
+    # How many chat turns may run at once, each on its own worker client in
+    # the concierge sandbox. Turns in one channel still run one after
+    # another; each turn keeps its own speaker, session and provider
+    # recovery; host tools still run one at a time. Chat bridge turns share
+    # one session and are not serialized by it, so this stays 1 by default.
     max_concurrent_turns: int = Field(default=1, ge=1, le=16)
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
@@ -2702,6 +2715,144 @@ class TelemetryConfig(_ConfigModel):
         return value
 
 
+#: Signature algorithms an ID token may use: asymmetric only, so neither
+#: ``none`` nor a MAC keyed with a shared secret can pass for a signature.
+OidcAlgorithm = Literal[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"
+]
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_OIDC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _oidc_url(value: str, key: str) -> str:
+    """An https URL, or plain http to this machine only."""
+    raw = value.strip()
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+    except ValueError:
+        raise ValueError(f"{key}: {raw!r} is not a URL") from None
+    if not host or parts.scheme not in ("http", "https"):
+        raise ValueError(f"{key}: {raw!r} must be an https:// URL")
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        raise ValueError(f"{key}: {raw!r} must carry no credential or fragment")
+    loopback = host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+    if parts.scheme == "http" and not loopback:
+        raise ValueError(f"{key}: {raw!r} must use https (plain http is for localhost only)")
+    return raw
+
+
+class ApiOidcConfig(_ConfigModel):
+    """`[api.oidc]`: sign-in through an OpenID Connect provider.
+
+    The browser client runs Authorization Code + PKCE and hands the code to
+    ``POST /v1/auth/oidc/token``; the daemon redeems it as the confidential
+    client, validates the ID token and answers with its own token pair.
+    Off by default, and an existing file without the section loads as
+    before. The client secret is read at exchange time from the
+    environment variable ``client_secret_env`` names (``secrets.env``);
+    the value never enters the config, an event or a log line.
+    """
+
+    enabled: bool = False
+    #: The provider's id in ``GET /v1/auth/providers`` and the exchange body.
+    id: str = "authentik"
+    label: str = Field(default="Authentik", min_length=1, max_length=80)
+    #: The issuer exactly as the provider's discovery document states it.
+    issuer: str | None = None
+    client_id: str = ""
+    client_secret_env: str = OIDC_CLIENT_SECRET_ENV
+    #: Exact-match allowlist for the ``redirect_uri`` a client presents.
+    redirect_uris: list[str] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
+    #: The ID token's expected ``aud``; empty means ``client_id``.
+    audience: str | None = None
+    algorithms: list[OidcAlgorithm] = Field(
+        default_factory=lambda: cast(list[OidcAlgorithm], ["RS256", "ES256"]), min_length=1
+    )
+    leeway_s: int = Field(default=60, ge=0, le=600)
+    discovery_cache_s: int = Field(default=3600, ge=0)
+    jwks_cache_s: int = Field(default=3600, ge=0)
+    username_claim: str = Field(default="preferred_username", min_length=1)
+    email_claim: str = Field(default="email", min_length=1)
+    name_claim: str = Field(default="name", min_length=1)
+    groups_claim: str = Field(default="groups", min_length=1)
+    #: Provider groups whose members are workspace owners / admins. With
+    #: either set, every sign-in re-derives the member's role from groups.
+    owner_groups: list[str] = Field(default_factory=list)
+    admin_groups: list[str] = Field(default_factory=list)
+    #: When set, only people in one of these groups may sign in.
+    allowed_groups: list[str] = Field(default_factory=list)
+    default_role: Literal["admin", "member"] = "member"
+    #: Create an account on a first sign-in; off, only linked or existing
+    #: accounts may sign in.
+    auto_provision: bool = True
+    #: Link a first sign-in to the local account holding the same email when
+    #: the provider says the address is verified. Off by default: a provider
+    #: that lets people edit their email, or asserts ``email_verified`` for
+    #: any address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified, the person gets an account of their own.
+    link_verified_email: bool = False
+    request_timeout_s: float = Field(default=10.0, gt=0, le=60)
+
+    @property
+    def expected_audience(self) -> str:
+        return self.audience or self.client_id
+
+    @property
+    def maps_roles(self) -> bool:
+        return bool(self.owner_groups or self.admin_groups)
+
+    @field_validator("id")
+    @classmethod
+    def _id_is_a_slug(cls, value: str) -> str:
+        if not _OIDC_ID_RE.match(value):
+            raise ValueError("api.oidc.id must be a lowercase slug")
+        return value
+
+    @field_validator("issuer")
+    @classmethod
+    def _issuer_is_https(cls, value: str | None) -> str | None:
+        return None if value is None or not value.strip() else _oidc_url(value, "api.oidc.issuer")
+
+    @field_validator("redirect_uris")
+    @classmethod
+    def _redirects_are_https(cls, value: list[str]) -> list[str]:
+        return [_oidc_url(uri, "api.oidc.redirect_uris") for uri in value]
+
+    @field_validator("client_secret_env")
+    @classmethod
+    def _secret_env_name(cls, value: str) -> str:
+        if value == OIDC_CLIENT_SECRET_ENV:
+            return value
+        return _check_api_key_env(value, "api.oidc.client_secret_env")
+
+    @field_validator("scopes")
+    @classmethod
+    def _scopes_ask_for_openid(cls, value: list[str]) -> list[str]:
+        if "openid" not in value:
+            raise ValueError("api.oidc.scopes must include openid")
+        if any(not scope or any(ch.isspace() for ch in scope) for scope in value):
+            raise ValueError("api.oidc.scopes must be single words")
+        return value
+
+    @model_validator(mode="after")
+    def _enabled_is_complete(self) -> ApiOidcConfig:
+        if self.enabled:
+            missing = [
+                key
+                for key, present in (
+                    ("issuer", self.issuer),
+                    ("client_id", self.client_id.strip()),
+                    ("redirect_uris", self.redirect_uris),
+                )
+                if not present
+            ]
+            if missing:
+                raise ValueError("[api.oidc] enabled = true needs " + ", ".join(missing))
+        return self
+
+
 class ApiConfig(_ConfigModel):
     """The remote operations API, served by ``sbxloop daemon`` in-process.
 
@@ -2740,6 +2891,7 @@ class ApiConfig(_ConfigModel):
     # A command accepted but not claimed within this expires rather than
     # applying stale intent later.
     operation_deadline_s: int = Field(default=300, ge=10)
+    oidc: ApiOidcConfig = Field(default_factory=ApiOidcConfig)
 
     @field_validator("bind")
     @classmethod
@@ -2772,6 +2924,76 @@ class MemoryConfig(_ConfigModel):
     max_item_chars: int = Field(default=1000, ge=1)
     # The most a memory block may add to an agent's prompt.
     prompt_budget_chars: int = Field(default=4000, ge=0)
+
+
+class AgentTeamConfig(_ConfigModel):
+    """What the agent team may do on its own initiative (S-A12), and what a
+    run tells the channel that asked for it.
+
+    An agent that declares ``can_start`` gets ``start_run`` and
+    ``file_issue``. Two bounds keep that from becoming a spiral: how deep
+    a chain of agent-started work may go before the next generation is
+    refused, and how much work one agent may start in a day.
+
+    ``max_chain_depth = 0`` stops agent-started work entirely without
+    editing every agent; ``max_agent_runs_per_day`` is the default an
+    ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+
+    ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
+    replies, the delivery and any notice; ``"quiet"`` posts only what ends
+    a run (its delivery, and a notice when it stopped); ``"off"`` posts
+    nothing. The delivery and a terminal notice are posted whatever the
+    cap, because a run nobody hears finish is a run nobody can act on.
+    """
+
+    # Work a person asked for is depth 0; the run an agent starts from it
+    # is depth 1. An agent working at this depth may start nothing.
+    max_chain_depth: int = Field(default=2, ge=0)
+    # The daily cap for an agent whose spec names none.
+    max_agent_runs_per_day: int = Field(default=4, ge=0)
+    # What a run posts in the channel that asked for it.
+    chronicle: Literal["normal", "quiet", "off"] = "normal"
+    # The most posts one run makes, across its resumes; the delivery and
+    # terminal notices are above it.
+    max_posts_per_run: int = Field(default=12, ge=1)
+    # Progress posts are coalesced to at most one this often.
+    progress_interval_s: float = Field(default=120.0, ge=0)
+
+
+class CollaborationConfig(_ConfigModel):
+    """What keeps agents talking to each other from running away.
+
+    An agent's reply is prose in a shared channel, so naming another agent
+    in it queues a turn by that agent. Without bounds two agents would
+    answer each other forever, so every follow-up passes these: how deep a
+    chain of agent-started turns may go, how many agent turns a channel and
+    a single agent may take within one window, and how long one agent waits
+    before addressing the same agent again. The channel's own silence and
+    the workspace token budget apply on top of them.
+    """
+
+    # How many agent-started turns may follow one human turn.
+    max_chain_depth: int = Field(default=4, ge=0, le=32)
+    # The window the two rate caps count within, in seconds.
+    window_s: float = Field(default=600.0, gt=0)
+    # Agent turns one channel may take within the window.
+    channel_turns_per_window: int = Field(default=20, ge=0)
+    # Agent turns one agent may take in a channel within the window.
+    agent_turns_per_window: int = Field(default=6, ge=0)
+    # How long one agent waits before addressing the same agent again.
+    pair_cooldown_s: float = Field(default=60.0, ge=0)
+    # Whether a channel participant in `ambient` mode may speak without
+    # being addressed. Off until an operator turns it on: an agent that
+    # answers uninvited is a surprise, and a surprise that spends tokens.
+    ambient: bool = False
+    # The model the relevance classifier uses; None reuses the concierge's.
+    # A cheap one belongs here: it runs once per ambient participant per
+    # message that gets past the interest prefilter.
+    ambient_model: str | None = None
+    # How many recent messages the prefilter and the classifier read.
+    ambient_window_messages: int = Field(default=5, ge=1, le=50)
+    # How often one ambient agent may speak in a channel, per hour.
+    ambient_max_per_hour: int = Field(default=6, ge=0)
 
 
 class Config(_ConfigModel):
@@ -2850,6 +3072,11 @@ class Config(_ConfigModel):
     agents: list[AgentSpec] = Field(default_factory=list)
     # Each agent's long-term memory (bounds and the on/off switch).
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    # What agents may start on their own, how much of it, and what a run
+    # says in the channel that asked for it.
+    agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
+    # The bounds on agents addressing each other in a channel.
+    collaboration: CollaborationConfig = Field(default_factory=CollaborationConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:

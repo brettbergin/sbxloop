@@ -373,7 +373,7 @@ service_memory = "2g"
 # instructions = "Answer weather questions from the forecast service; say when data is stale."  # its persona
 # model = "auto"  # unset: the model its role gets
 # roles = ["operator"]  # run roles it may take: "lead", "planner", "builder", "critic", "operator"
-# tools = ["load_skill", "call_service", "weather"]  # unset: the role's tools; a list (host tools or [[mcp]] names) only narrows
+# tools = ["load_skill", "call_service", "weather", "memory"]  # unset: the role's tools; a list (host tools or [[mcp]] names) only narrows; "memory" adds remember/recall/forget
 # skills = []  # unset: the role's skills; a list only narrows
 # mcp = ["weather"]  # [[mcp]] names it may use; unset: what its role gets
 # credentials = ["weather"]  # [[credentials]] names it may be granted
@@ -393,6 +393,45 @@ service_memory = "2g"
 # max_items_per_agent = 500        # past this, the agent's oldest unpinned memory is dropped
 # max_item_chars = 1000            # one memory's text is cut to this length
 # prompt_budget_chars = 4000       # the most a memory block may add to a prompt
+
+# [agent_team]
+# What agents may start on their own. An agent whose `[[agents]]` entry
+# declares `can_start` is offered `start_run` and `file_issue`; these two
+# bounds keep that from becoming a spiral. Depth 0 is work a person asked
+# for, so the first run an agent starts is depth 1; set max_chain_depth = 0
+# to stop agent-started work without editing every agent. Both bounds
+# count every start, an issue filed without queueing included, from the
+# moment it is made rather than from when a poll discovers it.
+# max_chain_depth = 2              # how deep a chain of agent-started work may go
+# max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+#
+# What a run says in the channel that asked for it. Each post is made
+# under the name of the agent that did the work: the plan by the planner,
+# each finished task by its agent, the verdict by the critic, the delivery
+# and any notice by the lead. `quiet` keeps only what ends a run; `off`
+# posts nothing. The delivery and a terminal notice are posted whatever
+# the cap says.
+# chronicle = "normal"             # normal | quiet | off
+# max_posts_per_run = 12           # the most one run says, deliveries and notices aside
+# progress_interval_s = 120.0      # progress is coalesced to at most one this often
+
+# [collaboration]
+# Naming an agent in an agent's own reply addresses it: a follow-up turn is
+# queued for it. These bounds keep a pair of agents from answering each
+# other forever. The channel's silence and the token budget apply too.
+# max_chain_depth = 4              # agent-started turns allowed after one human turn
+# window_s = 600                   # the window the rate caps count within
+# channel_turns_per_window = 20    # agent turns one channel may take in that window
+# agent_turns_per_window = 6       # agent turns one agent may take there in that window
+# pair_cooldown_s = 60             # how long an agent waits before addressing the same agent again
+# ambient = false                  # let a participant in `ambient` mode speak unprompted
+# ambient_window_messages = 5      # recent messages the prefilter and the classifier read
+# ambient_max_per_hour = 6         # how often one ambient agent may speak in a channel
+
+# The relevance classifier runs once per ambient participant per message
+# that gets past the interest prefilter, so it wants a cheap model. It is
+# unset by default, which reuses the concierge's:
+# ambient_model = "gpt-4o-mini"
 
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
@@ -774,6 +813,7 @@ service_memory = "2g"
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
+# daily_token_budget = 2000000   # input+output tokens per day across runs and chat turns; unset: no budget
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # claim_stale_after_s = 300        # a claim comment older than this with no run started is reclaimed
@@ -932,6 +972,40 @@ service_memory = "2g"
 # idempotency_retention_s = 86400  # an Idempotency-Key answers the same for a day
 # operation_deadline_s = 300       # an unclaimed command expires after this
 
+# [api.oidc]
+# Sign-in through an OpenID Connect provider (Authentik, Keycloak, ...).
+# The browser client runs Authorization Code + PKCE and hands the code to
+# POST /v1/auth/oidc/token; the daemon redeems it as the confidential
+# client, checks the ID token and signs the person in, creating their
+# account on first sign-in. Local password sign-in keeps working. The
+# client secret goes in secrets.env under the name client_secret_env gives;
+# its value never appears here, in events or in logs.
+# enabled = false
+# id = "authentik"                 # the provider id clients send
+# label = "Authentik"              # the sign-in button's label
+# issuer = "https://auth.example.com/application/o/angie/"  # exact; https only
+# client_id = "angie"              # the confidential client registered there
+# client_secret_env = "SBXLOOP_OIDC_CLIENT_SECRET"  # the variable's NAME
+# redirect_uris = ["https://angie.example.com/auth/callback"]  # exact matches
+# scopes = ["openid", "email", "profile"]  # what the browser asks for
+# audience = ""                    # the ID token's aud; empty = client_id
+# algorithms = ["RS256", "ES256"]  # asymmetric signatures only
+# leeway_s = 60                    # clock skew allowed on exp/iat/nbf
+# discovery_cache_s = 3600         # provider metadata kept this long
+# jwks_cache_s = 3600              # signing keys kept this long
+# username_claim = "preferred_username"  # a new account's username
+# email_claim = "email"             # its email address
+# name_claim = "name"               # its full name
+# groups_claim = "groups"           # the provider groups roles are read from
+# owner_groups = []                # provider groups whose members are owners
+# admin_groups = []                # ... and admins; either set = role follows groups
+# allowed_groups = []              # only these groups may sign in; empty = anyone
+# default_role = "member"          # a new person's role: member or admin
+# auto_provision = true            # create an account on first sign-in
+# link_verified_email = false      # link a local account with the same verified
+#                                  # email; only if users cannot edit their email
+# request_timeout_s = 10           # each call to the provider
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
@@ -946,8 +1020,9 @@ service_memory = "2g"
 # max_tool_result_chars = 6000     # what one host tool may hand back to the model
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
-# max_concurrent_turns = 1         # chat turns that may run at once (1-16); host
-#                                  # tools still run one at a time
+# max_concurrent_turns = 1         # chat turns that may run at once (1-16); one
+#                                  # channel's turns still run in order, and
+#                                  # host tools still run one at a time
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
 # create_issues = true             # file (queued at once)/list/comment/label/close issues
 #                                  # (a close needs your yes)

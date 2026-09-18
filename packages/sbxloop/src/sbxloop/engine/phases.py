@@ -33,12 +33,13 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel, Field, TypeAdapter
 
 from sbxloop import toolchains
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models, run_model_repo
+from sbxloop.agents.tools import MEMORY_TOOL_GROUP, AgentTool, agent_tool_handler, memory_tools
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
@@ -54,7 +55,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
-from sbxloop.engine.service import FETCH_TIMEOUT_S, FETCH_TOOL_NAME
+from sbxloop.engine.service import FETCH_TIMEOUT_S, FETCH_TOOL_NAME, TOOL_NAME as SERVICE_TOOL_NAME
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import InvalidOutputTwice, WorkerError
@@ -87,6 +88,10 @@ from sbxloop_worker.protocol import (
     JobResult,
     Usage,
 )
+
+if TYPE_CHECKING:
+    from sbxloop.agents.assignment import AgentAssignment, AgentBinding
+    from sbxloop.agents.memory import MemoryService
 
 OUTPUT_CLIP = 6_000
 REVIEW_RESPONSE_PHASE = "review_response_repair"
@@ -383,6 +388,59 @@ def clip_diff(diff: str | None, limit: int) -> str:
     )
 
 
+def _service_credentials(tool: HostToolSpec, allowed: Sequence[str]) -> list[str]:
+    """The credentials ``tool`` (``call_service``) offers that ``allowed`` names."""
+    offered = tool.parameters.get("properties", {}).get("credential", {}).get("enum") or []
+    return [str(name) for name in offered if name in allowed]
+
+
+def _with_credentials(tool: HostToolSpec, allowed: Sequence[str]) -> HostToolSpec:
+    """``tool`` with its credential enum cut to ``allowed``."""
+    parameters = json.loads(json.dumps(tool.parameters))
+    parameters["properties"]["credential"]["enum"] = list(allowed)
+    return tool.model_copy(update={"parameters": parameters})
+
+
+def _credential_guard(delegate: HostToolHandler, binding: AgentBinding) -> HostToolHandler:
+    """``delegate``, refusing a service call on a credential the agent was
+    not given: the tool's enum already hides it, and this is the barrier."""
+    allowed = frozenset(binding.credentials)
+
+    def handler(call: HostToolCall) -> HostToolResponse:
+        if call.name == SERVICE_TOOL_NAME:
+            credential = str(call.arguments.get("credential", ""))
+            if credential not in allowed:
+                return HostToolResponse(
+                    call_id=call.call_id,
+                    ok=False,
+                    error=(
+                        f"credential {credential!r} is not one @{binding.slug} may use "
+                        f"(allowed: {', '.join(sorted(allowed))})"
+                    ),
+                )
+        return delegate(call)
+
+    return handler
+
+
+def _tool_guard(
+    delegate: HostToolHandler, binding: AgentBinding, allowed: frozenset[str]
+) -> HostToolHandler:
+    """``delegate``, refusing a run tool the agent's session was not given:
+    leaving a tool out of the job hides it, and this is the barrier."""
+
+    def handler(call: HostToolCall) -> HostToolResponse:
+        if call.name not in allowed:
+            return HostToolResponse(
+                call_id=call.call_id,
+                ok=False,
+                error=f"tool {call.name!r} is not one @{binding.slug} may use",
+            )
+        return delegate(call)
+
+    return handler
+
+
 class PhaseRunner:
     """Runs the three phases for one run against the agent sandbox's worker."""
 
@@ -402,8 +460,23 @@ class PhaseRunner:
         bus: EventBus | None = None,
         session_models: Mapping[str, str] | None = None,
         store: StateStore | None = None,
+        assignment: AgentAssignment | None = None,
+        narrow_service: Callable[[Sequence[str]], HostToolSpec | None] | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         self.agent = agent
+        # Every agent's long-term memory: the tools an agent whose `tools`
+        # name `memory` is given. None (embedders, tests) offers none.
+        self.memory = memory
+        # The named agents taking this run's phases, when the host assigned
+        # any. A default assignment changes no job and no event: only a
+        # custom one credits the agents on what the worker reports.
+        self.assignment = assignment
+        self._credited = assignment is not None and not assignment.is_default()
+        # How the run's `call_service` tool is re-described for an agent
+        # narrowed to some of the granted credentials (the service sandbox
+        # knows their hosts); None filters the tool's enum alone.
+        self.narrow_service = narrow_service
         self.config = config
         self.run_id = run_id
         self.session_models = dict(session_models or {})
@@ -479,15 +552,17 @@ class PhaseRunner:
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
 
-    def _service_tools_section(self) -> str:
+    def _service_tools_section(self, tools: Sequence[HostToolSpec] | None = None) -> str:
         """The build prompt's host-tool sections — credentials (#765) and
         the dependency fetcher (#766) — or "" — with their own leading
         blank lines, so the template stays byte-identical for a run that
-        has no host tools."""
-        if not self.host_tools:
+        has no host tools. ``tools`` is what the session actually gets: the
+        run's tools unless a named agent's narrowing cut them."""
+        tools = self.host_tools if tools is None else tools
+        if not tools:
             return ""
-        fetchers = [tool for tool in self.host_tools if tool.name == FETCH_TOOL_NAME]
-        services = [tool for tool in self.host_tools if tool.name != FETCH_TOOL_NAME]
+        fetchers = [tool for tool in tools if tool.name == FETCH_TOOL_NAME]
+        services = [tool for tool in tools if tool.name != FETCH_TOOL_NAME]
         text = ""
         if services:
             lines = [f"- `{tool.name}`: {tool.description}" for tool in services]
@@ -525,6 +600,106 @@ class PhaseRunner:
             workspace=self.workspace,
         )
 
+    # -- named agents --------------------------------------------------------
+
+    def _binding(self, phase: str, task_id: str | None = None) -> AgentBinding | None:
+        """The agent taking ``phase``, or None when the run has no assignment."""
+        if self.assignment is None:
+            return None
+        return self.assignment.binding_for(phase, task_id)
+
+    @staticmethod
+    def _custom(binding: AgentBinding | None) -> AgentBinding | None:
+        """``binding`` when it changes anything about a session, else None."""
+        return binding if binding is not None and not binding.is_default() else None
+
+    def _system_message(self, phase: str, extra: str | None, binding: AgentBinding | None) -> str:
+        """The phase's briefing, then a custom agent's persona and memory."""
+        text = brief_for_phase(self.config, phase, extra)
+        custom = self._custom(binding)
+        if custom is not None:
+            text += custom.persona + custom.memory_block
+        return text
+
+    def _selection(self, phase: str, binding: AgentBinding | None) -> ModelSelection:
+        custom = self._custom(binding)
+        if custom is None:
+            return model_for_phase(
+                refreshed_models(self.config), phase, repo=run_model_repo(self.config)
+            )
+        return model_for_phase(
+            refreshed_models(self.config),
+            phase,
+            repo=run_model_repo(self.config),
+            agent_model=custom.model,
+            agent_slug=custom.slug,
+        )
+
+    def _session_tools(self, phase: str, binding: AgentBinding | None) -> tuple[HostToolSpec, ...]:
+        """The run's own host tools ``phase`` gets, narrowed to the agent's
+        tools and credentials when a custom agent takes it."""
+        tools = self.host_tools if phase in TOOLED_PHASES else ()
+        custom = self._custom(binding)
+        if custom is None:
+            return tools
+        if custom.tools is not None:
+            tools = tuple(tool for tool in tools if tool.name in custom.tools)
+        if not custom.credentials:
+            return tools
+        narrowed: list[HostToolSpec] = []
+        for tool in tools:
+            if tool.name != SERVICE_TOOL_NAME:
+                narrowed.append(tool)
+                continue
+            allowed = _service_credentials(tool, custom.credentials)
+            if not allowed:
+                continue
+            spec = (
+                self.narrow_service(allowed)
+                if self.narrow_service is not None
+                else _with_credentials(tool, allowed)
+            )
+            if spec is not None:
+                narrowed.append(spec)
+        return tuple(narrowed)
+
+    def _agent_tools(
+        self,
+        custom: AgentBinding | None,
+        *,
+        permission_mode: Literal["auto", "read_only"],
+    ) -> list[AgentTool]:
+        """The agent's own tools for one session: its memory, when its
+        ``tools`` name ``memory``. A built-in (no list) gets none, so the
+        default team's jobs are unchanged.
+
+        A session that may change nothing gets ``recall`` alone — a critic,
+        whatever it was asked to do, and any read-only session — exactly as
+        a read-only chat turn does: judging the work is not an occasion to
+        rewrite what the agent remembers of it."""
+        if (
+            self.memory is None
+            or custom is None
+            or custom.tools is None
+            or MEMORY_TOOL_GROUP not in custom.tools
+        ):
+            return []
+        return memory_tools(
+            self.memory,
+            custom.slug,
+            channel_id=None if self.assignment is None else self.assignment.channel_id,
+            run_id=self.run_id,
+            message_id=None,
+            writable=permission_mode != "read_only" and custom.role != "critic",
+        )
+
+    def _identity(self, binding: AgentBinding | None) -> dict[str, Any]:
+        """The ``submit`` keyword that credits the job to its agent, when
+        the run's assignment credits anyone."""
+        if not self._credited or binding is None:
+            return {}
+        return {"agent_identity": {"agent_slug": binding.slug, "agent_name": binding.name}}
+
     # -- job plumbing ------------------------------------------------------
 
     def _agent_job(
@@ -540,20 +715,36 @@ class PhaseRunner:
         digest: ToolDigest | None = None,
         selection: ModelSelection | None = None,
         response_only: bool = False,
+        task_id: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> JobResult:
-        selection = selection or model_for_phase(
-            refreshed_models(self.config), phase, repo=run_model_repo(self.config)
-        )
+        # An explicit binding overrides the run's assignment for this job:
+        # a steer answered by a mentioned agent speaks as that agent, in
+        # whatever phase the run happens to be in (S-A11).
+        binding = binding or self._binding(phase, task_id)
+        custom = self._custom(binding)
+        selection = selection or self._selection(phase, binding)
         agent_name = AGENT_NAMES[phase]
         # Only the working phases get the host tools: the planners and the
         # critics read and judge; the builder and the operator's executor
         # are the ones whose work may need a service.
-        service_tools = self.host_tools if phase in TOOLED_PHASES else ()
+        service_tools = self._session_tools(phase, binding)
         # The skill tool is NOT narrowed to the tooled phases: a critic needs
         # the verification procedure exactly as much as the builder does, and
         # unlike a service call it reaches nothing outside the host.
-        host_tools, tool_handler = self._tools_for(phase, service_tools)
-        if phase == "review" and self.issue_lookup is not None and not response_only:
+        host_tools, tool_handler = self._tools_for(phase, service_tools, custom)
+        agent_tools = self._agent_tools(custom, permission_mode=permission_mode)
+        if agent_tools:
+            assert custom is not None
+            host_tools = (*host_tools, *(tool.spec for tool in agent_tools))
+            tool_handler = agent_tool_handler(agent_tools, tool_handler, agent_slug=custom.slug)
+        allowed_tools = None if custom is None else custom.tools
+        if (
+            phase == "review"
+            and self.issue_lookup is not None
+            and not response_only
+            and (allowed_tools is None or self.issue_lookup.tool_spec().name in allowed_tools)
+        ):
             lookup = self.issue_lookup
             other_handler = tool_handler
 
@@ -577,7 +768,7 @@ class PhaseRunner:
             system_message=(
                 system_message
                 if response_only
-                else brief_for_phase(self.config, phase, system_message)
+                else self._system_message(phase, system_message, binding)
             ),
             system_preset=system_preset,
             model=selection.model,
@@ -641,6 +832,7 @@ class PhaseRunner:
                 tool_handler=tool_handler if host_tools else None,
                 agent_phase=phase,
                 model_source=selection.source,
+                **self._identity(binding),
             )
         finally:
             unsubscribe()
@@ -670,7 +862,10 @@ class PhaseRunner:
         return result
 
     def _tools_for(
-        self, phase: str, service_tools: Sequence[HostToolSpec]
+        self,
+        phase: str,
+        service_tools: Sequence[HostToolSpec],
+        custom: AgentBinding | None = None,
     ) -> tuple[tuple[HostToolSpec, ...], HostToolHandler | None]:
         """The host tools one phase's session gets, and the handler that
         answers them.
@@ -684,9 +879,15 @@ class PhaseRunner:
         """
         role = ROLE_BY_PHASE[phase]
         skill_spec = skill_tool_spec(role)
-        if skill_spec is None:
-            return tuple(service_tools), self.tool_handler if service_tools else None
+        if custom is not None and custom.tools is not None and SKILL_TOOL_NAME not in custom.tools:
+            skill_spec = None
         delegate = self.tool_handler
+        if custom is not None and custom.credentials and delegate is not None:
+            delegate = _credential_guard(delegate, custom)
+        if custom is not None and custom.tools is not None and delegate is not None:
+            delegate = _tool_guard(delegate, custom, frozenset(tool.name for tool in service_tools))
+        if skill_spec is None:
+            return tuple(service_tools), delegate if service_tools else None
 
         def handler(call: HostToolCall) -> HostToolResponse:
             if call.name == SKILL_TOOL_NAME:
@@ -723,6 +924,8 @@ class PhaseRunner:
         system_preset: bool = True,
         repair_check: Callable[[object, ModelT], None] | None = None,
         repair_identity: str = "",
+        task_id: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> tuple[ModelT, JobResult]:
         """Run a JSON-expecting job, normally with one validation retry.
 
@@ -742,10 +945,13 @@ class PhaseRunner:
         """
         checkpoint_key: str | None = None
         checkpoint: _ReviewResponseCheckpoint | None = None
+        binding = binding or self._binding(prompt_name, task_id)
         if prompt_name == "review" and self.store is not None:
             identity = {
                 "prompt": render(prompt_name, retry_context="", **context),
-                "system_message": brief_for_phase(self.config, prompt_name, system_message),
+                # A custom critic's persona and memory are part of what it
+                # was asked, so another critic never replays this response.
+                "system_message": self._system_message(prompt_name, system_message, binding),
                 "system_preset": system_preset,
                 "permission_mode": permission_mode,
                 # Keep the run's original fallback in the identity for legacy
@@ -772,9 +978,7 @@ class PhaseRunner:
         retry_context = ""
         last_error: Exception | None = None
         if checkpoint is None:
-            selection = model_for_phase(
-                refreshed_models(self.config), prompt_name, repo=run_model_repo(self.config)
-            )
+            selection = self._selection(prompt_name, binding)
         else:
             # Checkpoints written before per-agent models used the run's
             # top-level model. Restore session identities as well as responses
@@ -799,6 +1003,8 @@ class PhaseRunner:
                         system_message=system_message,
                         system_preset=system_preset,
                         selection=selection,
+                        task_id=task_id,
+                        binding=binding,
                     )
                 )
             except WorkerError as exc:
@@ -1259,7 +1465,9 @@ class PhaseRunner:
             repo_conventions=self.repo_conventions(),
             work_dir=self._work_dir(),
             toolchains=toolchains.describe(self.languages, self.versions),
-            service_tools=self._service_tools_section(),
+            service_tools=self._service_tools_section(
+                self._session_tools("build", self._binding("build", task.spec.id))
+            ),
         )
         return self._agent_job(
             prompt,
@@ -1267,6 +1475,7 @@ class PhaseRunner:
             permission_mode="auto",
             expect="text",
             resume_session_id=resume_session_id,
+            task_id=task.spec.id,
         )
 
     def review(
@@ -1345,6 +1554,7 @@ class PhaseRunner:
         tasks: Sequence[TaskRecord],
         task: TaskRecord | None,
         stage: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> SteerVerdict:
         """Answer one interactive chat message and rule on its course change.
 
@@ -1352,6 +1562,11 @@ class PhaseRunner:
         tasks, and throughout the post-build stages); ``tasks`` is the whole
         board, so the agent can speak to overall progress; ``stage`` names
         where the run is when no task is active ("awaiting CI on PR #12").
+
+        ``binding`` is the agent the message mentioned (S-A11): the answer
+        comes back in that agent's persona and with its model, rather than
+        in the run's default steering voice. None keeps the voice a steer
+        has always had, so an unmentioned steer is unchanged.
         """
         board = bullet_list(
             [f"{t.spec.id} [{t.state}] {t.spec.title}" for t in tasks],
@@ -1381,6 +1596,7 @@ class PhaseRunner:
                 "user_message": message,
             },
             permission_mode="read_only",
+            binding=binding,
         )
         return verdict
 
@@ -1428,7 +1644,11 @@ class PhaseRunner:
             prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             feedback=task.last_feedback or "(none — first attempt)",
             user_guidance=self._guidance(),
-            service_tools=self._service_tools_section(),
+            service_tools=self._service_tools_section(
+                self._session_tools(
+                    "operator_execute", self._binding("operator_execute", task.spec.id)
+                )
+            ),
         )
         return self._agent_job(
             prompt,
@@ -1439,6 +1659,7 @@ class PhaseRunner:
             system_message=OPERATOR_SYSTEM_MESSAGE,
             system_preset=False,
             digest=digest,
+            task_id=task.spec.id,
         )
 
     def judge(
@@ -1472,6 +1693,7 @@ class PhaseRunner:
             permission_mode="read_only",
             system_message=JUDGE_SYSTEM_MESSAGE,
             system_preset=False,
+            task_id=task.spec.id,
         )
         return verdict
 

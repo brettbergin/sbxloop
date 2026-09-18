@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Query
 from sbxloop.api.auth.deps import Authenticated, get_ctx, require
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
-from sbxloop.api.models import RunUsage, UsageWindow
+from sbxloop.api.models import RunUsage, UsagePool, UsageWindow, rfc3339
 from sbxloop.api.projections import Views
 from sbxloop.api.usage import WINDOW_MAX_S, parse_when, run_usage, window_usage
 from sbxloop.daemon.loop import day_window
@@ -61,6 +61,31 @@ async def get_usage(
         views = Views(ctx)
         return window_usage(
             views.store, since=start, until=end, now=now, runs=views.store.list_runs
+        )
+
+    return await ctx.call(read)
+
+
+@router.get("/usage/pool", response_model=UsagePool)
+async def get_usage_pool(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    _auth: Authenticated = Depends(require("runs:read")),  # noqa: B008
+) -> UsagePool:
+    """Today's workspace budget pool: runs against `[daemon]
+    max_runs_per_day` and reported input plus output tokens, from runs and
+    chat turns, against `[daemon] daily_token_budget`."""
+
+    def read() -> UsagePool:
+        figures = ctx.loop.usage_pool.snapshot(ctx.clock())
+        return UsagePool(
+            day_start=rfc3339(figures["day_start"]) or "",
+            resets_at=rfc3339(figures["resets_at"]) or "",
+            runs_today=figures["runs_today"],
+            max_runs_per_day=figures["max_runs_per_day"],
+            tokens_today=figures["tokens_today"],
+            daily_token_budget=figures["daily_token_budget"],
+            runs_tokens_today=figures["runs_tokens_today"],
+            turns_tokens_today=figures["turns_tokens_today"],
         )
 
     return await ctx.call(read)

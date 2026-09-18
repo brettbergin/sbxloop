@@ -22,14 +22,17 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any, Literal, TypeVar
 
+from sbxloop.agents.registry import AgentRegistry, default_registry
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.controls.intake import (
     AdmitRequest,
     IssueAdmission,
     admit_issue,
     build_item,
+    resolve_assignment_request,
     target_key,
     upsert,
+    with_assignment_request,
 )
 from sbxloop.daemon.controls.operations import OperationRunner, OperationSpec, OperationStore
 from sbxloop.daemon.controls.principal import Capability, Principal
@@ -112,6 +115,13 @@ class ControlService:
             if isinstance(operations, OperationStore)
             else None
         )
+
+    def _agents(self) -> AgentRegistry:
+        """The loop's agent registry; the configured agents for a loop
+        that keeps none (a test double)."""
+        loop: Any = self.loop
+        registry: AgentRegistry | None = getattr(loop, "agents", None)
+        return registry if registry is not None else default_registry(loop.config)
 
     def _record(self, spec: OperationSpec, fn: Callable[[str | None], OutcomeT]) -> OutcomeT:
         """Run ``fn`` under a durable operation when the loop keeps them;
@@ -348,9 +358,16 @@ class ControlService:
         expected_revision: int | None = None,
         deadline_s: float | None = None,
         idempotency: tuple[str, str] | None = None,
+        task_id: str | None = None,
+        agent_slug: str | None = None,
     ) -> SteerOutcome:
         """Submit explicit direction to the run in flight (#1038): a record
-        first, then the hand-over; the record says what became of it."""
+        first, then the hand-over; the record says what became of it.
+
+        ``task_id`` addresses one task lane and ``agent_slug`` the agent
+        that was mentioned (S-A11); both ride on the record so a reader can
+        see who the instruction was for, and both are optional, so a caller
+        that names neither steers the run exactly as before."""
         require(principal, "runs:steer")
         text = text.strip()
         if not text:
@@ -378,6 +395,8 @@ class ControlService:
                     text,
                     by=principal.attribution(),
                     expected_revision=expected_revision,
+                    task_id=task_id,
+                    agent_slug=agent_slug,
                 )
             except ControlError as exc:
                 store.failed(record.id, exc.message, self.loop.clock())
@@ -395,6 +414,10 @@ class ControlService:
             expected_revision=expected_revision,
             text=text,
             source_refs=list(source_refs),
+            # Recorded only when named, so an unaddressed instruction's
+            # operation fingerprint is the one it always was.
+            **({"task_id": task_id} if task_id else {}),
+            **({"agent_slug": agent_slug} if agent_slug else {}),
         )
         return self._record(spec, apply)
 
@@ -617,10 +640,14 @@ class ControlService:
         loop: Any = self.loop
 
         def apply(_: str | None) -> AdmitOutcome:
+            # Checked before the source is touched: a refused agent must
+            # not leave a labelled issue behind.
+            lead, roles = resolve_assignment_request(self._agents(), request)
             if isinstance(request, IssueAdmission):
                 item = admit_issue(loop, request)
             else:
                 item = build_item(loop.config, request, item_id=key, requested_by=None)
+            item = with_assignment_request(item, request, lead, roles)
             stored, fresh = upsert(loop, item, by=principal.attribution())
             return AdmitOutcome(item=stored, fresh=fresh)
 
@@ -910,6 +937,13 @@ def _request_fields(request: AdmitRequest) -> dict[str, Any]:
     asked, never a secret."""
     fields = asdict(request)
     fields.pop("key", None)
+    # Recorded only when asked for, so a request made before admission
+    # could name agents fingerprints as it always did.
+    for name in ("lead", "roles", "channel_id", "origin_agent", "parent_item_id", "chain_depth"):
+        if name in fields and not fields[name]:
+            del fields[name]
+    if "roles" in fields:
+        fields["roles"] = dict(fields["roles"])
     return {"form": type(request).__name__.removesuffix("Admission").lower(), **fields}
 
 

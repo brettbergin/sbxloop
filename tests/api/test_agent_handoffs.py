@@ -457,7 +457,7 @@ def test_stop_skips_dynamically_queued_peers_and_prose_does_not_dispatch(api: An
         with pytest.raises(ToolRejectedError, match="no longer running"):
             concierge.calls[0]["handoff"]("builder", "Too late")
         concierge.first.set_result(ConciergeReply("@operator could help too"))
-        api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+        assert api.ctx.turns.wait_idle(timeout=5)
         done = settled(api.client, headers, channel, turn["id"])
         assert done["status"] == "cancelled"
         assert [p["status"] for p in done["participants"]] == ["completed", "cancelled"]
@@ -467,7 +467,11 @@ def test_stop_skips_dynamically_queued_peers_and_prose_does_not_dispatch(api: An
             concierge.first.set_result(ConciergeReply("released"))
 
 
-def test_prose_mentions_alone_do_not_dispatch_a_peer(api: Any) -> None:
+def test_prose_mentions_alone_do_not_dispatch_a_peer_into_this_turn(api: Any) -> None:
+    """`handoff_agent` is the only thing that grows a turn a peer. A prose
+    mention in a reply leaves this turn's participants exactly as they
+    were; now that agents address each other it starts a turn of its own
+    instead (tests/api/test_agent_mentions.py), which is not this one."""
     concierge = Blocking()
     api.ctx.concierge = concierge
     headers = bearer(register(api))
@@ -477,4 +481,9 @@ def test_prose_mentions_alone_do_not_dispatch_a_peer(api: Any) -> None:
     concierge.first.set_result(ConciergeReply("@critic should review this"))
     done = settled(api.client, headers, channel, turn["id"])
     assert done["status"] == "completed"
-    assert len(done["participants"]) == len(concierge.calls) == 1
+    assert [p["agent_slug"] for p in done["participants"]] == ["planner"]
+    assert concierge.calls[0]["session_key"] == f"{channel}:planner"
+    # Whatever the mention started belongs to another turn, never this one.
+    assert api.ctx.turns.wait_idle(timeout=5)
+    again = api.client.get(f"{route}/{turn['id']}", headers=headers).json()
+    assert [p["agent_slug"] for p in again["participants"]] == ["planner"]

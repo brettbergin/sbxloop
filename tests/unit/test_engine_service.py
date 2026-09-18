@@ -613,3 +613,55 @@ class TestServiceOps:
     def test_http_refuses_ungranted_names_with_the_granted_list(self) -> None:
         with pytest.raises(ServiceOpsError, match=r"not granted.*weather"):
             self.make().http("mail", "GET", "/")
+
+
+def _session_jobs(harness: Harness, *, assigned: bool) -> list[dict[str, Any]]:
+    """The run's agent-session job requests, minus per-run identifiers."""
+    import re
+
+    from sbxloop.agents.assignment import plan_assignment
+    from sbxloop.agents.registry import ConfigAgentRegistry
+
+    harness.script([taskgraph(task("t1")), build_with_call(CALL), *HAPPY_TASK[1:]])
+    engine = harness.engine(credentials=[WEATHER], keep_sandboxes=True)
+    assignment = (
+        plan_assignment(
+            ConfigAgentRegistry(engine.config),
+            kind="code",
+            lead=None,
+            requested={},
+            channel_id=None,
+        )
+        if assigned
+        else None
+    )
+    assert engine.start("weather", credentials=["weather"], assignment=assignment).succeeded
+    run_id = engine.store.list_runs()[0].run_id
+    jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
+    keys = ("prompt", "system_message", "system_preset", "host_tools", "model", "mcp_servers")
+    text = json.dumps([{key: job.get(key) for key in keys} for job in jobs])
+    text = text.replace(run_id, "<run>").replace(str(harness.tmp_path), "<tmp>")
+    return sorted(json.loads(re.sub(r"job-[0-9a-z]+", "<job>", text)), key=json.dumps)
+
+
+class TestDefaultAssignment:
+    @pytest.mark.parametrize("assigned", [False, True], ids=["none", "default"])
+    def test_prompts_and_tools_match_a_run_without_one(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_service: Path,
+        assigned: bool,
+    ) -> None:
+        """The byte-identical gate for credentialed runs: the default
+        assignment sends the same prompts, system messages and host tools
+        as no assignment at all."""
+        (tmp_path / "base").mkdir()
+        expected = _session_jobs(Harness(fake_sbx, tmp_path / "base", monkeypatch), assigned=False)
+        (tmp_path / "subject").mkdir()
+        actual = _session_jobs(
+            Harness(fake_sbx, tmp_path / "subject", monkeypatch), assigned=assigned
+        )
+        assert len(expected) == 2
+        assert actual == expected

@@ -25,7 +25,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -128,6 +128,8 @@ class PhaseAttemptRecord(NamedTuple):
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
     turns: int | None = None
+    # The named agent that took the attempt, when the run had an assignment.
+    agent_slug: str | None = None
 
     @property
     def seconds(self) -> float:
@@ -384,6 +386,7 @@ def _attempt_record(row: PhaseAttempt) -> PhaseAttemptRecord:
         cache_read_tokens=row.cache_read_tokens,
         cache_write_tokens=row.cache_write_tokens,
         turns=row.turns,
+        agent_slug=row.agent_slug,
     )
 
 
@@ -752,6 +755,19 @@ class StateStore:
                 raise StateError(f"unknown run {run_id}")
             return self._run_record(row)
 
+    def set_run_assignment(self, run_id: str, assignment_json: str | None) -> None:
+        """Record the named-agent assignment the run was started with."""
+        with self._write() as session:
+            self._set_run(session, run_id, assignment_json=assignment_json)
+
+    def get_run_assignment(self, run_id: str) -> str | None:
+        """The run's assignment as recorded, None for a run without one."""
+        with self._read() as session:
+            row = session.get(Run, run_id)
+            if row is None:
+                raise StateError(f"unknown run {run_id}")
+            return row.assignment_json
+
     def get_run_config(self, run_id: str) -> str:
         """The config JSON persisted at run creation. ``'{}'`` means nothing
         was persisted (rows from versions that predate config storage)."""
@@ -1013,6 +1029,28 @@ class StateStore:
                     break
         return out
 
+    def set_task_assignees(self, run_id: str, assignees: Mapping[str, str]) -> None:
+        """Record which agent does each named task's work."""
+        if not assignees:
+            return
+        with self._write() as session:
+            for task_id, slug in assignees.items():
+                session.execute(
+                    update(Task)
+                    .where(Task.run_id == run_id, Task.task_id == task_id)
+                    .values(assignee=slug)
+                )
+
+    def task_assignees(self, run_id: str) -> dict[str, str]:
+        """Each task that has an assignee, by task id."""
+        with self._read() as session:
+            rows = session.execute(
+                select(Task.task_id, Task.assignee).where(
+                    Task.run_id == run_id, Task.assignee.is_not(None)
+                )
+            ).all()
+        return {str(task_id): str(slug) for task_id, slug in rows}
+
     def get_tasks(self, run_id: str) -> list[TaskRecord]:
         with self._read() as session:
             rows = session.scalars(
@@ -1049,6 +1087,7 @@ class StateStore:
         started_at: float,
         usage: Usage | None = None,
         turns: int | None = None,
+        agent_slug: str | None = None,
     ) -> None:
         u = usage or Usage()
         with self._write() as session:
@@ -1067,6 +1106,7 @@ class StateStore:
                     cache_read_tokens=u.cache_read_tokens,
                     cache_write_tokens=u.cache_write_tokens,
                     turns=turns,
+                    agent_slug=agent_slug,
                 )
             )
 

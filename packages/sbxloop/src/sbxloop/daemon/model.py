@@ -3,6 +3,7 @@ notices the loop narrates to a human channel."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any, Literal, NamedTuple
 
@@ -50,6 +51,35 @@ ItemState = Literal[
 # source told where it went. ``held`` is a workload parked at publishing by
 # its profile's `publish = "hold"`: the source hears how to release it.
 PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated", "completed", "held"]
+
+
+def requested_roles_json(roles: Mapping[str, str]) -> str:
+    """What an item's ``assignment_json`` holds before dispatch plans an
+    assignment: the agent asked for in each run role."""
+    return json.dumps({"roles": {role: roles[role] for role in sorted(roles)}})
+
+
+def requested_roles(assignment_json: str | None) -> dict[str, str]:
+    """The roles named in an item's ``assignment_json``, requested or planned."""
+    if not assignment_json:
+        return {}
+    try:
+        data = json.loads(assignment_json)
+    except ValueError:
+        return {}
+    roles = data.get("roles") if isinstance(data, dict) else None
+    return {str(k): str(v) for k, v in roles.items()} if isinstance(roles, dict) else {}
+
+
+def is_planned_assignment(assignment_json: str | None) -> bool:
+    """True once dispatch has replaced the request with a planned assignment."""
+    if not assignment_json:
+        return False
+    try:
+        data = json.loads(assignment_json)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "agents" in data and "lead" in data
 
 
 class WorkItem(BaseModel):
@@ -118,6 +148,19 @@ class WorkItem(BaseModel):
     # a row that will not load.
     recipe: str | None = None
     recipe_target: str | None = None
+    # Who the work is for and who does it. ``channel_id`` is the
+    # conversation the work answers to; ``lead_agent`` the lead asked for
+    # at admission (None: the built-in lead). ``assignment_json`` holds the
+    # roles asked for (``{"roles": {role: slug}}``) until dispatch replaces
+    # it with the planned :class:`~sbxloop.agents.assignment.AgentAssignment`,
+    # which every later attempt reuses. ``origin_agent``, ``parent_item_id``
+    # and ``chain_depth`` describe work an agent started.
+    channel_id: str | None = None
+    lead_agent: str | None = None
+    assignment_json: str | None = None
+    origin_agent: str | None = None
+    parent_item_id: str | None = None
+    chain_depth: int = 0
     # Bumped on every write of the row (a trigger, revision 0010); what a
     # remote command's `expected_revision` is checked against. Not a
     # column a caller sets.
@@ -222,7 +265,9 @@ TickOutcome = Literal[
     # `[daemon] max_concurrent_runs` leaves room for more than one run).
     "started",
 ]
-IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work", "provider_held", "busy"]
+IdleKind = Literal[
+    "paused", "breaker", "daily_cap", "budget", "backoff", "no_work", "provider_held", "busy"
+]
 
 
 def live_runs(status: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -273,6 +318,7 @@ NoticeKind = Literal[
     "daemon.resumed",
     "daemon.holds_restored",
     "daemon.daily_cap",
+    "daemon.token_budget",
     "daemon.gc",
     "daemon.state_archived",
     "daemon.repoless_items_stranded",

@@ -53,6 +53,37 @@ class Steering:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+#: The words that mean stop, and nothing else. Stopping is never inferred
+#: from a message that merely sounds urgent (S-A11): a person who wants the
+#: work to stop says so in one of these exact ways, and everything else is
+#: steering, which changes course without throwing away what is running.
+STOP_WORDS: frozenset[str] = frozenset({"/stop", "/cancel"})
+
+StopScope = Literal["channel", "agent"]
+
+
+def stop_command(text: str, agent_slug: str | None) -> StopScope | None:
+    """Whether ``text`` is an explicit stop, and how wide.
+
+    ``"channel"`` for a bare ``/stop`` or ``/cancel``; ``"agent"`` for an
+    exact ``@<agent> stop`` naming the agent this turn is for. Anything
+    with more words in it -- "@builder stop using that library" -- is
+    ordinary direction, so the one phrasing that reads like a command and
+    means something else does not silently kill a run.
+    """
+    words = text.strip().casefold().split()
+    if len(words) == 1 and words[0] in STOP_WORDS:
+        return "channel"
+    if (
+        agent_slug is not None
+        and len(words) == 2
+        and words[0] == f"@{agent_slug.casefold()}"
+        and words[1] == "stop"
+    ):
+        return "agent"
+    return None
+
+
 def new_steering_id() -> str:
     return "str_" + _token(16)
 
