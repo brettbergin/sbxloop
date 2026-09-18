@@ -656,6 +656,17 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A chat ask or scheduled workload no longer fetches the primary
+  repository's checkout anonymously on a daemon with several
+  repositories.** An item that names no repository selected no forge
+  credential, but its checkout still fell back to the primary repository's
+  home clone, so `git fetch origin` ran without a token and a private
+  GitLab answered "could not read Username ... terminal prompts disabled",
+  posted as a `workspace refresh failed` warning on every such run. With
+  several repositories configured, a repo-less item now refreshes nothing
+  and logs `workspace.refresh_skipped` at info. A single-repository daemon
+  still refreshes its one checkout with that repository's credential.
+
 - **`doctor --deep` no longer reports a sandbox reaching the remote API
   when nothing got through.** The `api-host-unreachable` probe counted any
   accepted connection as reachable, and sbx accepts connections its
