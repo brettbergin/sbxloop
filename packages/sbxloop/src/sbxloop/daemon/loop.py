@@ -114,7 +114,7 @@ from sbxloop.errors import (
     SbxloopError,
     StateError,
 )
-from sbxloop.events import Event, EventBus
+from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
 from sbxloop.ghids import (
     is_api_id,
@@ -2483,6 +2483,37 @@ class DaemonLoop:
         )
         return item.model_copy(update={"assignment_json": text})
 
+    def _chronicle(
+        self, item: WorkItem, run_id: str, item_config: Config | None = None
+    ) -> RunChronicle | None:
+        """The chronicle telling ``run_id``'s story in the channel that asked
+        for ``item``, or None when nobody asked. The poster the API listener
+        supplies also lists a run's files; one that does not simply posts
+        without them. A resumed segment is numbered by the resumes the run
+        has had, so a stop it reaches is said even when an earlier segment
+        stopped the same way."""
+        posts: object = self.poster
+        return RunChronicle.for_item(
+            self.poster,
+            _item_assignment(item),
+            item,
+            item_config or self._item_config(item),
+            self.clock,
+            artifacts=posts if isinstance(posts, RunArtifacts) else None,
+            resumes=self.dstore.resumes_for_run(run_id) if self.poster is not None else 0,
+        )
+
+    def _chronicle_landed(
+        self, item: WorkItem | None, run_id: str, pr: int | None, url: str | None
+    ) -> None:
+        """A parked run a person approved has merged, outside its engine:
+        tell its channel, as the engine's own merge would have."""
+        if item is None:
+            return
+        chronicle = self._chronicle(item, run_id)
+        if chronicle is not None:
+            chronicle.on_event(Event.now(HostEventTypes.RUN_MERGED, run_id, pr=pr, url=url))
+
     def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
@@ -2521,17 +2552,7 @@ class DaemonLoop:
         # What the run does is told in the channel that asked for it, under
         # the names of the agents doing it. A resume re-attaches it: the
         # posts a run already made are keyed, so nothing is said twice.
-        # The poster the API listener supplies also lists a run's files;
-        # one that does not simply posts without them.
-        posts: object = self.poster
-        chronicle = RunChronicle.for_item(
-            self.poster,
-            _item_assignment(item),
-            item,
-            item_config,
-            self.clock,
-            artifacts=posts if isinstance(posts, RunArtifacts) else None,
-        )
+        chronicle = self._chronicle(item, run_id, item_config)
         if chronicle is not None:
             bus.subscribe(chronicle.on_event)
         engine = LoopEngine(
@@ -3551,6 +3572,7 @@ class DaemonLoop:
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            self._chronicle_landed(fresh, run_id, hold.pr_number, hold.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} {how} · PR #{hold.pr_number}",
@@ -3790,6 +3812,7 @@ class DaemonLoop:
                 self._deliver_report(fresh)
             if item is not None:
                 self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
+            self._chronicle_landed(fresh or item, run_id, gate.pr_number, gate.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} merged after approval by {by} · PR #{gate.pr_number}",

@@ -72,6 +72,14 @@ class RunArtifacts(Protocol):
 
 
 @runtime_checkable
+class RunPostLedger(Protocol):
+    """What a run has already posted. A resumed run counts it towards its
+    cap; the platform's poster answers it from its dedupe ledger."""
+
+    def run_post_keys(self, run_id: str) -> frozenset[str]: ...
+
+
+@runtime_checkable
 class ChannelPoster(Protocol):
     """How a run reaches a channel. Every call is best-effort: a run never
     fails because a channel could not be written to."""
@@ -94,4 +102,5 @@ __all__ = [
     "ChannelPoster",
     "PostKind",
     "RunArtifacts",
+    "RunPostLedger",
 ]

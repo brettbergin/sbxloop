@@ -2953,8 +2953,8 @@ class AgentTeamConfig(_ConfigModel):
     max_agent_runs_per_day: int = Field(default=4, ge=0)
     # What a run posts in the channel that asked for it.
     chronicle: Literal["normal", "quiet", "off"] = "normal"
-    # The most posts one run makes; the delivery and terminal notices are
-    # above it.
+    # The most posts one run makes, across its resumes; the delivery and
+    # terminal notices are above it.
     max_posts_per_run: int = Field(default=12, ge=1)
     # Progress posts are coalesced to at most one this often.
     progress_interval_s: float = Field(default=120.0, ge=0)

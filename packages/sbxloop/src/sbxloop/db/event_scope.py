@@ -18,9 +18,7 @@ from sqlalchemy import select
 
 from sbxloop.db.collaboration_models import MessageRow, TurnRow
 from sbxloop.db.daemon_models import DaemonRunRow, WorkItemRow
-
-#: Run kinds whose item's source key is the asking chat message's id.
-_CHAT_KINDS = frozenset({"workload", "tool"})
+from sbxloop.ghids import chat_source_message_id
 
 
 def channel_for_item(session: Any, item_id: str) -> str | None:
@@ -34,8 +32,9 @@ def channel_for_item(session: Any, item_id: str) -> str | None:
         # message has.
         return str(item.channel_id)
     source_key = str(item.source_key)
-    if item.run_kind in _CHAT_KINDS:
-        message: MessageRow | None = session.get(MessageRow, source_key.split(":", 1)[0])
+    asking = chat_source_message_id(str(item.run_kind), source_key)
+    if asking is not None:
+        message: MessageRow | None = session.get(MessageRow, asking)
         if message is None or message.role != "user":
             return None
         return str(message.channel_id)

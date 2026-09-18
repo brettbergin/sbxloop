@@ -3,9 +3,9 @@
 A run reports through events, which is the right shape for a log and the
 wrong shape for a conversation. This turns the few events a person actually
 waits on into short posts under the name of the agent that did the work:
-the plan from the planner, each finished task from its agent, the verdict
-from the critic, a steering reply from the agent that was asked, and the
-delivery or the notice from the lead.
+the plan from the planner, each finished or failed task from its agent, the
+verdict from the critic, a steering reply from the agent that was asked, and
+the delivery or the notice from the lead.
 
 It is deliberately quiet. Progress is coalesced to one post per interval and
 the whole run is capped by ``[agent_team] max_posts_per_run``, so a long run
@@ -13,7 +13,11 @@ does not bury the conversation it is happening in. What ends a run - its
 delivery, and a notice when it stopped - is posted whatever the cap says,
 because a run nobody hears finish is a run nobody can act on. Every post
 carries a key naming the moment it is about, so a resumed or replayed run
-says each thing once.
+says each thing once. A stop is a moment of the segment that reached it: a
+run an operator resumes and that stops again says so again. The cap is the
+run's, so a resumed run starts from the posts the channel already has. Each
+post also names the message that asked for the work, so it
+joins the turn that asked rather than whichever turn is newest.
 """
 
 from __future__ import annotations
@@ -30,10 +34,12 @@ from sbxloop.agents.posts import (
     ChannelPoster,
     PostKind,
     RunArtifacts,
+    RunPostLedger,
 )
 from sbxloop.config import Config
 from sbxloop.daemon.model import WorkItem
 from sbxloop.events import HostEventTypes
+from sbxloop.ghids import chat_source_message_id
 from sbxloop.log import get_logger
 from sbxloop_worker.protocol import Event
 
@@ -43,6 +49,9 @@ log = get_logger(__name__)
 _WORKING_PHASE: dict[str, str] = {"code": "build", "workload": "operator_execute"}
 #: How a run ending in one of these states reads: it delivered something.
 _DELIVERED_STATES = frozenset({"merged", "completed", "published"})
+#: The sink whose publication carries the answer someone asked for; the
+#: others deliver a file, a pull request or an issue and are named by it.
+_ANSWERING_SINK = "chat"
 #: One post's text is cut to this; a channel is not a log.
 _MAX_TEXT = 500
 
@@ -68,6 +77,7 @@ class RunChronicle:
         clock: Callable[[], float],
         *,
         artifacts: RunArtifacts | None = None,
+        resumes: int = 0,
     ) -> None:
         self.poster = poster
         self.assignment = assignment
@@ -76,12 +86,24 @@ class RunChronicle:
         self.clock = clock
         self.artifacts = artifacts
         self.channel_id = str(item.channel_id or "")
-        #: The roster the run announced, and how many tasks have ended.
+        #: The message that asked for the work, when a chat message did.
+        #: A channel runs several turns at once, so a post that names no
+        #: message hangs on whichever turn is newest when it lands.
+        self._asked_by = chat_source_message_id(item.kind, item.source_key)
+        #: The roster the run announced, and how many tasks it finished.
         self._total = 0
         self._done = 0
-        #: Posts made (a post the channel already had counts: a replay must
-        #: reach the same cap as the run it replays).
-        self._posted = 0
+        #: What a sink other than chat reported delivering, in order, for
+        #: the delivery post of a run whose answer went nowhere else.
+        self._landed: list[str] = []
+        #: How many times the run was resumed before this segment. A stop
+        #: is keyed by it: each segment that stops says so once.
+        self._segment = f":resume{resumes}" if resumes > 0 else ""
+        #: The keys this run has posted under, in any segment. The cap
+        #: counts them, so it bounds the run rather than each segment, and a
+        #: replayed post is not counted twice. Read from the poster the
+        #: first time this segment posts.
+        self._counted: set[str] | None = None
         self._last_progress: float | None = None
 
     @classmethod
@@ -94,12 +116,13 @@ class RunChronicle:
         clock: Callable[[], float],
         *,
         artifacts: RunArtifacts | None = None,
+        resumes: int = 0,
     ) -> RunChronicle | None:
         """The chronicle for ``item``, or None when there is nobody to tell:
         no channel asked for the work, or this daemon has no poster."""
         if poster is None or not item.channel_id or config.agent_team.chronicle == "off":
             return None
-        return cls(poster, assignment, item, config, clock, artifacts=artifacts)
+        return cls(poster, assignment, item, config, clock, artifacts=artifacts, resumes=resumes)
 
     # -- the bus -----------------------------------------------------------
 
@@ -133,8 +156,16 @@ class RunChronicle:
 
     def _roster(self, event: Event, data: dict[str, Any]) -> None:
         tasks = data.get("tasks")
-        count = len(tasks) if isinstance(tasks, Sequence) else 0
+        entries: Sequence[Any] = tasks if isinstance(tasks, list | tuple) else ()
+        count = len(entries)
         self._total = max(self._total, count)
+        # A resume re-announces the roster with each task's persisted
+        # state. The chronicle re-attached to it picks its count up there,
+        # instead of numbering the run's next finished task as the first.
+        self._done = max(
+            self._done,
+            sum(1 for task in entries if isinstance(task, dict) and task.get("state") == "done"),
+        )
         if count:
             self._post(
                 event,
@@ -145,19 +176,34 @@ class RunChronicle:
             )
 
     def _task_end(self, event: Event, data: dict[str, Any]) -> None:
+        """A task ends in whatever state it reached, not only ``done``.
+
+        Only work that finished counts towards the run's progress, and only
+        a failure earns a line of its own: a skipped task did nothing, and
+        what stopped the run is the notice at its end.
+        """
+        state = str(data.get("state") or "done")
+        if state == "done":
+            self._done += 1
+        elif state != "failed":
+            return
         task_id = str(data.get("task_id") or "")
-        self._done += 1
-        total = max(self._total, self._done)
         now = self.clock()
         interval = self.config.agent_team.progress_interval_s
         if self._last_progress is not None and now - self._last_progress < interval:
             return
         title = str(data.get("title") or task_id or "the task")
+        if state == "done":
+            text = f"Finished task {self._done} of {max(self._total, self._done)}: {title}"
+            dedupe = f"{event.run_id}:progress:{task_id or self._done}"
+        else:
+            text = f"Task failed: {title}"
+            dedupe = f"{event.run_id}:failed:{task_id or self._done}{self._segment}"
         posted = self._post(
             event,
             "progress",
-            f"Finished task {self._done} of {total}: {title}",
-            dedupe=f"{event.run_id}:progress:{task_id or self._done}",
+            text,
+            dedupe=dedupe,
             agent=self._task_agent(data, task_id),
             task_id=task_id or None,
         )
@@ -195,6 +241,21 @@ class RunChronicle:
         )
 
     def _delivery(self, event: Event, data: dict[str, Any]) -> None:
+        """One delivery post per run, and it is the answer that was asked
+        for.
+
+        A run publishes to every sink its tasks named, in a fixed order
+        ending with chat, and only the chat sink carries the result itself.
+        A sink before it is remembered rather than posted, because every
+        post here shares one key: the channel would otherwise be told where
+        a file landed and never told what the file said.
+        """
+        sink = str(data.get("sink") or "")
+        if sink and sink != _ANSWERING_SINK:
+            landed = str(data.get("message") or "").strip()
+            if landed and landed not in self._landed:
+                self._landed.append(landed)
+            return
         artifacts = self._run_artifacts(event.run_id)
         self._post(
             event,
@@ -216,7 +277,7 @@ class RunChronicle:
             event,
             "notice",
             text,
-            dedupe=f"{event.run_id}:notice:{state or 'end'}",
+            dedupe=f"{event.run_id}:notice:{state or 'end'}{self._segment}",
             agent=self._lead(),
         )
 
@@ -237,7 +298,7 @@ class RunChronicle:
             event,
             "notice",
             text,
-            dedupe=f"{event.run_id}:notice:{state}",
+            dedupe=f"{event.run_id}:notice:{state}{self._segment}",
             agent=self._lead(),
         )
 
@@ -254,6 +315,8 @@ class RunChronicle:
             return message
         if artifacts:
             return "Delivered " + ", ".join(ref.relpath for ref in artifacts)
+        if self._landed:
+            return "; ".join(self._landed)
         return "Finished."
 
     def _run_artifacts(self, run_id: str) -> tuple[ArtifactRef, ...]:
@@ -314,7 +377,8 @@ class RunChronicle:
             return False
         if not terminal and settings.chronicle == "quiet":
             return False
-        if not terminal and self._posted >= settings.max_posts_per_run:
+        counted = self._posted_keys(event.run_id)
+        if not terminal and dedupe not in counted and len(counted) >= settings.max_posts_per_run:
             return False
         message_id = self.poster.post(
             ChannelPost(
@@ -326,13 +390,27 @@ class RunChronicle:
                 item_id=self.item.item_id,
                 dedupe_key=dedupe,
                 task_id=task_id,
+                reply_to_message_id=self._asked_by,
                 artifacts=artifacts,
             )
         )
         if message_id is None:
             return False
-        self._posted += 1
+        counted.add(dedupe)
         return True
+
+    def _posted_keys(self, run_id: str) -> set[str]:
+        """The keys the run has posted under, starting from what the channel
+        already holds for it when the poster can say."""
+        if self._counted is None:
+            known: frozenset[str] = frozenset()
+            if isinstance(self.poster, RunPostLedger):
+                try:
+                    known = frozenset(self.poster.run_post_keys(run_id))
+                except Exception:
+                    log.warning("chronicle.ledger_failed", run=run_id, exc_info=True)
+            self._counted = set(known)
+        return self._counted
 
 
 __all__ = ["RunChronicle"]

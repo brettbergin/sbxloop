@@ -168,6 +168,27 @@ class TestApprove:
         assert isinstance(front, GateFrontend)
         assert front.gates_resolved and front.gates_resolved[0][1] == "merged"
 
+    def test_an_approved_merge_is_delivered_in_the_channel_that_asked(self, tmp_path: Path) -> None:
+        """A gated run's last post was the lead waiting for approval. The
+        merge an approval completes is the run's delivery, and the channel
+        hears it the way it hears a merge the run made itself."""
+        from tests.unit.test_run_chronicle import CHANNEL, FakePoster
+
+        h = gated_harness(tmp_path)
+        poster = FakePoster(files=False)
+        h.loop.poster = poster
+        run_id = park(h, channel_id=CHANNEL)
+        fake = FakeGithub(number=9)
+        fake.pr["html_url"] = PR_URL
+        h.loop.github = FakeDaemonGithub(fake)  # type: ignore[assignment]
+        gate = h.dstore.merge_gate_for(run_id)
+        assert gate is not None and h.dstore.claim_merge_gate(run_id)
+        h.loop._complete_landing(gate, "Discord user `brett`")
+
+        assert [(p.kind, p.channel_id, p.dedupe_key, p.text) for p in poster.posts] == [
+            ("delivery", CHANNEL, f"{run_id}:delivery", f"Merged pull request #9: {PR_URL}")
+        ]
+
     def test_approve_judges_the_checks_against_the_prs_base(self, tmp_path: Path) -> None:
         """#611: the approve path makes the run's own judgment — a red the
         PR did not cause is merged over and named, against the base the
