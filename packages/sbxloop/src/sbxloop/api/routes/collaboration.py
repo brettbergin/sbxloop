@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from sbxloop.agents.registry import AgentRegistry
 from sbxloop.api.auth.deps import (
@@ -95,7 +96,9 @@ from sbxloop.api.routes.agents import addressable
 from sbxloop.api.routes.artifacts import stream_artifact
 from sbxloop.api.routes.auth import grant_tokens
 from sbxloop.chatservices import CHAT_SERVICES
+from sbxloop.log import get_logger
 
+log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
 
@@ -328,6 +331,22 @@ def _messages_out(messages: list[Message], ctx: ApiContext) -> list[MessageOut]:
     return [_message_out(message, ctx) for message in messages]
 
 
+def _work_out(message: Message) -> ChannelWorkOut | None:
+    """The work snapshot a message carries, when a client can read it.
+
+    A snapshot written by a build that named a field this one does not is
+    shown as no snapshot: the message, and every other message in the
+    channel, still reads back.
+    """
+    if not message.work:
+        return None
+    try:
+        return ChannelWorkOut.model_validate(message.work)
+    except ValidationError:
+        log.warning("api.message_work_unreadable", message=message.id, channel=message.channel_id)
+        return None
+
+
 def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -339,7 +358,7 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         content=message.content,
         agent_slug=message.agent_slug,
         created_at=rfc3339(message.created_at) or "",
-        work=ChannelWorkOut.model_validate(message.work) if message.work else None,
+        work=_work_out(message),
         reactions=list(message.reactions),
         author=_author_out(message.author, ctx),
         post_kind=message.post_kind,

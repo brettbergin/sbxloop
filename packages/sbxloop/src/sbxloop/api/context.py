@@ -259,6 +259,12 @@ class ApiContext:
         #: The projection thread, when the listener runs one (the daemon);
         #: a test drives the chronology directly.
         self.projector: Any = None
+        if self.loop is not None:
+            # Building the listener over a daemon is what gives that daemon
+            # a way into the channels it serves: a run linked to one posts
+            # into it through this context's store. A daemon with no
+            # listener keeps the None it was built with.
+            self.loop.poster = self.poster
 
     @property
     def api(self) -> Any:

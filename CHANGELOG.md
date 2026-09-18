@@ -132,12 +132,19 @@ a code run's checkout, is `404` like any other id from elsewhere.
   the new `channel_run_posts` table, so a replayed or resumed run posts a
   moment once. A deleted channel receives nothing; a silenced channel
   drops the running commentary and still hears a `delivery` or a
-  `notice`, because nobody is coming to look. An item admitted with a
-  `channel_id` now belongs to that channel for event visibility too, so a
-  member who can open the channel sees the run's events even when no
-  message there names the work. Nothing posts yet: this is the contract
-  (`ChannelPoster`) the daemon and engine will use, advertised as
-  `collaboration.run_progress`.
+  `notice`, because nobody is coming to look. A post hangs on the turn
+  that asked for its work, the same turn the work's result is delivered
+  on, so a run's commentary and its delivery do not split across two; a
+  turn belonging to another channel is never borrowed. A run a channel
+  asked for outside any turn of its own keeps its files all the same:
+  `work.turn_id` is now nullable. A snapshot is shown only if a client
+  can read it back, and one already recorded that this build cannot read
+  hides itself rather than the channel's whole message list. An item
+  admitted with a `channel_id` now belongs to that channel for event
+  visibility too, so a member who can open the channel sees the run's
+  events even when no message there names the work. Nothing posts yet:
+  this is the contract (`ChannelPoster`) the daemon and engine will use,
+  advertised as `collaboration.run_progress`.
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel

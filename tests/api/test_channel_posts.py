@@ -13,15 +13,21 @@ admit, never from the code under test.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import update
 
 from sbxloop.agents.posts import ArtifactRef, ChannelPost, ChannelPoster
+from sbxloop.config import Config
+from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.daemon.model import WorkItem
-from sbxloop.db.collaboration_models import ChannelRow
-from sbxloop.ghids import chat_item_id
+from sbxloop.db.collaboration_models import ChannelRow, MessageRow
+from sbxloop.ghids import chat_item_id, issue_item_id
 from tests.api.test_collaboration import FakeConcierge, bearer, register
+from tests.api.test_collaboration_recovery import settled
+from tests.unit.test_daemon_loop import Harness
 
 REPORT = ArtifactRef(
     id="art_bread",
@@ -190,15 +196,252 @@ def test_a_post_into_a_channel_that_is_gone_is_dropped(api: Any) -> None:
 
 
 def test_the_daemon_loop_takes_the_poster_the_listener_supplies(api: Any) -> None:
-    # A daemon with no API listener has none, and a run reports through
-    # its events alone.
-    assert api.loop.poster is None
-
-    api.loop.poster = api.ctx.poster
-
+    # Building the listener's context over a daemon is what gives that
+    # daemon a poster: the API server does nothing else to arrange it.
+    assert api.loop.poster is api.ctx.poster
     assert isinstance(api.loop.poster, ChannelPoster)
+
+
+def test_a_daemon_with_no_listener_has_no_poster(tmp_path: Path) -> None:
+    # A run there reports through its events alone.
+    config = Config.model_validate({"home": str(tmp_path / "state"), "github": {"repo": "o/r"}})
+    assert Harness(tmp_path, config).loop.poster is None
 
 
 def test_run_progress_is_advertised(api: Any) -> None:
     features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
     assert "collaboration.run_progress" in features
+
+
+def _turn(api: Any, headers: dict[str, str], channel: str, content: str) -> dict[str, Any]:
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns", headers=headers, json={"content": content}
+    ).json()
+    assert api.ctx.turns.wait_idle(timeout=5)
+    return dict(accepted["turn"])
+
+
+def test_a_snapshot_the_channel_cannot_show_still_leaves_it_readable(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+
+    message_id = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="progress",
+            text="Kneading",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:progress:1",
+            work={"phase": "build", "percent": 40},
+        )
+    )
+
+    assert message_id is not None
+    posted = _messages(api, headers, channel)
+    assert [(m["id"], m["content"]) for m in posted] == [(message_id, "Kneading")]
+    # What the platform itself knows about the work, in place of a shape no
+    # client could read: the channel stays readable either way.
+    assert posted[0]["work"]["item_id"] is not None
+    assert "phase" not in posted[0]["work"]
+
+
+def test_a_stored_snapshot_this_build_cannot_read_hides_only_itself(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+    message_id = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="progress",
+            text="Kneading",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:progress:1",
+        )
+    )
+    with api.harness.dstore.transaction() as session:
+        session.execute(
+            update(MessageRow)
+            .where(MessageRow.id == message_id)
+            .values(work_json='{"from": "a build that knew a field this one does not"}')
+        )
+
+    posted = _messages(api, headers, channel)
+    assert [(m["id"], m["content"], m["work"]) for m in posted] == [(message_id, "Kneading", None)]
+
+
+def test_a_reply_to_another_channels_message_does_not_borrow_its_turn(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+    other = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    elsewhere = _turn(api, headers, other, "Something else entirely")
+
+    message_id = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="planner",
+            kind="reply",
+            text="Answering",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:reply",
+            reply_to_message_id=elsewhere["input_message_id"],
+        )
+    )
+
+    assert message_id is not None
+    posted = _messages(api, headers, channel)
+    assert [m["turn_id"] for m in posted] != [elsewhere["id"]]
+
+
+def test_a_post_belongs_to_the_turn_that_asked_for_its_item(api: Any) -> None:
+    headers, channel, item = _channel_with_work(api)
+    asking = api.client.get(f"/v1/channels/{channel}/turns", headers=headers).json()[0]["id"]
+    later = _turn(api, headers, channel, "Unrelated, while the run is out")
+    assert later["id"] != asking
+
+    api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="progress",
+            text="Kneading",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:progress:1",
+        )
+    )
+
+    assert [m["turn_id"] for m in _messages(api, headers, channel)] == [asking]
+
+
+def test_a_post_keeps_its_files_in_a_channel_with_no_turn(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    item = WorkItem(
+        item_id="api:unasked",
+        source_key="api:unasked",
+        title="Bread list",
+        body="Bake without being asked in a message",
+        kind="workload",
+        channel_id=channel,
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+
+    api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="angie",
+            kind="delivery",
+            text="Here is the bread list",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:delivery",
+            artifacts=(REPORT,),
+        )
+    )
+
+    posted = _messages(api, headers, channel)
+    assert len(posted) == 1
+    work = posted[0]["work"]
+    assert work is not None
+    assert work["turn_id"] is None
+    assert [a["relpath"] for a in work["artifacts"]] == ["bread_items.md"]
+
+
+def test_a_posts_event_names_its_run_publicly(api: Any) -> None:
+    _headers, channel, item = _channel_with_work(api)
+
+    api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="planner",
+            kind="plan",
+            text="Split the ask into 5 tasks",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:plan",
+        )
+    )
+
+    events = api.client.get(
+        "/v1/events", params={"type_prefix": "collaboration.message.created"}, headers=api.bearer()
+    ).json()["data"]
+    posts = [e for e in events if e["data"].get("post_kind")]
+    assert [e["data"]["run_id"] for e in posts] == ["run_r1"]
+
+
+def test_a_channel_that_cannot_be_written_to_does_not_fail_the_run(
+    api: Any, monkeypatch: Any
+) -> None:
+    _headers, channel, item = _channel_with_work(api)
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("the store is having a day")
+
+    monkeypatch.setattr(type(api.ctx.collaboration), "post_agent_update", _boom)
+    monkeypatch.setattr("sbxloop.api.channel_posts.channel_for_item", _boom)
+
+    assert (
+        api.ctx.poster.post(
+            ChannelPost(
+                channel_id=channel,
+                author_agent="angie",
+                kind="delivery",
+                text="Here is the bread list",
+                run_id="r1",
+                item_id=item.item_id,
+                dedupe_key="r1:delivery",
+            )
+        )
+        is None
+    )
+    assert api.ctx.poster.channel_for_item(item.item_id) is None
+
+
+class _CodeConcierge:
+    """A turn that files an issue, as the concierge's code intent does."""
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+        kwargs["on_code_work"]("owner/repo", 12, "Add a feature")
+        future: Future[ConciergeReply] = Future()
+        future.set_result(ConciergeReply("Queued the requested issue."))
+        return future
+
+
+def test_a_code_runs_post_hangs_on_the_turn_that_filed_its_issue(api: Any) -> None:
+    api.ctx.concierge = _CodeConcierge()
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Add a feature", "intent": "code"},
+    ).json()
+    settled(api.client, headers, channel, accepted["turn"]["id"])
+    filed = accepted["turn"]["id"]
+    item = WorkItem(
+        item_id=issue_item_id(12, "owner/repo"),
+        source_key="12",
+        repo="owner/repo",
+        title="Add a feature",
+        kind="code",
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.ctx.concierge = FakeConcierge()
+    assert _turn(api, headers, channel, "Unrelated, while the run is out")["id"] != filed
+
+    assert api.ctx.poster.channel_for_item(item.item_id) == channel
+    api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="progress",
+            text="Opened the pull request",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:progress:1",
+        )
+    )
+
+    assert [m["turn_id"] for m in _messages(api, headers, channel)] == [filed]

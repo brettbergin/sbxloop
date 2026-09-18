@@ -1646,13 +1646,19 @@
             "type": "string"
           },
           "turn_id": {
-            "title": "Turn Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Id"
           }
         },
         "required": [
           "item_id",
-          "turn_id",
           "agent_slug",
           "title",
           "kind",

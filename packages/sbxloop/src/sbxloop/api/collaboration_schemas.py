@@ -409,7 +409,9 @@ class ArtifactRefOut(ApiModel):
 
 class ChannelWorkOut(ApiModel):
     item_id: str
-    turn_id: str
+    #: The turn the work hangs on; null for a run a channel asked for
+    #: outside any turn of its own.
+    turn_id: str | None = None
     agent_slug: str | None
     title: str
     kind: str

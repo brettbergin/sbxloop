@@ -41,18 +41,70 @@ def channel_for_item(session: Any, item_id: str) -> str | None:
         return str(message.channel_id)
     if item.run_kind != "code":
         return None
+    filed = _filing_turn(session, item)
+    return None if filed is None else filed[0]
+
+
+def _filing_turn(session: Any, item: WorkItemRow) -> tuple[str, str] | None:
+    """The channel and turn of the first participant that filed this code
+    item's issue, by repository and source key alike."""
+    source_key = str(item.source_key)
     fragment = json.dumps({"repo": item.repo, "source_key": source_key})[1:-1]
     rows = session.execute(
-        select(TurnRow.channel_id, TurnRow.participants_json)
+        select(TurnRow.channel_id, TurnRow.id, TurnRow.participants_json)
         .where(TurnRow.participants_json.contains(fragment, autoescape=True))
         .order_by(TurnRow.created_at.asc())
     ).all()
-    for channel_id, participants_json in rows:
+    for channel_id, turn_id, participants_json in rows:
         for participant in json.loads(participants_json or "[]"):
             for ref in participant.get("code_work", []):
                 if ref.get("repo") == item.repo and ref.get("source_key") == source_key:
-                    return str(channel_id)
+                    return str(channel_id), str(turn_id)
     return None
+
+
+def turn_for_item(session: Any, item_id: str, channel_id: str) -> str | None:
+    """The turn in ``channel_id`` that asked for the item.
+
+    The same exact identities :mod:`sbxloop.api.work_delivery` delivers a
+    result by, so a run's commentary and its delivery land on one turn:
+    the turn whose input message the item's source key names, the turn that
+    filed a code item's issue, and, for an item admitted with this channel
+    but naming no turn of it, the turn the channel was on when the item was
+    admitted. A channel that had no turn to ask has none to hang the post
+    on.
+    """
+    item: WorkItemRow | None = session.get(WorkItemRow, item_id)
+    if item is None:
+        return None
+    asking = session.scalars(
+        select(TurnRow)
+        .where(
+            TurnRow.input_message_id == str(item.source_key).split(":", 1)[0],
+            TurnRow.channel_id == channel_id,
+        )
+        .limit(1)
+    ).first()
+    if asking is not None:
+        return str(asking.id)
+    if item.run_kind == "code":
+        filed = _filing_turn(session, item)
+        if filed is not None and filed[0] == channel_id:
+            return filed[1]
+    if str(item.channel_id or "") != channel_id:
+        return None
+    turns = select(TurnRow).where(TurnRow.channel_id == channel_id)
+    turn = (
+        session.scalars(
+            turns.where(TurnRow.created_at <= item.created_at)
+            .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
+            .limit(1)
+        ).first()
+        or session.scalars(
+            turns.order_by(TurnRow.created_at.asc(), TurnRow.id.asc()).limit(1)
+        ).first()
+    )
+    return None if turn is None else str(turn.id)
 
 
 def channel_for_run(session: Any, run_id: str) -> str | None:
@@ -87,4 +139,4 @@ def event_channel(
     return None
 
 
-__all__ = ["channel_for_item", "channel_for_run", "event_channel"]
+__all__ = ["channel_for_item", "channel_for_run", "event_channel", "turn_for_item"]

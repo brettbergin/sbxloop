@@ -3028,8 +3028,6 @@ def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
         clock=loop.clock,
         concierge=getattr(frontend, "concierge", None),
     )
-    # A run linked to a channel posts into it through the listener's store.
-    loop.poster = ctx.poster
     server = ApiServer(create_app(ctx), config.api, ctx=ctx)
     frontend.add_observer(ApiFrontend(ctx.chronology, ctx.hub, ctx.projector, clock=ctx.clock))
     # The bridges reach the channels through the loop, and the channels

@@ -23,6 +23,7 @@ from sbxloop.agents.posts import TERMINAL_POST_KINDS, PostKind
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
 from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
+from sbxloop.api.publicids import run_public_id
 
 # The role names belong to this module's membership contract, so they are
 # re-exported explicitly (``X as X``) for strictly type-checked consumers.
@@ -42,9 +43,9 @@ from sbxloop.db.collaboration_models import (
     ChannelMemberRow,
     ChannelParticipantRow,
     ChannelRow,
+    ChannelRunPostRow,
     ChannelSummaryRow,
     ExternalIdentityRow,
-    ChannelRunPostRow,
     LocalUserRow,
     MessageArtifactRow,
     MessageRow,
@@ -56,6 +57,7 @@ from sbxloop.db.collaboration_models import (
     WorkspaceMemberRow,
 )
 from sbxloop.db.daemon_models import WorkItemRow
+from sbxloop.db.event_scope import turn_for_item
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -2761,23 +2763,27 @@ class CollaborationStore:
                 return None
             return through, None if previous is None else previous.content, "\n".join(lines)
 
-    def turn_for_post(self, channel_id: str, reply_to_message_id: str | None) -> str | None:
-        """The turn a run's post belongs to: the one that asked the message
-        it answers, or the channel's most recent. A channel with no turn
-        yet has nowhere to hang a work snapshot, and the post carries text
-        alone."""
+    def turn_for_post(
+        self,
+        channel_id: str,
+        reply_to_message_id: str | None,
+        item_id: str | None = None,
+    ) -> str | None:
+        """The turn a run's post belongs to: the turn that asked the message
+        it answers when that message is in this channel, and otherwise the
+        turn that asked for its work, by the identities the work's result
+        is delivered on. A channel with no such turn has nowhere to hang
+        the post, and it hangs on none."""
         with self.dstore.read() as session:
             if reply_to_message_id is not None:
                 message = session.get(MessageRow, reply_to_message_id)
-                if message is not None and message.turn_id is not None:
+                if (
+                    message is not None
+                    and message.turn_id is not None
+                    and str(message.channel_id) == channel_id
+                ):
                     return str(message.turn_id)
-            turn = session.scalars(
-                select(TurnRow)
-                .where(TurnRow.channel_id == channel_id)
-                .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
-                .limit(1)
-            ).first()
-            return None if turn is None else str(turn.id)
+            return None if item_id is None else turn_for_item(session, item_id, channel_id)
 
     def post_agent_update(
         self,
@@ -2805,6 +2811,14 @@ class CollaborationStore:
             channel = session.get(ChannelRow, channel_id)
             if channel is None or channel.state != "active":
                 return None
+            if turn_id is not None:
+                # A post hangs on a turn of its own channel or on none:
+                # another channel's turn would carry it to its members.
+                turn = session.get(TurnRow, turn_id)
+                if turn is None or str(turn.channel_id) != channel_id:
+                    turn_id = None
+                    if work is not None and "turn_id" in work:
+                        work = {**work, "turn_id": None}
             silenced = channel.silenced_until is not None and float(channel.silenced_until) > now
             if silenced and kind not in TERMINAL_POST_KINDS:
                 return None
@@ -2852,7 +2866,7 @@ class CollaborationStore:
                     "author_kind": "agent",
                     "author_id": author_agent,
                     "post_kind": kind,
-                    "run_id": run_id,
+                    "run_id": run_public_id(run_id) if run_id else None,
                 },
             )
             return message_id

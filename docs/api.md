@@ -365,8 +365,17 @@ with `kind` `agent_update`, `role` `assistant`, `author`
 It carries `post_kind`, one of `plan`, `progress`, `review`, `delivery`,
 `reply` or `notice`; every other message reports `post_kind` as null. When
 the run names files, they are listed on the post's `work.artifacts` in the
-shape described above. A channel that has had no turn yet has nowhere to
-hang a work snapshot, so such a post carries its text alone.
+shape described above.
+
+A post belongs to the turn that asked for its work, the same turn that
+work's result is delivered on, and to no turn at all rather than to one
+from another channel. A run a channel asked for outside any turn of its
+own still posts and still names its files: `work.turn_id` is null on such
+a post, so a client reads it as nullable. A snapshot a run hands in that
+does not fit this shape is replaced by what sbxloop itself knows about
+the work, and a snapshot already recorded that a later build cannot read
+is reported as no snapshot: a message the reader cannot parse never costs
+the channel its message list.
 
 Each post names a dedupe key, which is what makes a replayed, resumed or
 re-observed run post a moment once: the same key returns the message
@@ -377,7 +386,8 @@ and still hears the posts that end a run: `delivery` and `notice`.
 Clients read posts with the message history they already poll, or
 incrementally with `GET /v1/channels/{id}/messages?after=<sequence>`, and
 see each one as a `collaboration.message.created` event carrying
-`post_kind` and `run_id`. The events of a run a channel asked for, and the
+`post_kind` and the run's public `run_id`, the id
+`GET /v1/runs/{id}` answers to. The events of a run a channel asked for, and the
 run's catalogued files, belong to that channel: a member who can open it
 sees them.
 
