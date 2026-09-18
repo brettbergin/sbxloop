@@ -16,12 +16,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
-from sbxloop.api.channel_access import ChannelAccess, ChannelRole, Need
+from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
 
 # The role names belong to this module's membership contract, so they are
 # re-exported explicitly (``X as X``) for strictly type-checked consumers.
@@ -328,6 +328,23 @@ def _user(row: LocalUserRow) -> LocalUser:
         auth_source=str(row.auth_source or "local"),
         avatar_url=None if row.avatar_url is None else str(row.avatar_url),
         last_seen_at=None if row.last_seen_at is None else float(row.last_seen_at),
+    )
+
+
+def guest_user(display_name: str | None) -> LocalUser:
+    """The stand-in a guest's turn runs for: a name, and nothing else. Its
+    empty id belongs to no member, so every check that reads it refuses."""
+    name = (display_name or "guest").strip() or "guest"
+    return LocalUser(
+        id="",
+        client_id="",
+        username=name,
+        email="",
+        full_name=name,
+        timezone="UTC",
+        active=True,
+        created_at=0.0,
+        updated_at=0.0,
     )
 
 
@@ -1874,12 +1891,46 @@ class CollaborationStore:
         created_by: str | None,
         now: float,
     ) -> ChannelLink:
-        """Link a bridge surface to the channel; takes managing it."""
+        """Link a bridge surface to the channel.
+
+        Takes managing the channel *and* administering the workspace: a link
+        makes the channel capture what everyone on that surface says and post
+        its own traffic there, which reaches past the channel. A run's thread
+        belongs to its run and is refused.
+        """
+        if backend == "discord" and thread_id is not None:
+            # A Discord thread is a channel of its own: messages typed there
+            # arrive with the thread's id as their channel, and a post to it
+            # goes to that id. So the thread is the surface.
+            surface_id, thread_id = thread_id, None
+        # A run's thread is recorded once, when the run opens it, so reading
+        # it ahead of the write transaction races nothing that matters.
+        run_thread = self.dstore.run_for_thread(thread_id or surface_id, backend) is not None
         with self.dstore.immediate_transaction() as session:
-            _access(session, channel_id, viewer, "manage", now=now)
+            _, member = _access(session, channel_id, viewer, "manage", now=now)
+            if member is not None and member.role not in MANAGING_ROLES:
+                raise CollaborationError(
+                    "channel_forbidden", "linking a surface takes a workspace admin"
+                )
+            if run_thread:
+                raise CollaborationError(
+                    "link_run_thread", "that surface is a run's thread and cannot be linked"
+                )
             if _active_link(session, backend, surface_id, thread_id) is not None:
                 raise CollaborationError(
                     "link_exists", "that surface is already linked to a channel"
+                )
+            if thread_id is not None:
+                # A retired link to this thread would trip the unique index
+                # (NULL threads never do). Nothing reads a retired row, since
+                # each message carries its own origin, so it gives way.
+                session.execute(
+                    delete(ChannelLinkRow).where(
+                        ChannelLinkRow.backend == backend,
+                        ChannelLinkRow.surface_id == surface_id,
+                        ChannelLinkRow.thread_id == thread_id,
+                        ChannelLinkRow.active == 0,
+                    )
                 )
             link_id = "lnk_" + _token(16)
             session.execute(
@@ -2805,10 +2856,28 @@ class CollaborationStore:
                     interrupted.append((row.id, expected <= replies))
                     continue
                 channel = session.get(ChannelRow, row.channel_id)
+                message = session.get(MessageRow, row.input_message_id)
+                stored_origin = message.origin_json if message is not None else None
+                origin = json.loads(stored_origin) if stored_origin else None
+                if row.author_kind == "human" and row.author_id is None and origin:
+                    # A guest on a linked surface: the turn runs for the same
+                    # stand-in it would have run for live, never for the
+                    # channel's owner, whose identity would answer a stranger.
+                    if channel and channel.state == "active" and message:
+                        queued.append(
+                            (
+                                message.sequence,
+                                _turn(session, row),
+                                guest_user(_origin_name(origin)),
+                                message.content,
+                            )
+                        )
+                    else:
+                        interrupted.append((row.id, False))
+                    continue
                 author_id = row.author_id if row.author_kind == "human" else None
                 user_id = author_id or (channel.user_id if channel else None)
                 user = session.get(LocalUserRow, user_id) if user_id else None
-                message = session.get(MessageRow, row.input_message_id)
                 if user is not None and not self._may_read(session, row.channel_id, user.id):
                     user = None
                 if channel and channel.state == "active" and user and user.active and message:

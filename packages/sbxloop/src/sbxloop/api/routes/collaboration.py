@@ -1517,8 +1517,9 @@ async def create_channel_link(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelLinkOut:
-    """Mirror a bridge surface into this channel; takes managing it. A
-    surface carries one link, so a second one is refused."""
+    """Mirror a bridge surface into this channel; takes managing it and a
+    workspace owner or admin. A surface carries one link, so a second one
+    is refused, and a run's thread cannot be linked."""
     try:
         link = await ctx.call(
             ctx.collaboration.create_channel_link,

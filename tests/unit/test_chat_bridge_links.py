@@ -302,3 +302,40 @@ def test_a_refusal_quotes_the_word_back_without_breaking_out_of_it(elsewhere: An
     refusal = elsewhere.sent()[0]
     assert refusal.count("`") % 2 == 0
     assert len(refusal) < 300
+
+
+#: A Discord thread inside ELSEWHERE: a channel of its own, with its own id.
+THREAD = 88
+
+
+@pytest.fixture
+def threaded(tmp_path: Path) -> Any:
+    """A link to one thread inside an ordinary channel, admitting guests."""
+    built = Linked(tmp_path, surface=THREAD)
+    built.link = built.store.create_channel_link(
+        None,
+        built.channel.id,
+        backend="discord",
+        surface_id=ELSEWHERE_SURFACE,
+        thread_id=str(THREAD),
+        allow_guests=True,
+        created_by=built.user.id,
+        now=time.time(),
+    )
+    yield built
+    built.close()
+
+
+def test_a_message_in_a_linked_discord_thread_becomes_a_channel_turn(threaded: Any) -> None:
+    threaded.say("plan the bread", author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: len(threaded.messages()) == 1)
+    assert threaded.messages()[0].content == "plan the bread"
+    assert threaded.concierge.turns == []
+
+
+def test_a_linked_discord_thread_hears_the_channel(threaded: Any) -> None:
+    mirror = ChannelMirror(threaded.store, lambda backend: threaded.bridge)
+    threaded.store.add_message_observer(mirror.message_appended)
+    threaded.say("plan the bread", author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: any("reply from" in sent for sent in threaded.sent()))
+    assert not any("plan the bread" in sent for sent in threaded.sent() if sent.startswith("**"))

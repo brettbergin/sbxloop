@@ -44,8 +44,9 @@ def test_capabilities_advertise_the_bridges_feature(api: Any) -> None:
 def test_links_are_created_listed_and_deleted(api: Any) -> None:
     owner = bearer(register(api))
     channel_id = _channel(api, owner)
-    link = _link(api, owner, channel_id, thread_id="T9", allow_guests=True)
-    assert link["backend"] == "discord"
+    # Slack addresses a thread as (channel, thread), so both are kept as sent.
+    link = _link(api, owner, channel_id, backend="slack", thread_id="T9", allow_guests=True)
+    assert link["backend"] == "slack"
     assert link["surface_id"] == "C1"
     assert link["thread_id"] == "T9"
     assert link["allow_guests"] is True
@@ -248,3 +249,93 @@ def test_a_deactivated_member_is_no_longer_a_known_identity(api: Any) -> None:
     )
     store.update_member(guest_id, active=False, now=api.clock())
     assert store.identity_user("discord", "U9") is None
+
+
+def test_linking_a_surface_takes_a_workspace_admin(api: Any) -> None:
+    # Owning a channel is not enough: a link makes the channel capture what
+    # everyone on that surface says, and post the channel's traffic there.
+    api.ctx.concierge = FakeConcierge()
+    _owner, member, admin = _people(api)
+    mine = _channel(api, member)
+    refused = api.client.post(
+        f"/v1/channels/{mine}/links",
+        json={"backend": "discord", "surface_id": "C1"},
+        headers=member,
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["code"] == "channel_forbidden"
+    assert api.client.get(f"/v1/channels/{mine}/links", headers=member).json()["data"] == []
+
+    theirs = _channel(api, admin)
+    _link(api, admin, theirs)
+
+
+def test_a_run_thread_cannot_be_linked(api: Any) -> None:
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    api.harness.dstore.record_chat_thread("run-1", "C1", "T9", None, backend="slack")
+    refused = api.client.post(
+        f"/v1/channels/{channel_id}/links",
+        json={"backend": "slack", "surface_id": "C1", "thread_id": "T9"},
+        headers=owner,
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["code"] == "link_run_thread"
+
+
+def test_a_deleted_thread_link_can_be_made_again(api: Any) -> None:
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    body = {"backend": "slack", "surface_id": "C1", "thread_id": "T9"}
+    first = _link(api, owner, channel_id, **body)
+    removed = api.client.delete(f"/v1/channels/{channel_id}/links/{first['id']}", headers=owner)
+    assert removed.status_code == 204, removed.text
+
+    again = _link(api, owner, channel_id, **body)
+    assert again["thread_id"] == "T9"
+    listed = api.client.get(f"/v1/channels/{channel_id}/links", headers=owner).json()["data"]
+    assert [row["id"] for row in listed] == [again["id"]]
+
+
+def test_a_discord_thread_link_names_the_thread_as_its_surface(api: Any) -> None:
+    # A Discord thread is a channel of its own: what is typed there arrives
+    # with the thread's id as its channel, so that is the surface linked.
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    link = _link(api, owner, channel_id, surface_id="C1", thread_id="T9")
+    assert (link["surface_id"], link["thread_id"]) == ("T9", None)
+    found = api.ctx.collaboration.link_for_surface("discord", "T9", None)
+    assert found is not None and found.id == link["id"]
+
+
+def test_a_guest_turn_recovered_after_a_restart_runs_for_the_guest(api: Any) -> None:
+    # Recovery must not fall back to the channel's owner for a turn nobody
+    # with an account asked: the owner's identity would answer a stranger.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    owner_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel_id,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=True,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    turn, _message = store.accept_linked_turn(
+        link,
+        content="hello",
+        author_user_id=None,
+        display_name="stranger",
+        external_message_id="m1",
+        now=api.clock(),
+    )
+    recovered = {queued.id: user for queued, user, _content in store.recover_turns(api.clock())}
+    assert turn.id in recovered
+    user = recovered[turn.id]
+    assert user.id != owner_id
+    assert user.username == "stranger"

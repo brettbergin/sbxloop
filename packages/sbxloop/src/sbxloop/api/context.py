@@ -43,6 +43,7 @@ from sbxloop.api.collaboration import (
     LocalUser,
     Message,
     Turn,
+    guest_user,
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
@@ -123,23 +124,6 @@ def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[
             if role in RUN_ROLES:
                 roles.setdefault(role, agent.slug)
     return roles
-
-
-def _guest_user(display_name: str | None) -> LocalUser:
-    """The stand-in a guest's turn runs for: a name, and nothing else. Its
-    empty id belongs to no member, so every check that reads it refuses."""
-    name = (display_name or "guest").strip() or "guest"
-    return LocalUser(
-        id="",
-        client_id="",
-        username=name,
-        email="",
-        full_name=name,
-        timezone="UTC",
-        active=True,
-        created_at=0.0,
-        updated_at=0.0,
-    )
 
 
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
@@ -402,7 +386,7 @@ class ApiContext:
                 now=self.clock(),
             )
             member = None if author_user_id is None else store.member_for_user(author_user_id)
-            user = member.user if member is not None else _guest_user(display_name)
+            user = member.user if member is not None else guest_user(display_name)
             self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
         return turn, message
 

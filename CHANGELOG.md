@@ -35,8 +35,11 @@ naming the next offset, and never hands back bytes that are not text.
   another travel that way as well, so an ask that fails is answered on the
   surface it came from. `GET /v1/bridges` lists the services and whether
   one is configured here, and `GET`, `POST` and
-  `DELETE /v1/channels/{id}/links` manage a channel's links (managing the
-  channel). Messages gain `origin`, naming the surface a message arrived
+  `DELETE /v1/channels/{id}/links` manage a channel's links (creating one
+  takes managing the channel and a workspace owner or admin, and a run's
+  thread cannot be linked; a Discord thread is linked as a surface of its
+  own). A guest's turn that a daemon restart interrupts before it starts
+  resumes for the guest, never for the channel's owner. Messages gain `origin`, naming the surface a message arrived
   on. Linking a surface grants nobody operator powers: a link cannot widen
   where `!sbx` runs, so on a linked surface that is not the control channel
   the only command is `!sbx link`, and every other one is refused with a

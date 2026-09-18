@@ -8866,7 +8866,7 @@
         ]
       },
       "post": {
-        "description": "Mirror a bridge surface into this channel; takes managing it. A\nsurface carries one link, so a second one is refused.",
+        "description": "Mirror a bridge surface into this channel; takes managing it and a\nworkspace owner or admin. A surface carries one link, so a second one\nis refused, and a run's thread cannot be linked.",
         "operationId": "create_channel_link_v1_channels__channel_id__links_post",
         "parameters": [
           {

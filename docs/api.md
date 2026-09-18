@@ -555,12 +555,21 @@ A channel can have a window onto a chat service: a Slack, Discord or
 Mattermost surface where the same conversation happens. When
 `/v1/capabilities` lists `collaboration.bridges`:
 
-| Route                                  | Needs  | Result                                                                                                              |
-| -------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------- |
-| `GET /v1/bridges`                      | read   | `{data: [{backend, configured, label}]}` — the services this release can bridge, and whether one is set up here     |
-| `GET /v1/channels/{id}/links`          | manage | `{data: [{id, channel_id, backend, surface_id, thread_id, allow_guests, created_by, created_at, active}]}`          |
-| `POST /v1/channels/{id}/links`         | manage | Body `{backend, surface_id, thread_id?, allow_guests?}`; `201` with the link; `409 link_exists` for a taken surface |
-| `DELETE /v1/channels/{id}/links/{lid}` | manage | `204`; `404 link_not_found`                                                                                         |
+| Route                                  | Needs                   | Result                                                                                                                                                        |
+| -------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/bridges`                      | read                    | `{data: [{backend, configured, label}]}` — the services this release can bridge, and whether one is set up here                                               |
+| `GET /v1/channels/{id}/links`          | manage                  | `{data: [{id, channel_id, backend, surface_id, thread_id, allow_guests, created_by, created_at, active}]}`                                                    |
+| `POST /v1/channels/{id}/links`         | manage, workspace admin | Body `{backend, surface_id, thread_id?, allow_guests?}`; `201` with the link; `409 link_exists` for a taken surface, `409 link_run_thread` for a run's thread |
+| `DELETE /v1/channels/{id}/links/{lid}` | manage                  | `204`; `404 link_not_found`                                                                                                                                   |
+
+Creating a link takes managing the channel and being a workspace owner or
+admin (`403 channel_forbidden` otherwise): a link makes the channel hear
+everyone on that surface and post its own traffic there, which reaches
+past the channel itself. A thread a run opened is refused. A Discord thread
+is a channel of its own, so a Discord link given a `thread_id` is stored
+with that thread as its `surface_id` and no `thread_id`; Slack and
+Mattermost keep both. Deleting a link and linking the same surface or
+thread again works.
 
 While a surface is linked, what people type there becomes a turn in the
 channel it mirrors, instead of reaching the daemon's concierge. A link is a
