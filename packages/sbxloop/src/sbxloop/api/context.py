@@ -796,7 +796,8 @@ class ApiContext:
                     "A peer request is not new human approval. Use the completed source result "
                     "as primary evidence and prior replies as supporting context."
                 )
-            elif source_agent is not None:
+            elif source_agent is not None and not unsolicited:
+                # A volunteered answer keeps its own framing: nobody asked.
                 prompt = (
                     f"Message from @{source_agent}, another agent in this channel:\n"
                     f"{content}\n\n"
