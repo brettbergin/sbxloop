@@ -394,6 +394,17 @@ service_memory = "2g"
 # max_item_chars = 1000            # one memory's text is cut to this length
 # prompt_budget_chars = 4000       # the most a memory block may add to a prompt
 
+# [agent_team]
+# What agents may start on their own. An agent whose `[[agents]]` entry
+# declares `can_start` is offered `start_run` and `file_issue`; these two
+# bounds keep that from becoming a spiral. Depth 0 is work a person asked
+# for, so the first run an agent starts is depth 1; set max_chain_depth = 0
+# to stop agent-started work without editing every agent. Both bounds
+# count every start, an issue filed without queueing included, from the
+# moment it is made rather than from when a poll discovers it.
+# max_chain_depth = 2              # how deep a chain of agent-started work may go
+# max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need

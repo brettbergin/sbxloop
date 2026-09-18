@@ -356,6 +356,37 @@ class TestJobShape:
         assert job.system_message is not None
         assert "You are Angie." in job.system_message
         assert "ordinary conversation turn" in job.system_message
+        # A mention asks for a reply, so it is not how a person gets action:
+        # the turn points at the runner modes instead.
+        assert "mention an agent when action is wanted" not in job.system_message
+        assert "Auto" in job.system_message
+
+    def test_a_turn_that_may_not_start_work_keeps_its_other_tools(self, tmp_path: Path) -> None:
+        """A mention in a conversation asks an agent to reply: it keeps its
+        read tools but cannot start managed work, so answering is the only
+        outcome the turn can have."""
+        starters = {
+            "start_workload",
+            "start_entrygraph",
+            "create_schedule",
+            "create_issue",
+            "label_issue_for_run",
+        }
+        concierge, client, *_ = make(
+            tmp_path, [{"text": "one"}, {"text": "two"}], github=FakeGithub()
+        )
+        concierge.submit_turn("list bread items", author="owner", agent_role="planner").result(
+            timeout=10
+        )
+        concierge.submit_turn(
+            "list bread items", author="owner", agent_role="planner", start_work=False
+        ).result(timeout=10)
+        allowed, conversation = ({t.name for t in job.host_tools} for job in client.jobs)
+        assert {"start_workload", "create_issue"} <= allowed
+        assert not starters & conversation
+        assert {"list_runs", "run_detail", "list_issues"} <= conversation
+        assert client.jobs[1].system_message is not None
+        assert "cannot start managed work" in client.jobs[1].system_message
 
     def test_handoff_requires_a_completed_deliverable(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"text": "done"}])

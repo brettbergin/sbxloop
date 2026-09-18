@@ -75,6 +75,8 @@ COLLABORATION_TABLES = (
     "workspace_invites",
     "agents",
     "agent_memories",
+    "collaboration_channel_links",
+    "collaboration_external_identities",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 

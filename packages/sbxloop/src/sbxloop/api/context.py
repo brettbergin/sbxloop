@@ -28,7 +28,7 @@ from sbxloop.agents.registry import (
     addressable,
     default_registry,
 )
-from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools
+from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools, work_granted
 from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -37,11 +37,13 @@ from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
     Message,
     Turn,
+    guest_user,
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
@@ -70,6 +72,32 @@ PAGE_MAX = 200
 #: summary never queues behind (or ahead of) somebody's conversation.
 SUMMARY_SESSION_KEY = "sbxloop:channel-summary"
 _CONTENT_WORD = re.compile(r"\w+")
+#: Turn intents that may start managed work, so the agents a turn mentions
+#: are recorded as its run-role assignees.
+WORK_INTENTS = frozenset({"code", "workload", "auto"})
+#: Turn intents whose agents are offered the tools that start managed work:
+#: the runner intents and an explicit delegation. A conversation, mention
+#: or not, only answers.
+START_WORK_INTENTS = frozenset({"delegate", *WORK_INTENTS})
+#: What a turn that may start work, but picked no runner, is told: an ask
+#: the reply can satisfy is answered. Managed work is for asks it cannot.
+_INLINE_ANSWER = (
+    "\n\nWhen the ask can be satisfied in this reply - a list, an explanation, "
+    "a short plan, an opinion, a judgement about work already in this channel - "
+    "answer it inline and in full, and start nothing. Start managed work only when the "
+    "ask needs execution, external sources, a change to a repository or a "
+    "produced file; then start it without asking for confirmation."
+)
+#: What a conversation turn that mentions an agent is told. It keeps its
+#: read tools but none that start work, so a reply is the only outcome.
+_CONVERSATION_ANSWER = (
+    "\n\nBeing mentioned is a request to reply, not a request to queue work. "
+    "Whatever this reply can satisfy, answer it inline and in full, and start "
+    "nothing. This turn cannot start managed work: when the ask needs "
+    "execution, external sources, a change to a repository or a produced file, "
+    "say so and tell the person to ask again with the Code, Workload or Auto "
+    "mode selected."
+)
 _RUNNER_INTENT = {
     "code": (
         "\n\nThe person explicitly selected sbxloop's Code runner for this turn. "
@@ -83,6 +111,16 @@ _RUNNER_INTENT = {
         "Call start_workload once with their request and let the existing plan, execute, judge, "
         "revision, and publish stages carry it to completion. Do not simulate those stages with "
         "chat handoffs."
+    ),
+    "auto": (
+        "\n\nThe person left this turn's handling to you. Decide, do not ask which "
+        "they meant. When the ask can be satisfied in this reply - a list, an "
+        "explanation, a short plan, an opinion, a judgement about work already in "
+        "this channel - answer it inline and in full, and start nothing. Start "
+        "managed work only when the ask needs execution, external sources, a change "
+        "to a repository or a produced file: a repository change through the "
+        "existing issue intake tools, anything else with one start_workload call, "
+        "no confirmation. Never queue work in place of an answer you could write."
     ),
 }
 
@@ -111,7 +149,7 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
 
 
-def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
+def work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
     """The first mentioned agent that declares each run role, by role."""
     roles: dict[str, str] = {}
     for slug in targets:
@@ -122,6 +160,17 @@ def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[
             if role in RUN_ROLES:
                 roles.setdefault(role, agent.slug)
     return roles
+
+
+def _recorded_assignees(turn: Turn) -> dict[str, str]:
+    """The run roles a work-capable turn recorded when it was accepted: the
+    agents it mentioned, by the role each declares."""
+    if not turn.participants:
+        return {}
+    stored = turn.participants[0].get("assignees")
+    if not isinstance(stored, dict):
+        return {}
+    return {str(role): str(slug) for role, slug in stored.items()}
 
 
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
@@ -356,6 +405,38 @@ class ApiContext:
                 )
             return turn, message, created
 
+    def accept_bridge_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+    ) -> tuple[Turn, Message]:
+        """Accept a message from a linked bridge surface as a turn in the
+        channel that surface mirrors.
+
+        A mapped author answers as themselves. A guest — only where the link
+        admits one — has no account, so the turn runs for a stand-in carrying
+        the name they use on that service: no preferences to read, and no
+        standing to hand work off with.
+        """
+        store = self.collaboration
+        with self._turn_admission:
+            turn, message = store.accept_linked_turn(
+                link,
+                content=content,
+                author_user_id=author_user_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                now=self.clock(),
+            )
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else guest_user(display_name)
+            self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
+        return turn, message
+
     def start_collaboration_turn(
         self,
         turn: Turn,
@@ -423,7 +504,9 @@ class ApiContext:
         author = user.full_name or user.username
         # Work this turn starts goes to the agents it mentioned, in the run
         # roles they declare.
-        work_roles = _work_roles(self.agents, turn.targets or ())
+        turn_roles = work_roles(self.agents, turn.targets or ())
+        for role, slug in _recorded_assignees(turn).items():
+            turn_roles.setdefault(role, slug)
         index = 0
         while True:
             # The daemon reads its own accepted turn: whoever asked may have
@@ -465,12 +548,25 @@ class ApiContext:
             # The channel's own files, for every participant: a read-only
             # critic reviewing a delivered file has to be able to read it.
             channel_tools = self._channel_tools(turn.channel_id)
+            if not read_only:
+                # An agent whose spec declares `can_start` may put work in
+                # the queue itself, on behalf of whoever asked (S-A12). A
+                # read-only turn, and every built-in, gets nothing new.
+                agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
-            persona += _RUNNER_INTENT.get(intent, "")
             model = definition.agent.spec.model if definition and definition.agent else None
-            # Mentioning a role is explicit delegation in Angie's UI.
-            allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
+            # A named agent acts in its own persona, so it keeps its tools;
+            # whether it may start work with them is the intent's business,
+            # not the mention's.
+            start_work = intent in START_WORK_INTENTS
+            allow_actions = start_work or definition is not None
+            if intent in _RUNNER_INTENT:
+                persona += _RUNNER_INTENT[intent]
+            elif start_work:
+                persona += _INLINE_ANSWER
+            elif allow_actions:
+                persona += _CONVERSATION_ANSWER
             prompt = content
             if participant.get("parent_index") is not None:
                 parent_index = int(participant["parent_index"])
@@ -540,6 +636,7 @@ class ApiContext:
                     session_key=f"{turn.channel_id}:{target or 'angie'}",
                     persona=persona,
                     allow_actions=allow_actions,
+                    start_work=start_work,
                     history=store.turn_history(turn),
                     agent_role=definition.role if definition else "concierge",
                     read_only=read_only,
@@ -553,7 +650,7 @@ class ApiContext:
                     agent_tools=agent_tools,
                     channel_tools=channel_tools,
                     work_lead=work_lead,
-                    work_roles=work_roles,
+                    work_roles=turn_roles,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):
@@ -635,6 +732,37 @@ class ApiContext:
             log.warning("collaboration.agent_memory_unavailable", agent=agent.slug, exc_info=True)
             return "", ()
         return block, tuple(tools)
+
+    def _agent_work(
+        self,
+        definition: AgentDefinition | None,
+        channel_id: str,
+        *,
+        on_behalf_of: str | None,
+    ) -> tuple[AgentTool, ...]:
+        """``start_run`` and ``file_issue`` for a mentioned agent whose spec
+        declares ``can_start`` (S-A12). A turn is depth 0 -- a person asked
+        for it -- so what the agent starts from here is depth 1. A
+        daemon-less context, or an agent that declares nothing, brings
+        nothing, so the shipped team's turns are unchanged."""
+        agent = definition.agent if definition is not None else None
+        if agent is None or self.loop is None or not work_granted(agent):
+            return ()
+        try:
+            from sbxloop.daemon.agentwork import AgentWorkService
+
+            return tuple(
+                AgentWorkService(self.loop, clock=self.clock).tools(
+                    agent,
+                    channel_id=channel_id,
+                    parent_item_id=None,
+                    parent_depth=0,
+                    on_behalf_of=on_behalf_of,
+                )
+            )
+        except Exception:
+            log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
+            return ()
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the
