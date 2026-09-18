@@ -30,6 +30,7 @@ from sbxloop.engine.engine import ChatMessage, LoopEngine
 from sbxloop.engine.model import SteerVerdict, TaskSpec
 from sbxloop.engine.phases import PhaseSpend
 from sbxloop.events import HostEventTypes
+from sbxloop_worker.protocol import Event
 from tests.conftest import FakeSbx
 from tests.unit.test_engine import Harness
 
@@ -448,3 +449,28 @@ class TestStopFromChat:
             loop.stop_channel("ch1", MEMBER)
         assert refused.value.code == "forbidden"
         assert cancelled == []
+
+
+def test_a_mention_steered_reply_is_told_in_the_channel_by_the_agent_named() -> None:
+    """The answer a mention promised reaches the channel through the run's
+    chronicle, in the voice of the agent that was named and on the task lane
+    that answered it, not in the run's default steering voice."""
+    from tests.unit.test_run_chronicle import RUN, Clock, _chronicle
+
+    chronicle, poster = _chronicle(Clock())
+
+    chronicle.on_event(
+        Event.now(
+            HostEventTypes.CHAT_REPLY,
+            RUN,
+            message_id="stm_7",
+            reply="Switched the parser to streaming.",
+            action="continue",
+            task_id="t2",
+            agent_slug="kneader",
+        )
+    )
+
+    assert [(p.kind, p.author_agent, p.task_id, p.text) for p in poster.posts] == [
+        ("reply", "kneader", "t2", "Switched the parser to streaming.")
+    ]

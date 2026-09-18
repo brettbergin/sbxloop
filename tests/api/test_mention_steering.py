@@ -283,21 +283,21 @@ def test_the_steering_route_passes_the_task_and_agent_to_the_run(api: Api) -> No
         thread.join(10)
 
 
-def test_revision_0028_adds_the_column_and_is_safe_to_run_twice(tmp_path: Path) -> None:
+def test_revision_0031_adds_the_column_and_is_safe_to_run_twice(tmp_path: Path) -> None:
     path = tmp_path / "db.sqlite"
     engine = open_engine(path)
     try:
         with engine.begin() as conn:
-            command.upgrade(_config(conn), "0028")
+            command.upgrade(_config(conn), "0031")
         with engine.begin() as conn:
-            command.downgrade(_config(conn), "0027")
+            command.downgrade(_config(conn), "0030")
         with engine.begin() as conn:
-            command.upgrade(_config(conn), "0028")
+            command.upgrade(_config(conn), "0031")
         with engine.begin() as conn:
-            command.stamp(_config(conn), "0027")
+            command.stamp(_config(conn), "0030")
         with engine.begin() as conn:
             # The column is already there: the guard keeps the rerun a no-op.
-            command.upgrade(_config(conn), "0028")
+            command.upgrade(_config(conn), "0031")
     finally:
         engine.dispose()
     conn2 = sqlite3.connect(path)

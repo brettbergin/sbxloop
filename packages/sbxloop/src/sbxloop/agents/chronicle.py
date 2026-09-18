@@ -232,12 +232,16 @@ class RunChronicle:
         if not reply:
             return
         message_id = str(data.get("message_id") or self._done)
+        # A steer addressed by mention (S-A11) stamps the agent and the task
+        # lane that answered it, so the channel hears it from that agent.
+        task_id = data.get("task_id")
         self._post(
             event,
             "reply",
             reply,
             dedupe=f"{event.run_id}:reply:{message_id}",
             agent=self._agent_for("steer", data),
+            task_id=task_id if isinstance(task_id, str) and task_id else None,
         )
 
     def _delivery(self, event: Event, data: dict[str, Any]) -> None:
