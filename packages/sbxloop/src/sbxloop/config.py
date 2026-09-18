@@ -2926,6 +2926,26 @@ class MemoryConfig(_ConfigModel):
     prompt_budget_chars: int = Field(default=4000, ge=0)
 
 
+class AgentTeamConfig(_ConfigModel):
+    """What the agent team may do on its own initiative (S-A12).
+
+    An agent that declares ``can_start`` gets ``start_run`` and
+    ``file_issue``. Two bounds keep that from becoming a spiral: how deep
+    a chain of agent-started work may go before the next generation is
+    refused, and how much work one agent may start in a day.
+
+    ``max_chain_depth = 0`` stops agent-started work entirely without
+    editing every agent; ``max_agent_runs_per_day`` is the default an
+    ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+    """
+
+    # Work a person asked for is depth 0; the run an agent starts from it
+    # is depth 1. An agent working at this depth may start nothing.
+    max_chain_depth: int = Field(default=2, ge=0)
+    # The daily cap for an agent whose spec names none.
+    max_agent_runs_per_day: int = Field(default=4, ge=0)
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # Runtime provenance, not operator knobs. Persisted so CLI precedence
@@ -3002,6 +3022,8 @@ class Config(_ConfigModel):
     agents: list[AgentSpec] = Field(default_factory=list)
     # Each agent's long-term memory (bounds and the on/off switch).
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    # What agents may start on their own, and how much of it.
+    agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:

@@ -47,6 +47,41 @@ naming the next offset, and never hands back bytes that are not text.
   run-thread steering and an unlinked surface behave exactly as before.
   Advertised as `collaboration.bridges`.
 
+- **Agents can start work and file issues themselves.** An agent whose
+  `[[agents]]` entry declares `can_start` is offered two new tools in a chat
+  turn: `start_run` (a `workload` run, or a `code` run filed as a queued
+  issue) and `file_issue`. Six guardrails run before anything is admitted —
+  the kind must be one the agent declares, the repository must be configured
+  and enabled, the work must sit below `[agent_team] max_chain_depth`, the
+  agent must be under its daily cap (`[[agents]] max_runs_per_day`, else
+  `[agent_team] max_agent_runs_per_day`), the workspace pool must admit
+  another run, and the same ask under the same parent is refused rather than
+  queued twice. The admission runs under a new `Principal.for_agent`, which
+  holds `items:create` and nothing else. Work an agent started carries its
+  channel, the agent, the parent item and the chain depth, and everything it
+  writes to a repository carries an attribution footer and an origin marker
+  that issue discovery reads back, so a chain stays countable across a poll.
+  The marker is the daemon's alone: every marker is stripped out of the body
+  the agent wrote before the daemon appends its own, and the last marker in a
+  body is the one read back, so nothing an agent types can credit another
+  agent or reset the depth its chain is already at. Every start is written to
+  a durable ledger as it is made, so a queued issue counts against the daily
+  cap from the moment it is filed rather than from whenever a poll discovers
+  it, and an ask is refused as a duplicate across turns and restarts, not
+  only within one turn. Filing an issue nobody queued runs nothing, so it
+  needs no `can_start` kind and does not ask the pool, but it answers to the
+  chain depth, the daily cap and the duplicate check like every other start.
+  A queued issue needs `code` in `can_start`; an agent with none can only
+  file one for a person to decide on. An agent offered these tools is not
+  also offered the concierge's own start tools (`create_issue`,
+  `label_issue_for_run`, `start_workload`, `start_entrygraph`,
+  `create_schedule`), which check none of those guardrails, so `start_run`
+  and `file_issue` are the only way it starts work. An issue an agent files
+  from a conversation leaves that channel with the daemon, as the
+  concierge's own filings do, so the code run a poll builds from it reports
+  back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
+  capability `agents.initiative`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list
