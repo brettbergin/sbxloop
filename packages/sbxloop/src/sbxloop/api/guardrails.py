@@ -83,8 +83,33 @@ class Guardrails:
         ``collaboration.followup.queued`` or
         ``collaboration.followup.suppressed``.
         """
-        now = self.clock()
-        admission = self._decide(channel_id, source, target_slug, depth, now)
+        admission = self.decide(channel_id, source=source, target_slug=target_slug, depth=depth)
+        self.record(
+            channel_id,
+            source=source,
+            target_slug=target_slug,
+            depth=depth,
+            trigger=trigger,
+            admission=admission,
+        )
+        return admission
+
+    def decide(self, channel_id: str, *, source: Author, target_slug: str, depth: int) -> Admission:
+        """What :meth:`admit` decides, without recording it: for a caller
+        that has a further gate of its own and records only the outcome."""
+        return self._decide(channel_id, source, target_slug, depth, self.clock())
+
+    def record(
+        self,
+        channel_id: str,
+        *,
+        source: Author,
+        target_slug: str,
+        depth: int,
+        trigger: str,
+        admission: Admission,
+    ) -> None:
+        """Audit one final decision about a follow-up."""
         self.store.record_followup_decision(
             channel_id,
             source_slug=source.id,
@@ -92,7 +117,7 @@ class Guardrails:
             trigger=trigger,
             depth=depth,
             admission=admission,
-            now=now,
+            now=self.clock(),
         )
         if not admission.ok:
             log.info(
@@ -103,7 +128,6 @@ class Guardrails:
                 depth=depth,
                 trigger=trigger,
             )
-        return admission
 
     def _decide(
         self, channel_id: str, source: Author, target_slug: str, depth: int, now: float

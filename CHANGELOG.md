@@ -95,6 +95,31 @@ a code run's checkout, is `404` like any other id from elsewhere.
   back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
 
+- **A listening agent may speak without being asked.** A channel
+  participant whose `mode` is `ambient` was listed and never heard from: it
+  answered only when named, like every other participant. With the new
+  `[collaboration] ambient = true` it may answer a message nobody addressed
+  to it, through three gates in order. Its `interests` are matched, case
+  insensitively, over the last `ambient_window_messages`; an agent none of
+  whose interests match is dropped there and no model is called for it.
+  What matches passes the mention guardrails with `trigger: "ambient"` —
+  the chain depth, the rate caps, the channel's silence and the token
+  budget — plus `ambient_max_per_hour` for that agent in that channel. What
+  survives gets one short relevance call on `ambient_model` (the
+  concierge's model when unset) that answers RELEVANT or PASS; a PASS posts
+  nothing and records `collaboration.followup.suppressed` with reason
+  `ambient_pass`, and being over the hourly cap records `ambient_cap`. What
+  passes all three becomes a turn whose reply is an ordinary agent
+  message, but the turn carries no authority: it runs read-only, with no
+  actions and no handoff, and the agent is told the message was not a
+  request to it. The relevance call is one-shot and resumes no session, so
+  no earlier verdict colours the next. Each decision is audited once, as its
+  final outcome. An agent never answers its own message; one already
+  answering the turn, or named in the message it would answer, does not
+  also volunteer; and each message is looked at once, by the turn that
+  posted it. `ambient = false`, the default, leaves every channel exactly
+  as it was.
+
 - **Agents address each other, under a person's control.** An agent's
   reply is prose in a shared channel, so naming another agent in it now
   addresses that agent: a follow-up turn is accepted for it, carrying

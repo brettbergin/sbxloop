@@ -424,6 +424,14 @@ service_memory = "2g"
 # channel_turns_per_window = 20    # agent turns one channel may take in that window
 # agent_turns_per_window = 6       # agent turns one agent may take there in that window
 # pair_cooldown_s = 60             # how long an agent waits before addressing the same agent again
+# ambient = false                  # let a participant in `ambient` mode speak unprompted
+# ambient_window_messages = 5      # recent messages the prefilter and the classifier read
+# ambient_max_per_hour = 6         # how often one ambient agent may speak in a channel
+
+# The relevance classifier runs once per ambient participant per message
+# that gets past the interest prefilter, so it wants a cheap model. It is
+# unset by default, which reuses the concierge's:
+# ambient_model = "gpt-4o-mini"
 
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a

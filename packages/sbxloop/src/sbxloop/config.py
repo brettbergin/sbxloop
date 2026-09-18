@@ -2982,6 +2982,18 @@ class CollaborationConfig(_ConfigModel):
     agent_turns_per_window: int = Field(default=6, ge=0)
     # How long one agent waits before addressing the same agent again.
     pair_cooldown_s: float = Field(default=60.0, ge=0)
+    # Whether a channel participant in `ambient` mode may speak without
+    # being addressed. Off until an operator turns it on: an agent that
+    # answers uninvited is a surprise, and a surprise that spends tokens.
+    ambient: bool = False
+    # The model the relevance classifier uses; None reuses the concierge's.
+    # A cheap one belongs here: it runs once per ambient participant per
+    # message that gets past the interest prefilter.
+    ambient_model: str | None = None
+    # How many recent messages the prefilter and the classifier read.
+    ambient_window_messages: int = Field(default=5, ge=1, le=50)
+    # How often one ambient agent may speak in a channel, per hour.
+    ambient_max_per_hour: int = Field(default=6, ge=0)
 
 
 class Config(_ConfigModel):

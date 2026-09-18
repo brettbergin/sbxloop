@@ -816,8 +816,24 @@ def test_example_collaboration_section_documents_the_defaults() -> None:
         "channel_turns_per_window",
         "agent_turns_per_window",
         "pair_cooldown_s",
+        "ambient",
+        "ambient_window_messages",
+        "ambient_max_per_hour",
     }
     assert Config.model_validate({"collaboration": block}).collaboration == Config().collaboration
+
+
+def test_example_documents_the_ambient_model_as_an_opt_in() -> None:
+    """`[collaboration] ambient_model` ships unset, so the classifier reuses
+    the concierge's model until an operator names a cheaper one. It is shown
+    outside the defaults block with a value that loads."""
+    text = DEFAULT_CONFIG_TOML
+    section = text[text.index("# [collaboration]") :]
+    match = re.search(r'^# ambient_model = "([^"]+)"', section, re.MULTILINE)
+    assert match is not None, "[collaboration] ambient_model is not in the example"
+    assert Config().collaboration.ambient_model is None
+    loaded = Config.model_validate({"collaboration": {"ambient_model": match.group(1)}})
+    assert loaded.collaboration.ambient_model == match.group(1)
 
 
 def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:
