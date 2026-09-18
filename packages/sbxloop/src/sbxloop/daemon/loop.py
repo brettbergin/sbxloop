@@ -40,6 +40,14 @@ from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
+from sbxloop.agents.assignment import (
+    AgentAssignment,
+    MemoryBlocks,
+    RunRole,
+    plan_assignment,
+)
+from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
+from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
@@ -61,10 +69,13 @@ from sbxloop.daemon.model import (
     TickOutcome,
     TickResult,
     WorkItem,
+    is_planned_assignment,
+    requested_roles,
 )
 from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
+from sbxloop.daemon.usagepool import UsagePool, fairness_key
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
@@ -328,6 +339,14 @@ def _fit_context(block: str, room: int, limit: int) -> str:
     return f"{kept}\n\n{note.format(hidden=hidden)}" if kept else note.format(hidden=hidden)
 
 
+def _item_assignment(item: WorkItem) -> AgentAssignment | None:
+    """The planned assignment ``item`` carries; None before one is planned."""
+    if not is_planned_assignment(item.assignment_json):
+        return None
+    assert item.assignment_json is not None  # nosec B101 - checked above
+    return AgentAssignment.from_json(item.assignment_json)
+
+
 class DaemonLoop:
     def __init__(
         self,
@@ -360,6 +379,13 @@ class DaemonLoop:
         self.worker_python = worker_python
         self.install_workers = install_workers
         self._runner = runner or self._default_runner
+        # Where a run's agents come from: the built-ins, `[[agents]]`, then
+        # the agents people saved (built per config, like the API's).
+        self._agents: tuple[Config, AgentRegistry] | None = None
+        # Where a planned assignment reads each agent's remembered
+        # context. None (the default) builds the item's own memory service
+        # at dispatch, the same one its run gets; a test may set it.
+        self.memory: MemoryBlocks | None = None
         self._stop = threading.Event()
         # An operator's `stop`: unlike a signal, it lets a landing the
         # daemon is completing finish before the process exits.
@@ -418,6 +444,11 @@ class DaemonLoop:
         # The import is reached from the loop thread (a tick) and from a
         # concierge command alike; one of them does it.
         self._schedules_lock = threading.Lock()
+        # The workspace budget pool: the daily run cap and token budget
+        # every dispatch is admitted against, and what runs spend.
+        self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
+        # `daemon_state` key: the day start the budget notice last went out for.
+        self._budget_notice_key = "usage_pool_budget_notice_day"
 
     # -- external control ---------------------------------------------------------
 
@@ -1585,7 +1616,12 @@ class DaemonLoop:
                     waits[candidate.item_id] = repo
                 return repo is not None
 
-            item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s, skip=blocked)
+            item = self.dstore.next_queued(
+                now,
+                self.config.daemon.retry_backoff_s,
+                skip=blocked,
+                busy=self._fairness_busy(),
+            )
             if item is None:
                 if launched:
                     break
@@ -1634,10 +1670,15 @@ class DaemonLoop:
                 idle_kind="breaker",
                 idle_detail=f"half-open; probe run {self._breaker_probe} in flight",
             )
+        admission = self.usage_pool.admit_run(None, now)
+        if admission.ok:
+            return None
+        if admission.reason == "token_budget":
+            if first:
+                self._announce_budget(now)
+            return TickResult(idle_kind="budget")
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
-        if started_today < self.config.daemon.max_runs_per_day:
-            return None
         if not first:
             return TickResult(idle_kind="daily_cap")
         provider_resume = any(
@@ -1645,6 +1686,11 @@ class DaemonLoop:
             for item in self.dstore.queued()
         )
         if provider_resume:
+            # The run cap exempts a provider-held resume; the token budget
+            # does not, even though the pool reported the run cap first.
+            if not self.usage_pool.admit_tokens(now).ok:
+                self._announce_budget(now)
+                return TickResult(idle_kind="budget")
             return None
         if now - self._last_cap_log > 3600:
             self._last_cap_log = now
@@ -1659,6 +1705,38 @@ class DaemonLoop:
                 resets_at=day_end,
             )
         return TickResult(idle_kind="daily_cap")
+
+    def _fairness_busy(self) -> Callable[[WorkItem], bool] | None:
+        """With room for several runs, an item whose requester (its
+        :func:`fairness_key`) already has a run in flight waits behind one
+        whose requester has none. One run at a time: plain FIFO."""
+        if self._serial:
+            return None
+        live = {fairness_key(handle.item) for handle in self.runs}
+        if not live:
+            return None
+        return lambda candidate: fairness_key(candidate) in live
+
+    def _announce_budget(self, now: float) -> None:
+        """Say once per pool day that the token budget holds new runs back.
+        The day is remembered in the store, so a restart does not repeat it."""
+        day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
+        stamp = repr(day_start)
+        if self.dstore.get_value(self._budget_notice_key) == stamp:
+            return
+        self.dstore.set_value(self._budget_notice_key, stamp)
+        budget = self.config.daemon.daily_token_budget
+        spent = self.usage_pool.tokens_today(now)
+        tz = self.config.daemon.run_cap_timezone
+        self._notice(
+            "daemon.token_budget",
+            f"token budget reached for today ({tz}): {spent}/{budget} tokens; "
+            f"no new runs until 00:00 {tz}",
+            tokens_today=spent,
+            budget=budget,
+            timezone=tz,
+            resets_at=day_end,
+        )
 
     def _nothing_to_run(self, now: float, discovered: int, waits: dict[str, str]) -> TickResult:
         """Say WHY there is nothing to run: a queue full of items sitting in
@@ -2338,6 +2416,66 @@ class DaemonLoop:
         self._await(handle)
         return self._settle_run(handle)
 
+    @property
+    def agents(self) -> AgentRegistry:
+        """The agent registry for the config this loop currently holds."""
+        cached = self._agents
+        if cached is None or cached[0] is not self.config:
+            cached = (self.config, DbAgentRegistry(self.config, self.dstore, clock=self.clock))
+            self._agents = cached
+        return cached[1]
+
+    def _memory(self, item: WorkItem) -> MemoryService:
+        """The memory service for ``item``: the store's memories under the
+        item's own config, so a planned assignment and the run it starts
+        read the same thing."""
+        return MemoryService(
+            self.dstore,
+            WorkspaceChannelVisibility(self.dstore),
+            self._item_config(item).memory,
+            self.clock,
+        )
+
+    def _assign(self, item: WorkItem, now: float) -> WorkItem:
+        """``item`` carrying the agent assignment its run starts with.
+
+        An item already holding a planned assignment keeps it, so every
+        attempt at the same work goes to the same agents; otherwise the
+        assignment is planned from the lead and roles asked for at
+        admission (none: the built-in team) and stored on the item. Each
+        binding snapshots its agent's memory block here (S-A5), taken in
+        the channel the item names."""
+        if is_planned_assignment(item.assignment_json):
+            return item
+        requested = cast("dict[RunRole, str]", requested_roles(item.assignment_json))
+        planned = plan_assignment(
+            self.agents,
+            kind=item.kind,
+            lead=item.lead_agent,
+            requested=requested,
+            memory=self.memory if self.memory is not None else self._memory(item),
+            channel_id=item.channel_id,
+        )
+        if item.origin_agent is not None or item.chain_depth:
+            planned = AgentAssignment(
+                lead=planned.lead,
+                roles=planned.roles,
+                agents=planned.agents,
+                channel_id=planned.channel_id,
+                origin_agent=item.origin_agent,
+                chain_depth=item.chain_depth,
+            )
+        text = planned.to_json()
+        self.dstore.set_item_assignment(item.item_id, text, now)
+        log.info(
+            "run.assigned",
+            item=item.item_id,
+            lead=planned.lead,
+            roles=dict(planned.roles),
+            default=planned.is_default(),
+        )
+        return item.model_copy(update={"assignment_json": text})
+
     def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
@@ -2345,7 +2483,7 @@ class DaemonLoop:
         run_id = resume_run_id or new_run_id()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
-            item = self.dstore.get(item.item_id) or item
+            item = self._assign(self.dstore.get(item.item_id) or item, now)
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
@@ -2371,6 +2509,8 @@ class DaemonLoop:
         item_config = self._item_config(item)
         bus = EventBus()
         bus.subscribe(event_log_subscriber)
+        # What the run's agents report spending is charged to the pool.
+        bus.subscribe(self.usage_pool.subscriber(getattr(item, "channel_id", None)))
         engine = LoopEngine(
             item_config,
             store=self.store,
@@ -2381,6 +2521,14 @@ class DaemonLoop:
             # This daemon watches the item's repository, so a follow-up issue
             # can honestly say which label queues it (#631).
             trigger_label=self.config.labels_for(self._item_repo(item)).trigger,
+            # The agents' long-term memory lives in the daemon's store: an
+            # agent whose `tools` name `memory` remembers and recalls there.
+            memory=MemoryService(
+                self.dstore,
+                WorkspaceChannelVisibility(self.dstore),
+                item_config.memory,
+                self.clock,
+            ),
         )
         handle = RunHandle(
             item,
@@ -4266,6 +4414,7 @@ class DaemonLoop:
             # profile; a code item passes the defaults, as it always has.
             kind=item.kind,
             profile=item.profile,
+            assignment=_item_assignment(item),
         )
 
     # -- reporting -----------------------------------------------------------------------

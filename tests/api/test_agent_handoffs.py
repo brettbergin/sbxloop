@@ -457,7 +457,7 @@ def test_stop_skips_dynamically_queued_peers_and_prose_does_not_dispatch(api: An
         with pytest.raises(ToolRejectedError, match="no longer running"):
             concierge.calls[0]["handoff"]("builder", "Too late")
         concierge.first.set_result(ConciergeReply("@operator could help too"))
-        api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+        assert api.ctx.turns.wait_idle(timeout=5)
         done = settled(api.client, headers, channel, turn["id"])
         assert done["status"] == "cancelled"
         assert [p["status"] for p in done["participants"]] == ["completed", "cancelled"]

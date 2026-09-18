@@ -34,7 +34,7 @@ from sbxloop.api.commands import dispatch
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.projections import Views
-from sbxloop.api.replay import cursor_after, read_after
+from sbxloop.api.replay import cursor_after, follow
 from sbxloop.daemon.controls.principal import WORKSPACE_ID
 from sbxloop.daemon.controls.results import ControlError
 
@@ -180,7 +180,9 @@ class _Session:
         while self.subscribed:
             ctx = self.ctx
             try:
-                page = await ctx.call(self._read, self.cursor, self.run_id, self.type_prefix)
+                page, resume = await ctx.call(
+                    self._read, self.cursor, self.run_id, self.type_prefix
+                )
             except Problem as exc:
                 self.subscribed = False
                 await self.error(exc.code, exc.detail, **exc.extra)
@@ -190,11 +192,21 @@ class _Session:
                 # event's, the frame's is the frame's.
                 await self.send({"type": "event", "event": event.model_dump(mode="json")})
                 self.cursor = int(event.id.removeprefix("evt_"))
+            self.cursor = max(self.cursor, resume)
             if not page.has_more:
                 return
 
     def _read(self, cursor: int, run_id: str | None, prefix: str | None) -> Any:
-        return read_after(Views(self.ctx), cursor, run_id=run_id, type_prefix=prefix, limit=BATCH)
+        """The next page this connection's member may see, and where to
+        resume (the member is re-read on every access re-check)."""
+        return follow(
+            Views(self.ctx),
+            cursor,
+            run_id=run_id,
+            type_prefix=prefix,
+            limit=BATCH,
+            viewer=self.auth.member,
+        )
 
     async def recheck_access(self) -> bool:
         now = self.ctx.clock()

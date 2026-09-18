@@ -39,6 +39,7 @@ from sbxloop.api.routes import (
     runs,
     status,
     usage,
+    workspace,
 )
 from sbxloop.config import ApiConfig
 
@@ -169,4 +170,5 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(agents.router)
     app.include_router(collaboration.router)
+    app.include_router(workspace.router)
     return app

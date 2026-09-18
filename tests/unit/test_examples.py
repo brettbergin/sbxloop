@@ -15,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from sbxloop.chatservices import CHAT_SERVICES
-from sbxloop.config import Config, load_config, load_secrets_env
+from sbxloop.config import RESERVED_ENV_KEYS, Config, load_config, load_secrets_env
 from sbxloop.data import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +115,31 @@ def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 1}
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
     assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
+
+
+def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[api.oidc]`, plus the secrets
+    template that carries the client secret."""
+    oidc = Config.model_validate({}).api.oidc
+    fields = set(type(oidc).model_fields)
+    (start,) = [
+        i for i, line in enumerate(DEFAULT_CONFIG_TOML.splitlines()) if line == "# [api.oidc]"
+    ]
+    section: set[str] = set()
+    for line in DEFAULT_CONFIG_TOML.splitlines()[start + 1 :]:
+        if not line.startswith("#"):
+            break
+        match = re.match(r"# ([a-z_]+) = ", line)
+        if match:
+            section.add(match.group(1))
+    assert section == fields
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    documented: set[str] = set()
+    for row in re.findall(r"\| `\[api\.oidc\] ([^|]+)\|", guide):
+        documented |= set(re.findall(r"`(?:\[api\.oidc\] )?([a-z_]+)`", "`" + row))
+    assert documented == fields
+    secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
+    assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
 
 
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
@@ -315,6 +340,7 @@ CREDENTIAL_ENVS = {
     "GITLAB_TOKEN",
     "GITEA_TOKEN",
     "DISCORD_BOT_TOKEN",
+    "SBXLOOP_OIDC_CLIENT_SECRET",
 }
 
 
@@ -361,6 +387,8 @@ def test_env_example_sbxloop_overrides_name_real_config_keys() -> None:
         if not name.startswith("SBXLOOP_"):
             continue
         remainder = name[len("SBXLOOP_") :].lower()
+        if remainder in RESERVED_ENV_KEYS:
+            continue  # a credential or worker variable, never a setting
         dotted = remainder.replace("__", ".")
         assert dotted in known, f"{name} is not a config key ({dotted})"
         seen += 1
@@ -534,7 +562,10 @@ def test_every_commented_key_is_a_real_config_key() -> None:
                 "slack": {"channel_id": "C0123ABCDEF"},
             }
         else:
-            doc = {section: parsed}
+            # A nested table such as `[api.oidc]` nests the same way.
+            doc = parsed
+            for part in reversed(section.split(".")):
+                doc = {part: doc}
         Config.model_validate(doc)
         checked += 1
     assert checked > 50, f"expected the example to document many keys, saw {checked}"
@@ -736,3 +767,35 @@ def test_example_memory_section_documents_the_defaults() -> None:
         "prompt_budget_chars",
     }
     assert Config.model_validate({"memory": block}).memory == Config().memory
+
+
+def test_example_agent_team_section_documents_the_defaults() -> None:
+    """The commented `[agent_team]` block, uncommented whole, loads and
+    equals the model's defaults: the example never advertises a chain depth
+    or a per-agent cap the daemon does not actually apply."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[agent_team]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {"max_chain_depth", "max_agent_runs_per_day"}
+    assert Config.model_validate({"agent_team": block}).agent_team == Config().agent_team
+
+
+def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:
+    """`[daemon] daily_token_budget` is shown commented (the model ships it
+    unset, so no budget applies until an operator picks one), and the value
+    it suggests loads."""
+    text = EXAMPLE.read_text()
+    daemon = text[text.index("# [daemon]") :]
+    match = re.search(r"^# daily_token_budget = (\d+)", daemon, re.MULTILINE)
+    assert match is not None, "[daemon] daily_token_budget is not in the example"
+    assert Config().daemon.daily_token_budget is None
+    loaded = Config.model_validate({"daemon": {"daily_token_budget": int(match.group(1))}})
+    assert loaded.daemon.daily_token_budget == int(match.group(1))

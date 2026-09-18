@@ -129,3 +129,45 @@ def test_host_model_attribution_does_not_overwrite_sdk_reported_model(monkeypatc
     assert data["agent_phase"] == "operator_plan" and data["model_source"] == "model"
     assert data["backend"] == "claude" and data["agent"] == "operator"
     assert client._model_context == {}
+
+
+def _submit_one(client: WorkerClient, line_data: dict, monkeypatch, **submit_kwargs) -> dict:
+    from sbxloop_worker.protocol import JobResult
+
+    job = JobRequest(job_id="j1", run_id="r1", kind="agent.session", prompt="task")
+    received = []
+    client.bus.subscribe(received.append)
+
+    def submit(request):
+        client._handle_line(
+            request, Event.now("agent.message", "r1", job_id="j1", **line_data).to_json_line()
+        )
+        return JobResult(job_id="j1", status="ok")
+
+    monkeypatch.setattr(client, "_submit", submit)
+    client.submit(job, **submit_kwargs)
+    assert client._job_agents == {}
+    return received[0].data
+
+
+@pytest.mark.parametrize("identity", [None, {"agent_slug": "ada", "agent_name": "Ada"}])
+def test_worker_cannot_forge_the_agent_identity(monkeypatch, identity) -> None:
+    client = WorkerClient(Sandbox(SbxCLI(), "unused"))
+    forged = {"text": "hi", "agent_slug": "concierge", "agent_name": "Angie", "agent": "x"}
+    kwargs = {"agent": "builder"}
+    if identity is not None:
+        kwargs["agent_identity"] = identity
+    data = _submit_one(client, forged, monkeypatch, **kwargs)
+    assert data["agent"] == "builder"
+    if identity is None:
+        assert "agent_slug" not in data and "agent_name" not in data
+    else:
+        assert (data["agent_slug"], data["agent_name"]) == ("ada", "Ada")
+
+
+def test_a_job_without_identity_is_stamped_as_before(monkeypatch) -> None:
+    client = WorkerClient(Sandbox(SbxCLI(), "unused"))
+    data = _submit_one(client, {"text": "hi"}, monkeypatch, agent="builder")
+    assert data == {"text": "hi", "agent": "builder"} | {
+        k: data[k] for k in ("requested_model", "model_source", "agent_phase")
+    }

@@ -20,8 +20,20 @@ def run_model_repo(config: Config) -> str | None:
     return config.github.repo if config.run_model_repo is None else config.run_model_repo or None
 
 
-def model_for_phase(config: Config, phase: str, *, repo: str | None = None) -> ModelSelection:
-    """Resolve one requested model; None never selects an implicit repo."""
+def model_for_phase(
+    config: Config,
+    phase: str,
+    *,
+    repo: str | None = None,
+    agent_model: str | None = None,
+    agent_slug: str | None = None,
+) -> ModelSelection:
+    """Resolve one requested model; None never selects an implicit repo.
+
+    Precedence: the run's ``--model``, then the repository's per-phase
+    model, then ``agent_model`` (the model of the named agent taking the
+    phase, ``agent_slug``), then ``[agent].models``, then ``model``.
+    """
     if phase == "concierge":
         return ModelSelection(
             config.concierge.model or config.model,
@@ -38,6 +50,8 @@ def model_for_phase(config: Config, phase: str, *, repo: str | None = None) -> M
                 if value is not None:
                     return ModelSelection(value, f"github.repos[{entry.repo}].agent_models.{phase}")
                 break
+    if agent_model is not None:
+        return ModelSelection(agent_model, f"agents[{agent_slug or '?'}].model")
     value = getattr(config.agent.models, phase)
     if value is not None:
         return ModelSelection(value, f"agent.models.{phase}")

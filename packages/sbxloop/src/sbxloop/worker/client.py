@@ -144,6 +144,21 @@ if smoke is None or smoke.returncode != 64:
 emit("ok", python=python, languages=manifest.get("languages"))
 """
 
+#: The event keys that name the agent speaking. Only the host sets them.
+_IDENTITY_KEYS = ("agent_slug", "agent_name")
+
+
+def _identity(agent: str | None, named: Mapping[str, str] | None) -> dict[str, str]:
+    """What a job's agent.* events are stamped with: the persona label
+    under ``agent``, then the named agent's slug and name when given."""
+    identity = {} if agent is None else {"agent": agent}
+    for key in _IDENTITY_KEYS:
+        value = (named or {}).get(key)
+        if value:
+            identity[key] = value
+    return identity
+
+
 # The batched toolchain presence probe: every selected toolchain's own probe
 # in one `sh -c`, printing the names of the ones that fail. One exec round
 # trip whatever the size of the set — round trips are the cost (#127) — and
@@ -301,11 +316,12 @@ class WorkerClient:
             ]
             | None
         ) = None
-        # job_id -> agent persona (planner, executor, ...) supplied at
-        # submit(); stamped onto that job's agent.* events so the transcript
-        # can say who is speaking (the worker doesn't know which phase it
-        # serves).
-        self._job_agents: dict[str, str] = {}
+        # job_id -> who is speaking, supplied at submit(): the persona label
+        # (planner, executor, ...) under `agent`, and the named agent taking
+        # the phase under `agent_slug`/`agent_name` when the run has one.
+        # Stamped onto that job's agent.* events so the transcript can say
+        # who is speaking (the worker doesn't know which phase it serves).
+        self._job_agents: dict[str, dict[str, str]] = {}
         # job_id -> the broker answering that job's host-tool requests
         # (see sbxloop.worker.hosttools); registered for the life of submit().
         self._brokers: dict[str, HostToolBroker] = {}
@@ -1079,7 +1095,12 @@ class WorkerClient:
         tool_handler: HostToolHandler | None = None,
         agent_phase: str | None = None,
         model_source: str | None = None,
+        agent_identity: Mapping[str, str] | None = None,
     ) -> JobResult:
+        """Run one job. ``agent_identity`` (``agent_slug``, ``agent_name``)
+        names the agent taking the job; it is stamped on the job's agent.*
+        events and never taken from the worker."""
+        identity = _identity(agent, agent_identity)
         if job.kind == "agent.session":
             if self.provider_recovery is not None:
                 pinned = self.provider_recovery.pin_model(job)
@@ -1096,11 +1117,11 @@ class WorkerClient:
                 return self.provider_recovery.submit(
                     job,
                     lambda request: self._submit_once(
-                        request, agent=agent, tool_handler=tool_handler
+                        request, identity=identity, tool_handler=tool_handler
                     ),
                     self.bus,
                 )
-            return self._submit_once(job, agent=agent, tool_handler=tool_handler)
+            return self._submit_once(job, identity=identity, tool_handler=tool_handler)
         finally:
             self._model_context.pop(job.job_id, None)
 
@@ -1108,7 +1129,7 @@ class WorkerClient:
         self,
         job: JobRequest,
         *,
-        agent: str | None = None,
+        identity: Mapping[str, str] | None = None,
         tool_handler: HostToolHandler | None = None,
     ) -> JobResult:
         """Run one job to completion.
@@ -1125,7 +1146,7 @@ class WorkerClient:
             if self.mcp_prepare is None:
                 raise WorkerError("credentialed MCP has no host mediator")
             with self.mcp_prepare(job, tool_handler) as (prepared, handler):
-                return self._submit_once(prepared, agent=agent, tool_handler=handler)
+                return self._submit_once(prepared, identity=identity, tool_handler=handler)
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "
@@ -1137,15 +1158,15 @@ class WorkerClient:
             broker = HostToolBroker(self.sandbox, job, tool_handler)
             self._brokers[job.job_id] = broker
             try:
-                return self._submit_as(job, agent)
+                return self._submit_as(job, identity)
             finally:
                 self._brokers.pop(job.job_id, None)
                 broker.close()
-        return self._submit_as(job, agent)
+        return self._submit_as(job, identity)
 
-    def _submit_as(self, job: JobRequest, agent: str | None) -> JobResult:
-        if agent is not None:
-            self._job_agents[job.job_id] = agent
+    def _submit_as(self, job: JobRequest, identity: Mapping[str, str] | None) -> JobResult:
+        if identity:
+            self._job_agents[job.job_id] = dict(identity)
         try:
             return self._submit(job)
         finally:
@@ -1360,12 +1381,15 @@ class WorkerClient:
             EventTypes.SANDBOX_RESOURCES_WARNING,
         ):
             event.data["role"] = self.role
-        agent = self._job_agents.get(job.job_id)
+        # Which named agent is speaking is the host's to say: a worker that
+        # names one is forging it.
+        for key in _IDENTITY_KEYS:
+            event.data.pop(key, None)
+        speaker = self._job_agents.get(job.job_id, {})
         if event.type.startswith("agent."):
             # Host-owned request metadata, separate from SDK-reported identity.
             event.data.update(self._model_context.get(job.job_id, {}))
-            if agent is not None:
-                event.data["agent"] = agent
+            event.data.update(speaker)
             if self.backend is not None:
                 # Diagnostic data, not authority: a fallback worker can
                 # truthfully report a different backend from the config.

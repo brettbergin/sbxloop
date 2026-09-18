@@ -256,6 +256,35 @@ class TokenResponse(ApiModel):
     client_id: str
 
 
+class OidcProviderOut(ApiModel):
+    """What a signed-out browser needs to start Authorization Code + PKCE."""
+
+    id: str
+    label: str
+    authorize_url: str
+    client_id: str
+    scopes: list[str]
+    end_session_url: str | None
+
+
+class AuthProviders(ApiModel):
+    #: Username and password sign-in (``/v1/auth/local/login``) is offered.
+    local: bool
+    #: The OpenID Connect provider, when one is configured and reachable.
+    oidc: OidcProviderOut | None
+
+
+class OidcTokenRequest(ApiModel):
+    """The browser's authorization code, redeemed by the daemon."""
+
+    provider: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1, max_length=4096)
+    #: RFC 7636: 43 to 128 unreserved characters.
+    code_verifier: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9._~-]+$")
+    redirect_uri: str = Field(min_length=1, max_length=2048)
+    nonce: str = Field(min_length=1, max_length=512)
+
+
 class RevokeRequest(ApiModel):
     #: The refresh token whose family to revoke, besides the access token
     #: this request was made with.
@@ -306,6 +335,12 @@ class Item(ApiModel):
     updated_at: str
     revision: int = 0
     available_actions: list[str] = Field(default_factory=list)
+    #: The agent asked to lead the work, or, once the run is planned, the
+    #: agent that leads it. ``None`` for work admitted without one.
+    lead_agent: str | None = None
+    #: The agent in each run role: the planned team once the item was
+    #: dispatched, the roles asked for before. ``None`` when none were.
+    assignment: dict[str, str] | None = None
 
 
 class ItemDetail(Item):
@@ -442,6 +477,9 @@ class IssueIntake(ApiModel):
     repository: str | None = None
     number: int = Field(ge=1)
     run_kind: Literal["code", "workload"] = "code"
+    lead: str | None = Field(default=None, max_length=64)
+    roles: dict[str, str] = Field(default_factory=dict, max_length=8)
+    channel_id: str | None = Field(default=None, max_length=128)
 
 
 class WorkloadIntake(ApiModel):
@@ -449,6 +487,14 @@ class WorkloadIntake(ApiModel):
     ask: str = Field(min_length=1, max_length=65536)
     profile: str | None = None
     sink: str | None = None
+    #: The agent that leads the run (the built-in lead when omitted); it
+    #: must be active and declare the ``lead`` role.
+    lead: str | None = Field(default=None, max_length=64)
+    #: The agent asked for in each run role (``planner``, ``builder``,
+    #: ``critic``, ``operator``); each must be active and declare the role.
+    roles: dict[str, str] = Field(default_factory=dict, max_length=8)
+    #: The channel the work answers to: its result is delivered there.
+    channel_id: str | None = Field(default=None, max_length=128)
 
 
 class ToolIntake(ApiModel):
@@ -669,6 +715,23 @@ class UsageWindow(ApiModel):
     total: UsageTotals
     spend: None = None
     spend_basis: str
+
+
+class UsagePool(ApiModel):
+    """Today's workspace budget pool: runs against the daily cap and
+    reported tokens (input plus output) against the daily budget, for the
+    calendar day in ``[daemon] run_cap_timezone``."""
+
+    workspace_id: str = WORKSPACE_ID
+    day_start: str
+    resets_at: str
+    runs_today: int
+    max_runs_per_day: int
+    tokens_today: int
+    #: ``null`` when no budget is configured.
+    daily_token_budget: int | None = None
+    runs_tokens_today: int
+    turns_tokens_today: int
 
 
 # -- diagnostics and administration (#1040) -----------------------------------------

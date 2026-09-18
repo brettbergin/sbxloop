@@ -121,6 +121,13 @@ async def download_artifact(
     """The bytes, as an attachment: never rendered, never a path the
     client chose, opened relative to the run's own directory without
     following a link out of it. ``410`` once the run was pruned."""
+    return await stream_artifact(ctx, artifact_id)
+
+
+async def stream_artifact(ctx: ApiContext, artifact_id: str) -> StreamingResponse:
+    """One catalogued file's bytes, as an attachment, bounded by the same
+    download semaphore however the caller reached it. Whoever calls this has
+    already decided that the artifact is theirs to read."""
 
     def prepare() -> tuple[Artifact, RunRecord, Any]:
         artifact, record = _lookup(ctx, artifact_id)

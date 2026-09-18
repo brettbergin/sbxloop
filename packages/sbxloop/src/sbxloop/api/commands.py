@@ -46,9 +46,10 @@ from sbxloop.daemon.controls.intake import (
     WorkloadAdmission,
 )
 from sbxloop.daemon.controls.operations import IdempotencyConflict, Operation, OperationReplay
-from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.principal import Capability as PrincipalCapability, Principal
 from sbxloop.daemon.controls.results import AdmitOutcome, ItemOutcome, Outcome
 from sbxloop.daemon.controls.steering import SteeringStore
+from sbxloop.db.collaboration_models import ChannelRow
 from sbxloop.vcs.protocol import Capability
 
 KEY_HEADER = "Idempotency-Key"
@@ -142,9 +143,43 @@ def _operation(ctx: ApiContext, op_id: str | None) -> Operation:
     return op
 
 
-def _admission(ctx: ApiContext, body: IssueIntake | WorkloadIntake | ToolIntake) -> AdmitRequest:
+def _check_channel(ctx: ApiContext, auth: Authenticated, channel_id: str | None) -> None:
+    """A channel work is admitted for must exist and be one the caller may
+    read: a workspace member names their own channels; a plain API client,
+    which reads everything, any active one. Work admitted for a channel is
+    delivered and charged there, so naming one takes the capabilities a
+    channel write does, checked before whether the channel exists."""
+    if channel_id is None:
+        return
+    member = auth.member
+    needed: tuple[PrincipalCapability, ...] = ("collaboration:write",)
+    if member is not None:
+        needed = ("collaboration:read", *needed)
+    for capability in needed:
+        if not auth.principal.can(capability):
+            raise Problem(
+                403,
+                "forbidden",
+                f"{auth.principal.id} lacks {capability}",
+                capability=capability,
+            )
+    if member is not None:
+        found = ctx.collaboration.get_channel(member.user.id, channel_id) is not None
+    else:
+        with ctx.loop.dstore.read() as session:
+            row = session.get(ChannelRow, channel_id)
+            found = row is not None and row.state == "active"
+    if not found:
+        raise Problem(404, "channel_not_found", "channel not found")
+
+
+def _admission(
+    ctx: ApiContext, auth: Authenticated, body: IssueIntake | WorkloadIntake | ToolIntake
+) -> AdmitRequest:
     """The service's request for a body; a public repository id is
     resolved here, on the executor."""
+    if not isinstance(body, ToolIntake):
+        _check_channel(ctx, auth, body.channel_id)
     if isinstance(body, IssueIntake):
         if (body.repository_id is None) == (body.repository is None):
             raise Problem(
@@ -155,9 +190,23 @@ def _admission(ctx: ApiContext, body: IssueIntake | WorkloadIntake | ToolIntake)
             repo = Views(ctx).repository_by_public_id(body.repository_id).repo
         assert repo is not None  # nosec B101 - one of the two was given
         run_kind: Literal["code", "workload"] = body.run_kind
-        return IssueAdmission(repository=repo, number=body.number, run_kind=run_kind)
+        return IssueAdmission(
+            repository=repo,
+            number=body.number,
+            run_kind=run_kind,
+            lead=body.lead,
+            roles=dict(body.roles),
+            channel_id=body.channel_id,
+        )
     if isinstance(body, WorkloadIntake):
-        return WorkloadAdmission(ask=body.ask, profile=body.profile, sink=body.sink)
+        return WorkloadAdmission(
+            ask=body.ask,
+            profile=body.profile,
+            sink=body.sink,
+            lead=body.lead,
+            roles=dict(body.roles),
+            channel_id=body.channel_id,
+        )
     return ToolAdmission(recipe=body.recipe, parameters=dict(body.parameters))
 
 
@@ -170,7 +219,7 @@ async def admit(
     service = ctx.service()
 
     def apply() -> AdmitOutcome:
-        return service.admit(principal, _admission(ctx, body), idempotency=pair)
+        return service.admit(principal, _admission(ctx, auth, body), idempotency=pair)
 
     try:
         outcome = await run_command(ctx, apply)

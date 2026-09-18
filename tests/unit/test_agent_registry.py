@@ -224,7 +224,7 @@ class TestApiShims:
             assert scout is not None and scout.source == "config"
         finally:
             ctx.executor.shutdown()
-            ctx.turn_executor.shutdown()
+            ctx.turns.shutdown()
 
 
 class TestConfigAgents:

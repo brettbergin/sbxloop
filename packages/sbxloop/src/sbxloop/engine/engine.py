@@ -52,17 +52,18 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
 from sbxloop import hostgit, repofiles
 from sbxloop.agentmodels import model_for_phase, refreshed_models, run_model_repo
+from sbxloop.agents.assignment import AgentAssignment
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -203,6 +204,9 @@ from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
 
+if TYPE_CHECKING:
+    from sbxloop.agents.memory import MemoryService
+
 log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], VcsOps]
@@ -304,6 +308,24 @@ class Pipeline:
     issues_enabled: bool | None = None
 
 
+#: The prompt whose session does a task's work, per run kind: a task's
+#: events and its assignee belong to the agent taking it. A tool run has no
+#: agent doing anything.
+_WORKING_PHASE: dict[str, str] = {"code": "build", "workload": "operator_execute"}
+#: The prompt behind each phase-attempt name that an agent session fills;
+#: every other attempt (verify, gate, setup, a tool run's commands) is
+#: mechanical and belongs to nobody.
+_PROMPT_BY_RECORDED_PHASE: dict[str, str] = {
+    "decompose": "decompose",
+    "plan": "operator_plan",
+    "build": "build",
+    "execute": "operator_execute",
+    "judge": "operator_judge",
+    "review": "review",
+    "steer": "steer",
+}
+
+
 class LoopEngine:
     def __init__(
         self,
@@ -319,6 +341,7 @@ class LoopEngine:
         github_ops: GithubOpsFactory | None = None,
         service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         # Library parity with the CLI: the home's secrets.env supplies tokens
         # and settings even when the caller passes a prebuilt Config (real
@@ -331,6 +354,9 @@ class LoopEngine:
         # daemon watches the repository and the instruction would mislead.
         self.trigger_label = trigger_label
         self.store = store or StateStore(self.config.paths.state_db)
+        # Every agent's long-term memory, for the memory tools of an agent
+        # whose `tools` name `memory` (the daemon's store). None offers none.
+        self.memory = memory
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
         self.worker_python = (
@@ -392,6 +418,10 @@ class LoopEngine:
         # A restart's offer of the previous attempt's pushed branch/PR
         # (#600); empty for an ordinary run and for a resume.
         self._prior = PriorArtifacts()
+        # The named agents this run was given, persisted with the
+        # run and read back on resume. None: the run was started without an
+        # assignment and every phase is the built-in's.
+        self._assignment: AgentAssignment | None = None
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -427,6 +457,7 @@ class LoopEngine:
         kind: RunKind = "code",
         profile: str | None = None,
         expects_mount: bool | None = None,
+        assignment: AgentAssignment | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -476,6 +507,10 @@ class LoopEngine:
         profile at all may declare no needs. It is pinned into the run's
         persisted config with its budget overrides applied, so a resume
         runs under the same bounds.
+
+        ``assignment`` names the agents taking the run's phases, decided by
+        the host. It is persisted with the run; a default assignment (the
+        built-in team) changes no prompt and no event.
         """
         run_id = run_id or new_run_id()
         if profile is not None and kind != "workload":
@@ -501,8 +536,12 @@ class LoopEngine:
         self.store.create_run(
             run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
         )
+        self._assignment = assignment
+        if assignment is not None:
+            self.store.set_run_assignment(run_id, assignment.to_json())
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
+            self._record_assignees(run_id, kind, [spec.id for spec in tasks])
         if kind != "code":
             # The data dir is cut at provisioning (`sandbox.workspace_mount`
             # names it); the start event says only that no checkout is in
@@ -585,6 +624,7 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
+        self._assignment = self._stored_assignment(run_id)
         recovery = ProviderRecovery(self.store, self.config.agent.backend)
         if release_provider_hold and recovery.pending(run_id):
             recovery.release()
@@ -767,9 +807,100 @@ class LoopEngine:
             if key not in ignore and stored_flat.get(key) != current_flat.get(key)
         ]
 
+    # -- named agents ------------------------------------------------------
+
+    def _stored_assignment(self, run_id: str) -> AgentAssignment | None:
+        """The assignment the run was started with, with any task handed
+        to another of its agents since."""
+        raw = self.store.get_run_assignment(run_id)
+        if raw is None:
+            return None
+        return AgentAssignment.from_json(raw).with_tasks(self.store.task_assignees(run_id))
+
+    def _credited(self) -> AgentAssignment | None:
+        """The assignment when it credits anyone; a default one does not."""
+        assignment = self._assignment
+        return None if assignment is None or assignment.is_default() else assignment
+
+    def _record_assignees(self, run_id: str, kind: RunKind, task_ids: Sequence[str]) -> None:
+        """Write down which agent does each task's work."""
+        phase = _WORKING_PHASE.get(kind)
+        if self._assignment is None or phase is None:
+            return
+        assignees: dict[str, str] = {}
+        for task_id in task_ids:
+            binding = self._assignment.binding_for(phase, task_id)
+            if binding is not None:
+                assignees[task_id] = binding.slug
+        self.store.set_task_assignees(run_id, assignees)
+
+    def _record_phase(self, run_id: str, phase: str, **values: Any) -> None:
+        """``store.record_phase``, naming the agent that took an agent phase."""
+        prompt = _PROMPT_BY_RECORDED_PHASE.get(phase)
+        if self._assignment is not None and prompt is not None:
+            binding = self._assignment.binding_for(prompt, values.get("task_id"))
+            if binding is not None:
+                values["agent_slug"] = binding.slug
+        self.store.record_phase(run_id, phase, **values)
+
+    @contextlib.contextmanager
+    def _assignment_stamps(self, run_id: str, kind: RunKind) -> Iterator[None]:
+        """While the run is driven, credit the host events emitted within a
+        task or a phase to the agent taking it. Nothing is stamped without
+        an assignment, or with a default one."""
+        assignment = self._credited()
+        if assignment is None:
+            yield
+            return
+        working = _WORKING_PHASE.get(kind)
+
+        def stamp(event_type: str, data: dict[str, Any]) -> None:
+            if "agent_slug" in data:
+                return
+            binding = None
+            if event_type.startswith("task."):
+                task_id = data.get("task_id")
+                if working is not None:
+                    binding = assignment.binding_for(
+                        working, task_id if isinstance(task_id, str) else None
+                    )
+            elif event_type == HostEventTypes.REVIEW_VERDICT:
+                binding = assignment.binding_for("review")
+            elif event_type == HostEventTypes.CHAT_REPLY:
+                binding = assignment.binding_for("steer")
+            elif event_type in (HostEventTypes.RUN_FOLLOWUPS, HostEventTypes.RUN_DELIVER):
+                binding = assignment.lead_binding()
+            if binding is not None:
+                data["agent_slug"] = binding.slug
+
+        unstamp = self.bus.stamp_run(run_id, stamp)
+        try:
+            yield
+        finally:
+            unstamp()
+
     # -- run driver --------------------------------------------------------
 
     def _drive(
+        self,
+        run_id: str,
+        outcome: str,
+        *,
+        workspace: Path | None = None,
+        stage: str | None = None,
+        expects_mount: bool | None = None,
+    ) -> RunResult:
+        kind = self.store.get_run(run_id).kind
+        with self._assignment_stamps(run_id, kind):
+            return self._drive_run(
+                run_id,
+                outcome,
+                workspace=workspace,
+                stage=stage,
+                expects_mount=expects_mount,
+            )
+
+    def _drive_run(
         self,
         run_id: str,
         outcome: str,
@@ -948,6 +1079,11 @@ class LoopEngine:
                         bus=self.bus if kind == "workload" else None,
                         session_models=self.store.session_models(run_id),
                         store=self.store,
+                        assignment=self._assignment,
+                        memory=self.memory,
+                        narrow_service=(
+                            service.narrowed_tool_spec if service is not None else None
+                        ),
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -1243,7 +1379,7 @@ class LoopEngine:
         attempt = 1 + sum(
             1 for row in self.store.phase_attempts(run_id) if row.phase == "dependencies"
         )
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "dependencies",
             task_id=None,
@@ -1810,7 +1946,7 @@ class LoopEngine:
             else []
         )
         status = "ok" if failed is None and not missing else "failed"
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "execute",
             task_id=spec.id,
@@ -2147,10 +2283,11 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
+            self._record_assignees(run_id, p.kind, [spec.id for spec in ordered])
             if title:
                 self.store.set_run_title(run_id, title)
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 phase,
                 task_id=None,
@@ -2640,7 +2777,7 @@ class LoopEngine:
             if result.exit_code != 0
         ]
         status = "ok" if not failed else "failed"
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "judge",
             task_id=None,
@@ -2928,7 +3065,7 @@ class LoopEngine:
                 if not gate
                 else 'verify_mode = "ci-only": the pull request\'s checks are the gate'
             )
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "gate",
                 task_id=None,
@@ -2955,7 +3092,7 @@ class LoopEngine:
         # `failed`: it blocked nothing, and `_verification_note` reads the
         # rows back to tell the review and the pull request what stood.
         status = "ok" if passed else ("advisory" if mode == "advisory" else "failed")
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "gate",
             task_id=None,
@@ -3338,7 +3475,7 @@ class LoopEngine:
         if verdict.verdict == "approve":
             self._note_nonblocking(p, round_no, posted_findings, posting)
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "review",
             task_id=None,
@@ -3971,6 +4108,7 @@ class LoopEngine:
             failed_checks=failed_checks,
         )
         task = self.store.append_task(run_id, spec)
+        self._record_assignees(run_id, p.kind, [spec.id])
         p.fix_kinds[spec.id] = kind
         self.bus.emit(
             HostEventTypes.FIX_ROUND,
@@ -4480,7 +4618,7 @@ class LoopEngine:
                     task_id=task.spec.id,
                     anchors=unanswered,
                 )
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "build",
             task_id=task.spec.id,
@@ -4558,7 +4696,7 @@ class LoopEngine:
             self._live_sessions.add(result.session_id)
         report = clip(result.output_text)
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "execute",
             task_id=task.spec.id,
@@ -4688,7 +4826,7 @@ class LoopEngine:
             )
         except InvalidOutputTwice as exc:
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "judge",
                 task_id=task.spec.id,
@@ -4720,7 +4858,7 @@ class LoopEngine:
             self._set_task_state(run_id, task, "failed")
             return
         spend = phases.drain_spend()
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "judge",
             task_id=task.spec.id,
@@ -4783,7 +4921,7 @@ class LoopEngine:
             # the work in landing, on a runner that has the services. The
             # row and the event keep the skip visible — a resumed run and a
             # reader of the chronology both see that nothing ran.
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "verify",
                 task_id=task.spec.id,
@@ -4819,7 +4957,7 @@ class LoopEngine:
         # run reads the evidence from phase_attempts rather than in-memory
         # state (#61). An advisory failure (#682) gets its own status: it
         # blocked nothing, and `_verification_note` reads the rows back.
-        self.store.record_phase(
+        self._record_phase(
             run_id,
             "verify",
             task_id=task.spec.id,
@@ -5142,7 +5280,7 @@ class LoopEngine:
                     exc_info=True,
                 )
                 spend = phases.drain_spend()
-                self.store.record_phase(
+                self._record_phase(
                     run_id,
                     "steer",
                     task_id=task.spec.id if task else None,
@@ -5162,7 +5300,7 @@ class LoopEngine:
                 continue
             action = self._apply_steer(run_id, task, verdict, phases)
             spend = phases.drain_spend()
-            self.store.record_phase(
+            self._record_phase(
                 run_id,
                 "steer",
                 task_id=task.spec.id if task else None,

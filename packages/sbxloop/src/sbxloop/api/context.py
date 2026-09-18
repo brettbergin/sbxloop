@@ -16,10 +16,11 @@ import functools
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from sbxloop.agents.assignment import RUN_ROLES, agent_memory_block
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
@@ -27,26 +28,37 @@ from sbxloop.agents.registry import (
     addressable,
     default_registry,
 )
-from sbxloop.api.agents import ANGIE_PERSONA, AgentDefinition
+from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools, work_granted
+from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
+from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
     Message,
     Turn,
+    guest_user,
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
+from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.errors import ToolRejectedError
+from sbxloop.log import get_logger
+
+if TYPE_CHECKING:
+    from sbxloop.api.auth.oidc import OidcProvider
 
 T = TypeVar("T")
+
+log = get_logger(__name__)
 
 #: Threads that run store and loop calls for the routes, and how many may
 #: be in flight at once: a reconnect storm queues behind these rather than
@@ -56,6 +68,9 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+#: The session the history compaction job resumes. Its own lane, so a
+#: summary never queues behind (or ahead of) somebody's conversation.
+SUMMARY_SESSION_KEY = "sbxloop:channel-summary"
 _CONTENT_WORD = re.compile(r"\w+")
 _RUNNER_INTENT = {
     "code": (
@@ -98,6 +113,30 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
 
 
+def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
+    """The first mentioned agent that declares each run role, by role."""
+    roles: dict[str, str] = {}
+    for slug in targets:
+        agent = registry.get(slug) if slug else None
+        if agent is None or not agent.active or agent.legacy:
+            continue
+        for role in agent.spec.roles:
+            if role in RUN_ROLES:
+                roles.setdefault(role, agent.slug)
+    return roles
+
+
+def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
+    """The agent answering the turn when it may lead work; Angie answers a
+    turn that addressed nobody."""
+    if target is None:
+        return ANGIE_SLUG
+    agent = registry.get(target)
+    if agent is None or not agent.active or agent.legacy or "lead" not in agent.spec.roles:
+        return None
+    return agent.slug
+
+
 class ApiContext:
     def __init__(
         self,
@@ -121,9 +160,11 @@ class ApiContext:
         self.executor = ThreadPoolExecutor(
             max_workers=EXECUTOR_THREADS, thread_name_prefix="sbxloop-api-worker"
         )
-        self.turn_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="sbxloop-collaboration"
-        )
+        #: Accepted chat turns: one FIFO lane per channel over a pool as wide
+        #: as the concierge's own turn pool.
+        self.turns = TurnCoordinator(config.concierge.max_concurrent_turns)
+        # Held while a turn is accepted and queued, so two requests for one
+        # channel queue in the order they were accepted.
         self._turn_admission = threading.Lock()
         self._collaboration_recovered = False
         self._semaphore: asyncio.Semaphore | None = None
@@ -134,6 +175,8 @@ class ApiContext:
         self._collaboration: CollaborationStore | None = None
         self._agents: tuple[Config, AgentRegistry] | None = None
         self._memory: tuple[Config, MemoryService] | None = None
+        self._summaries: ChannelSummarizer | None = None
+        self._oidc: tuple[Any, Any] | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -177,6 +220,60 @@ class ApiContext:
             )
             self._memory = cached
         return cached[1]
+
+    @property
+    def summaries(self) -> ChannelSummarizer:
+        """The channel history compaction job (S-P15). It runs after a turn
+        settles, on the concierge's own model, so a long conversation keeps
+        a summary of what has fallen out of the history window."""
+        if self._summaries is None:
+            self._summaries = ChannelSummarizer(self.collaboration, self._summarize, self.clock)
+        return self._summaries
+
+    def _summarize(self, prompt: str) -> str:
+        """One cheap, tool-less model call through the concierge's session
+        pool. Raises when there is no concierge, which the job treats as
+        "no summary this time"."""
+        concierge = self.concierge
+        if concierge is None:
+            raise RuntimeError("no concierge to summarise with")
+        reply = concierge.submit_turn(
+            prompt,
+            author="sbxloop",
+            via="local",
+            session_key=SUMMARY_SESSION_KEY,
+            allow_actions=False,
+            read_only=True,
+        ).result()
+        return str(reply.text or "") if reply.ok else ""
+
+    def compact_channel(self, channel_id: str) -> None:
+        """Summarise what has fallen out of a channel's history window.
+
+        Best effort and off the turn's critical path: a failure leaves the
+        watermark alone, so the next settled turn tries again.
+        """
+        try:
+            self.summaries.refresh(channel_id)
+        except Exception:
+            log.warning("collaboration.compaction_failed", channel=channel_id, exc_info=True)
+
+    @property
+    def oidc(self) -> OidcProvider | None:
+        """The configured OpenID Connect provider, or ``None`` when sign-in
+        through one is off. Its discovery and key caches live as long as
+        the ``[api.oidc]`` section this context holds."""
+        settings = self.config.api.oidc
+        if not settings.enabled:
+            return None
+        cached = self._oidc
+        if cached is None or cached[0] is not settings:
+            from sbxloop.api.auth.oidc import OidcProvider
+
+            cached = (settings, OidcProvider(settings, clock=self.clock))
+            self._oidc = cached
+        provider: OidcProvider = cached[1]
+        return provider
 
     @property
     def public_ids(self) -> PublicIds:
@@ -261,6 +358,38 @@ class ApiContext:
                 )
             return turn, message, created
 
+    def accept_bridge_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+    ) -> tuple[Turn, Message]:
+        """Accept a message from a linked bridge surface as a turn in the
+        channel that surface mirrors.
+
+        A mapped author answers as themselves. A guest — only where the link
+        admits one — has no account, so the turn runs for a stand-in carrying
+        the name they use on that service: no preferences to read, and no
+        standing to hand work off with.
+        """
+        store = self.collaboration
+        with self._turn_admission:
+            turn, message = store.accept_linked_turn(
+                link,
+                content=content,
+                author_user_id=author_user_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                now=self.clock(),
+            )
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else guest_user(display_name)
+            self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
+        return turn, message
+
     def start_collaboration_turn(
         self,
         turn: Turn,
@@ -269,11 +398,12 @@ class ApiContext:
         *,
         intent: str,
     ) -> None:
-        """Run an accepted chat turn away from the HTTP event loop.
+        """Queue an accepted chat turn on its channel's lane.
 
-        Explicit agent targets are sequential today because the existing
-        concierge owns one sandbox session executor. Each role still has its
-        own durable session key, and every reply is recorded independently.
+        Turns in one channel run in order; turns in different channels run
+        side by side up to ``[concierge] max_concurrent_turns``. Within a
+        turn its explicit agent targets still answer one after another, each
+        with its own durable session key and independently recorded reply.
         """
         concierge = self.concierge
         if concierge is None:
@@ -301,7 +431,12 @@ class ApiContext:
                 )
             self.hub.notify()
 
-        self.turn_executor.submit(run)
+        def cancel() -> bool:
+            changed = self.collaboration.request_turn_cancel(turn.id, self.clock())
+            self.hub.notify()
+            return changed
+
+        self.turns.submit(turn, run, cancel=cancel)
 
     def _execute_collaboration_turn(
         self,
@@ -320,9 +455,14 @@ class ApiContext:
             preference_context = f"\n\nUser preferences:\n\n{joined}"
         errors: list[str] = []
         author = user.full_name or user.username
+        # Work this turn starts goes to the agents it mentioned, in the run
+        # roles they declare.
+        work_roles = _work_roles(self.agents, turn.targets or ())
         index = 0
         while True:
-            current = store.get_turn(user.id, turn.channel_id, turn.id)
+            # The daemon reads its own accepted turn: whoever asked may have
+            # left the channel since, and the turn still has to settle.
+            current = store.get_turn(None, turn.channel_id, turn.id)
             if self.stopping.is_set() or current is None:
                 return
             participants = current.participants or tuple(
@@ -343,7 +483,7 @@ class ApiContext:
                 # Archived or disabled after the turn was accepted: it no
                 # longer answers in its own persona or with action rights.
                 errors.append(f"@{target} is no longer available")
-                store.participant_failed(turn.id, index, errors[-1])
+                store.participant_failed(turn.id, index, errors[-1], self.clock())
                 self.hub.notify()
                 index += 1
                 continue
@@ -352,12 +492,24 @@ class ApiContext:
                 if resolved is not None and resolved.slug == target
                 else None
             )
-            persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
+            read_only = bool(participant.get("read_only")) or target == "critic"
+            memory_block, agent_tools = self._agent_memory(
+                definition, turn.channel_id, turn.input_message_id, writable=not read_only
+            )
+            # The channel's own files, for every participant: a read-only
+            # critic reviewing a delivered file has to be able to read it.
+            channel_tools = self._channel_tools(turn.channel_id)
+            if not read_only:
+                # An agent whose spec declares `can_start` may put work in
+                # the queue itself, on behalf of whoever asked (S-A12). A
+                # read-only turn, and every built-in, gets nothing new.
+                agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
+            persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
+            persona += preference_context
             persona += _RUNNER_INTENT.get(intent, "")
             model = definition.agent.spec.model if definition and definition.agent else None
             # Mentioning a role is explicit delegation in Angie's UI.
             allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
-            read_only = bool(participant.get("read_only")) or target == "critic"
             prompt = content
             if participant.get("parent_index") is not None:
                 parent_index = int(participant["parent_index"])
@@ -414,6 +566,7 @@ class ApiContext:
             handoff_agents = tuple(
                 agent.slug for agent in self.agents.list() if addressable(agent, agent.slug)
             )
+            work_lead = _work_lead(self.agents, target)
             try:
                 future = concierge.submit_turn(
                     prompt,
@@ -434,6 +587,12 @@ class ApiContext:
                     on_code_work=code_work,
                     model=model,
                     handoff_agents=handoff_agents if allow_actions else None,
+                    channel_id=turn.channel_id,
+                    agent_slug=target or ANGIE_SLUG,
+                    agent_tools=agent_tools,
+                    channel_tools=channel_tools,
+                    work_lead=work_lead,
+                    work_roles=work_roles,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):
@@ -451,7 +610,7 @@ class ApiContext:
             except Exception:
                 errors.append(f"@{target or 'angie'} could not finish. Check the daemon logs.")
             if len(errors) > previous_errors:
-                store.participant_failed(turn.id, index, errors[-1])
+                store.participant_failed(turn.id, index, errors[-1], self.clock())
             self.hub.notify()
             index += 1
         store.finish_turn(
@@ -460,6 +619,92 @@ class ApiContext:
             now=self.clock(),
         )
         self.hub.notify()
+        self.compact_channel(turn.channel_id)
+
+    def _channel_tools(self, channel_id: str) -> tuple[AgentTool, ...]:
+        """The tools over the turn's own channel: today, reading a file
+        that was delivered there (S-P15). A daemon-less context brings
+        nothing, so a turn without a loop is unchanged."""
+        if self.loop is None:
+            return ()
+        try:
+            from sbxloop.api.channel_artifacts import channel_artifact_tools
+
+            return tuple(channel_artifact_tools(self, channel_id))
+        except Exception:
+            log.warning(
+                "collaboration.channel_tools_unavailable", channel=channel_id, exc_info=True
+            )
+            return ()
+
+    def _agent_memory(
+        self,
+        definition: AgentDefinition | None,
+        channel_id: str,
+        message_id: str | None,
+        *,
+        writable: bool,
+    ) -> tuple[str, tuple[AgentTool, ...]]:
+        """What a mentioned agent brings from its long-term memory into a
+        turn in ``channel_id``: its memory block for the persona (``""``
+        when it has none to show, so the persona is unchanged) and the
+        memory tools, when its agent may have them. A daemon-less context,
+        or a store that cannot answer, brings nothing."""
+        agent = definition.agent if definition is not None else None
+        if agent is None or self.loop is None:
+            return "", ()
+        try:
+            memory = self.memory
+            # The seam a run is planned through, so one protocol
+            # describes the memory service for chat and for runs alike.
+            block = agent_memory_block(memory, agent.slug, channel_id=channel_id)
+            tools = (
+                memory_tools(
+                    memory,
+                    agent.slug,
+                    channel_id=channel_id,
+                    run_id=None,
+                    message_id=message_id,
+                    writable=writable,
+                )
+                if chat_memory_granted(agent)
+                else []
+            )
+        except Exception:
+            log.warning("collaboration.agent_memory_unavailable", agent=agent.slug, exc_info=True)
+            return "", ()
+        return block, tuple(tools)
+
+    def _agent_work(
+        self,
+        definition: AgentDefinition | None,
+        channel_id: str,
+        *,
+        on_behalf_of: str | None,
+    ) -> tuple[AgentTool, ...]:
+        """``start_run`` and ``file_issue`` for a mentioned agent whose spec
+        declares ``can_start`` (S-A12). A turn is depth 0 -- a person asked
+        for it -- so what the agent starts from here is depth 1. A
+        daemon-less context, or an agent that declares nothing, brings
+        nothing, so the shipped team's turns are unchanged."""
+        agent = definition.agent if definition is not None else None
+        if agent is None or self.loop is None or not work_granted(agent):
+            return ()
+        try:
+            from sbxloop.daemon.agentwork import AgentWorkService
+
+            return tuple(
+                AgentWorkService(self.loop, clock=self.clock).tools(
+                    agent,
+                    channel_id=channel_id,
+                    parent_item_id=None,
+                    parent_depth=0,
+                    on_behalf_of=on_behalf_of,
+                )
+            )
+        except Exception:
+            log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
+            return ()
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the
@@ -489,4 +734,4 @@ class ApiContext:
         # Every live stream sees `stopping` on its next wake and ends.
         self.hub.notify()
         self.executor.shutdown(wait=False, cancel_futures=True)
-        self.turn_executor.shutdown(wait=False, cancel_futures=True)
+        self.turns.shutdown()
