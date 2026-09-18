@@ -1302,8 +1302,10 @@ async def stop_channel(
     agents go somewhere they should not is the only guard that matters, and
     waiting for whoever owns the channel would defeat it. Queued and
     running turns are cancelled, the runs the channel asked for are
-    cancelled through the daemon's control service, and the channel is
-    silenced until ``resume`` or a ``silence`` of its own lifts it.
+    cancelled and the work it queued is abandoned through the daemon's
+    control service (scoped to this channel's own work, so a member who
+    may post needs no run control), and the channel is silenced until
+    ``resume`` or a ``silence`` of its own lifts it.
     """
     until = ctx.clock() + STOP_SILENCE_S
     channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, until, ctx.clock())

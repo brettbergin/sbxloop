@@ -631,6 +631,8 @@ class ChannelStopOut(ApiModel):
 
     cancelled_turns: list[str] = Field(default_factory=list)
     cancelled_runs: list[str] = Field(default_factory=list)
+    #: Work items the channel queued that had not started, abandoned.
+    cancelled_items: list[str] = Field(default_factory=list)
     silenced_until: float | None = None
 
 

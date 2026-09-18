@@ -631,8 +631,16 @@ replying agent as its author, the reply as its input message,
 one deeper. Mentions inside a fenced or inline code span and inside a block
 quote address nobody, an agent never addresses itself, and at most four
 agents are addressed from one reply. The agent joins the channel as a
-`mention` participant if it is not one already. `handoff_agent` — a peer
-request inside one turn — is unchanged and unrelated.
+`mention` participant if it is not one already. An agent still to answer
+in the same turn, whether the person asked for it or a peer handed off to
+it, is not addressed again: it sees the reply in that turn.
+
+A follow-up is a peer request, not the person's. The agent answers the
+other agent's message framed as that agent speaking and as no new human
+approval, with read-only tools, no MCP servers, no memory writes and no
+`handoff_agent`, so one agent's prose cannot make another act on the
+person's authority. `handoff_agent` itself, a peer request inside one
+turn, is unchanged.
 
 Every follow-up passes the `[collaboration]` guardrails first, and each
 decision records `collaboration.followup.queued` or
@@ -646,16 +654,22 @@ than `pair_cooldown_s` ago), or the workspace budget's own reason.
 
 A person has the last word over all of it:
 
-| Route                           | Needs    | Result                                               |
-| ------------------------------- | -------- | ---------------------------------------------------- |
-| `POST /v1/channels/{id}/stop`   | delegate | `{cancelled_turns, cancelled_runs, silenced_until}`  |
-| `POST /v1/channels/{id}/resume` | delegate | The channel, with `silenced_until` cleared           |
-| `PUT /v1/channels/{id}/silence` | delegate | Body \`{until: float                                 |
-| `PUT /v1/channels/{id}/read`    | write    | Body `{sequence}`; the caller's channel member entry |
+| Route                           | Needs    | Result                                                               |
+| ------------------------------- | -------- | -------------------------------------------------------------------- |
+| `POST /v1/channels/{id}/stop`   | delegate | `{cancelled_turns, cancelled_runs, cancelled_items, silenced_until}` |
+| `POST /v1/channels/{id}/resume` | delegate | The channel, with `silenced_until` cleared                           |
+| `PUT /v1/channels/{id}/silence` | delegate | Body `{until}` (a timestamp, or null to lift it); the channel        |
+| `PUT /v1/channels/{id}/read`    | write    | Body `{sequence}`; the caller's channel member entry                 |
 
 Stop cancels the channel's queued and running turns, cancels the runs its
-work items are executing through the daemon's control service, and silences
-the channel for an hour; resume lifts the silence but restarts nothing.
+work items are executing, abandons the work items it queued that have not
+started, and silences the channel for an hour; resume lifts the silence but
+restarts nothing. The runs and items are cancelled through the daemon's
+control service with run control scoped to this channel's own work, so a
+plain member who may post stops them too, the audit record names that
+member, and nothing another channel asked for is touched. Gated work and
+work awaiting review is left alone: it already waits on a person, and
+dropping it would discard a finished result.
 Silence quiets the agents without cancelling anything. Channel-level
 permission for stop, resume and silence is **post**, not manage: a person
 watching agents go somewhere they should not is the guard that matters, and

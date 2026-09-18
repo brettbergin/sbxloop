@@ -7,11 +7,11 @@ a channel ends up with an agent answering a quotation of itself. Only prose
 mentions count.
 
 :class:`MentionRouter` turns the ones that do into follow-up turns: it keeps
-the slugs that name an active agent, drops the author's own and the source
-message's author, asks :class:`~sbxloop.api.guardrails.Guardrails` about
-each survivor, and queues the allowed ones. ``handoff_agent`` — an agent
-addressing a peer *within* its own turn — is a different mechanism and is
-untouched by this one.
+the slugs that name an active agent, drops the author's own, the source
+message's author and any agent still to answer in the same turn, asks
+:class:`~sbxloop.api.guardrails.Guardrails` about each survivor, and queues
+the allowed ones. ``handoff_agent`` — an agent addressing a peer *within*
+its own turn — is a different mechanism and is untouched by this one.
 """
 
 from __future__ import annotations
@@ -81,19 +81,25 @@ class MentionRouter:
         reply_to_author: str | None,
         depth: int,
         trigger: str = "mention",
+        skip: Iterable[str] = (),
     ) -> tuple[str, ...]:
-        """Queue what ``text`` addresses; the slugs actually queued."""
-        skip = {author_slug.casefold()}
+        """Queue what ``text`` addresses; the slugs actually queued.
+
+        ``skip`` names agents that must not get a follow-up: those still to
+        answer in the turn that produced ``text`` see it there already.
+        """
+        passed = {slug.casefold() for slug in skip}
+        passed.add(author_slug.casefold())
         if reply_to_author:
-            skip.add(reply_to_author.casefold())
+            passed.add(reply_to_author.casefold())
         queued: list[str] = []
         for slug in addressed_slugs(text)[:MAX_MENTIONS]:
-            if slug in skip:
+            if slug in passed:
                 continue
             resolved = self.resolve(slug)
-            if resolved is None or resolved in skip:
+            if resolved is None or resolved in passed:
                 continue
-            skip.add(resolved)
+            passed.add(resolved)
             if resolved not in set(self.participants(channel_id)):
                 self.join(channel_id, resolved)
             admission = self.admit(channel_id, target_slug=resolved, depth=depth, trigger=trigger)

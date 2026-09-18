@@ -108,8 +108,13 @@ a code run's checkout, is `404` like any other id from elsewhere.
   channel's silence and the workspace token budget — and each decision,
   allowed or refused, records `collaboration.followup.queued` or
   `collaboration.followup.suppressed` with its reason and never the
-  message text. `POST /v1/channels/{id}/stop` cancels the channel's turns
-  and the runs its work asked for and silences it,
+  message text. A follow-up answers as a peer request, never as the
+  person's: the other agent's message is framed as that agent speaking,
+  with read-only tools and no handoff, and an agent still to answer in the
+  same turn is not addressed a second time. `POST /v1/channels/{id}/stop`
+  cancels the channel's turns, the runs its work is executing and the work
+  it queued (`cancelled_items`), for any member who may post, and silences
+  it,
   `POST /v1/channels/{id}/resume` lifts that, and
   `PUT /v1/channels/{id}/silence` quiets the agents without cancelling
   anything; all three need only the right to post, because the person

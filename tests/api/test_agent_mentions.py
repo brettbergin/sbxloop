@@ -22,8 +22,12 @@ from typing import Any
 
 from sbxloop.daemon.concierge import ConciergeReply
 from tests.api.conftest import build
+from tests.api.test_channel_access import _invite
 from tests.api.test_collaboration import FakeConcierge, bearer, register
+from tests.api.test_collaboration_controls import Blocking
 from tests.api.test_collaboration_recovery import settled
+from tests.api.test_control import in_flight
+from tests.unit.test_daemon_loop import gh_item
 
 CAPS = {
     "collaboration": {
@@ -185,6 +189,144 @@ def test_the_chain_stops_at_the_configured_depth(tmp_path: Any) -> None:
     api.ctx.close()
 
 
+def test_a_chain_runs_to_the_default_depth_of_four_and_no_further(tmp_path: Any) -> None:
+    """With the shipped depth cap, two agents naming each other get four
+    agent-started turns after the person's, and the fifth is refused."""
+    api = build(tmp_path, config={"collaboration": {"pair_cooldown_s": 0}})
+    with api.client:
+        assert api.ctx.config.collaboration.max_chain_depth == 4
+        api.ctx.concierge = ScriptedConcierge(
+            {"planner": "over to @critic", "critic": "back to @planner"}
+        )
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        _ask(api, headers, channel, "@planner plan the bake")
+
+        turns = _turns(api, headers, channel)
+        assert [turn["chain_depth"] for turn in turns] == [0, 1, 2, 3, 4]
+        assert [turn["targets"] for turn in turns[1:]] == [
+            ["critic"],
+            ["planner"],
+            ["critic"],
+            ["planner"],
+        ]
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["chain_depth"]
+        assert suppressed[0]["data"]["chain_depth"] == 5
+    api.ctx.close()
+
+
+def test_a_spent_token_budget_refuses_the_follow_up(tmp_path: Any) -> None:
+    """The workspace budget is the last guardrail: once today's tokens are
+    spent, an agent naming another agent starts nothing."""
+    api = build(
+        tmp_path,
+        config={
+            "collaboration": dict(CAPS["collaboration"]),
+            "daemon": {"daily_token_budget": 100},
+        },
+    )
+    with api.client:
+        api.ctx.concierge = ScriptedConcierge({"planner": "over to @critic"})
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        api.loop.dstore.record_usage(
+            ts=api.clock(),
+            source="run",
+            ref_id="spent",
+            agent_slug=None,
+            channel_id=None,
+            input_tokens=500,
+            output_tokens=500,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        _ask(api, headers, channel, "@planner plan the bake")
+
+        assert len(_turns(api, headers, channel)) == 1
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["token_budget"]
+    api.ctx.close()
+
+
+def test_an_agent_started_turn_is_a_read_only_peer_message_not_the_persons_ask(
+    tmp_path: Any,
+) -> None:
+    """The follow-up's input is text another agent wrote. It is framed as
+    that agent speaking, carries no new human approval, and answers with
+    read-only tools and no handoff, so one agent's prose cannot make another
+    act on the person's authority."""
+    api = _api(tmp_path)
+    with api.client:
+        concierge = ScriptedConcierge({"planner": "Plan ready. @critic please review it."})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        _ask(api, headers, channel, "@planner plan the bake")
+
+        assert len(concierge.calls) == 2, concierge.calls
+        person, peer = concierge.calls
+        assert person["author"] == "Local Owner"
+        assert person["read_only"] is False
+        assert peer["session_key"].endswith(":critic")
+        assert peer["author"] != "Local Owner"
+        assert "planner" in peer["author"]
+        assert peer["author_id"] != person["author_id"]
+        assert peer["read_only"] is True
+        assert peer["handoff"] is None
+        assert peer["handoff_agents"] is None
+        assert "Plan ready. @critic please review it." in peer["text"]
+        assert "not new human approval" in peer["text"]
+    api.ctx.close()
+
+
+def test_an_agent_already_answering_this_turn_gets_no_second_turn(tmp_path: Any) -> None:
+    """The person asked planner and critic together. planner's reply names
+    critic, who is about to answer in this same turn anyway."""
+    api = _api(tmp_path)
+    with api.client:
+        concierge = ScriptedConcierge({"planner": "Draft done. @critic please check."})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        _ask(api, headers, channel, "@planner @critic plan the bake")
+
+        assert len(_turns(api, headers, channel)) == 1
+        assert [c["session_key"].rsplit(":", 1)[-1] for c in concierge.calls] == [
+            "planner",
+            "critic",
+        ]
+        assert _events(api, headers, channel) == []
+    api.ctx.close()
+
+
+class HandoffThenMention(ScriptedConcierge):
+    """planner hands off to critic with the tool and also names critic in prose."""
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        if not self.calls and kwargs.get("handoff") is not None:
+            kwargs["handoff"]("critic", "Check the proposed plan")
+        return super().submit_turn(text, **kwargs)
+
+
+def test_an_agent_handed_off_to_in_this_turn_gets_no_second_turn(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        concierge = HandoffThenMention({"planner": "I asked @critic to check the plan."})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        _ask(api, headers, channel, "@planner plan the bake")
+
+        assert len(_turns(api, headers, channel)) == 1
+        assert [c["session_key"].rsplit(":", 1)[-1] for c in concierge.calls] == [
+            "planner",
+            "critic",
+        ]
+        assert _events(api, headers, channel) == []
+    api.ctx.close()
+
+
 def test_a_pair_that_just_spoke_waits_out_its_cooldown(tmp_path: Any) -> None:
     api = _api(tmp_path, max_chain_depth=8, pair_cooldown_s=60)
     with api.client:
@@ -265,32 +407,93 @@ def test_a_silenced_channel_refuses_follow_ups_until_it_is_resumed(tmp_path: Any
     api.ctx.close()
 
 
-def test_stop_cancels_the_channels_turns_and_silences_it(tmp_path: Any) -> None:
+def test_stop_cancels_the_running_and_queued_turns_and_starts_nothing_after(
+    tmp_path: Any,
+) -> None:
+    """Stop with one turn running and another queued behind it: both are
+    cancelled, both settle as cancelled, and the reply still in flight when
+    the stop landed starts no follow-up of its own."""
     api = _api(tmp_path)
     with api.client:
-        api.ctx.concierge = FakeConcierge()
+        concierge = Blocking()
+        api.ctx.concierge = concierge
         headers = bearer(register(api))
         channel = _channel(api, headers)
-        # Accept a turn, then stop before it can settle.
-        accepted = api.client.post(
-            f"/v1/channels/{channel}/turns",
-            json={"content": "@planner plan the bake"},
-            headers=headers,
-        )
-        assert accepted.status_code == 202, accepted.text
+        route = f"/v1/channels/{channel}/turns"
+        running = api.client.post(
+            route, json={"content": "@planner plan the bake"}, headers=headers
+        ).json()["turn"]
+        queued = api.client.post(route, json={"content": "@planner and then?"}, headers=headers)
+        queued_turn = queued.json()["turn"]
+        try:
+            deadline = time.monotonic() + 5
+            while not concierge.calls and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert concierge.calls, "the first turn never started"
 
-        stopped = api.client.post(f"/v1/channels/{channel}/stop", headers=headers)
-        assert stopped.status_code == 200, stopped.text
-        body = stopped.json()
-        assert set(body) >= {"cancelled_turns", "cancelled_runs", "silenced_until"}
-        assert body["silenced_until"] is not None
-        assert (
-            api.client.get(f"/v1/channels/{channel}", headers=headers).json()["silenced_until"]
-            == body["silenced_until"]
-        )
+            stopped = api.client.post(f"/v1/channels/{channel}/stop", headers=headers)
+            assert stopped.status_code == 200, stopped.text
+            body = stopped.json()
+            assert set(body["cancelled_turns"]) == {running["id"], queued_turn["id"]}
+            assert body["cancelled_runs"] == []
+            assert body["silenced_until"] is not None
+            assert (
+                api.client.get(f"/v1/channels/{channel}", headers=headers).json()["silenced_until"]
+                == body["silenced_until"]
+            )
+        finally:
+            # The running reply lands after the stop and names another agent.
+            if not concierge.first.done():
+                concierge.first.set_result(ConciergeReply("over to @critic"))
+        _quiet(api)
+
+        turns = {turn["id"]: turn for turn in _turns(api, headers, channel)}
+        assert set(turns) == {running["id"], queued_turn["id"]}
+        assert turns[running["id"]]["status"] == "cancelled"
+        assert turns[queued_turn["id"]]["status"] == "cancelled"
+        assert [e for e in _events(api, headers, channel) if e["type"].endswith("queued")] == []
+        assert len(concierge.calls) == 1
 
         resumed = api.client.post(f"/v1/channels/{channel}/resume", headers=headers)
         assert resumed.json()["silenced_until"] is None
+    api.ctx.close()
+
+
+def test_a_members_stop_cancels_the_runs_and_queued_work_the_channel_asked_for(
+    tmp_path: Any,
+) -> None:
+    """Stop takes post, not run control: a plain workspace member who may
+    post in the channel stops what that channel started. Work another
+    channel asked for is untouched."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = FakeConcierge()
+        register(api)
+        member = bearer(_invite(api, "member", "guest"))
+        channel = _channel(api, member)
+        other = _channel(api, member)
+
+        thread, run_id, release = in_flight(api, gh_item("1", channel_id=channel))
+        try:
+            now = api.clock()
+            api.loop.dstore.upsert_new(gh_item("2", channel_id=channel), now)
+            api.loop.dstore.upsert_new(gh_item("3", channel_id=other), now)
+
+            stopped = api.client.post(f"/v1/channels/{channel}/stop", headers=member)
+            assert stopped.status_code == 200, stopped.text
+            body = stopped.json()
+            assert body["cancelled_runs"] == [run_id]
+            assert body["cancelled_items"] == ["gh:issue:2"]
+        finally:
+            release.set()
+            thread.join(10)
+
+        running = api.loop.dstore.get("gh:issue:1")
+        assert running is not None and running.state == "cancelled"
+        abandoned = api.loop.dstore.get("gh:issue:2")
+        assert abandoned is not None and abandoned.state == "failed"
+        untouched = api.loop.dstore.get("gh:issue:3")
+        assert untouched is not None and untouched.state == "queued"
     api.ctx.close()
 
 
