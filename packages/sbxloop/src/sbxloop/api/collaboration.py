@@ -2565,6 +2565,17 @@ class CollaborationStore:
                 return None
             return float(row.silenced_until)
 
+    def may_post(self, viewer: Viewer, channel_id: str, now: float) -> bool:
+        """Whether ``viewer`` may post in the channel, by the same check
+        :meth:`set_silence` and a new turn make: the rule a channel stop
+        answers to, from chat as from ``POST /v1/channels/{id}/stop``."""
+        with self.dstore.transaction() as session:
+            try:
+                _access(session, channel_id, viewer, "post", now=now)
+            except CollaborationError:
+                return False
+            return True
+
     def set_silence(
         self, viewer: Viewer, channel_id: str, until: float | None, now: float
     ) -> Channel | None:
