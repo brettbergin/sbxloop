@@ -182,7 +182,7 @@ def test_a_linked_message_becomes_a_channel_turn_credited_to_the_account(linked:
         linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
     )
     linked.say("plan the bread")
-    assert wait_for(lambda: len(linked.messages()) == 1)
+    assert wait_for(lambda: len(linked.messages()) >= 1)
     message = linked.messages()[0]
     assert message.content == "plan the bread"
     assert message.author.kind == "human"
@@ -208,7 +208,7 @@ def test_an_unmapped_author_is_refused_when_the_link_admits_no_guests(linked: An
 
 def test_a_guest_message_is_stored_under_their_display_name(guests: Any) -> None:
     guests.say("plan the bread", author=FakeUser(99, "stranger"))
-    assert wait_for(lambda: len(guests.messages()) == 1)
+    assert wait_for(lambda: len(guests.messages()) >= 1)
     message = guests.messages()[0]
     assert message.author.kind == "human"
     assert message.author.id is None
@@ -242,7 +242,7 @@ def test_a_link_code_typed_on_the_bridge_maps_the_author(linked: Any) -> None:
     control.messages[950] = msg
     linked.bridge._handle_message(msg)
     assert wait_for(lambda: linked.store.identity_user("discord", "1") == linked.user.id)
-    assert any("linked" in sent.casefold() for sent in control.sent)
+    assert wait_for(lambda: any("linked" in sent.casefold() for sent in control.sent))
 
 
 @pytest.fixture
@@ -277,7 +277,7 @@ def test_a_link_code_still_maps_an_author_from_a_linked_surface(elsewhere: Any) 
     code, _expires = elsewhere.store.create_link_code(elsewhere.user.id, time.time())
     elsewhere.type(f"!sbx link {code}")
     assert wait_for(lambda: elsewhere.store.identity_user("discord", "1") == elsewhere.user.id)
-    assert any("linked" in sent.casefold() for sent in elsewhere.sent())
+    assert wait_for(lambda: any("linked" in sent.casefold() for sent in elsewhere.sent()))
 
 
 def test_revoking_workspace_access_revokes_bridge_access(linked: Any) -> None:
@@ -328,7 +328,8 @@ def threaded(tmp_path: Path) -> Any:
 
 def test_a_message_in_a_linked_discord_thread_becomes_a_channel_turn(threaded: Any) -> None:
     threaded.say("plan the bread", author=FakeUser(99, "stranger"))
-    assert wait_for(lambda: len(threaded.messages()) == 1)
+    # The channel agent answers at once, so the input may already have a reply.
+    assert wait_for(lambda: len(threaded.messages()) >= 1)
     assert threaded.messages()[0].content == "plan the bread"
     assert threaded.concierge.turns == []
 
