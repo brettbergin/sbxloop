@@ -41,6 +41,7 @@ __all__ = [
     "MEMORY_TOOL_NAMES",
     "RUN_TOOLS",
     "TOOL_CATALOG",
+    "UNGUARDED_START_TOOLS",
     "WORK_TOOL_NAMES",
     "AgentTool",
     "IssueRequest",
@@ -113,6 +114,20 @@ AGENT_TOOL_GROUPS: frozenset[str] = frozenset({MEMORY_TOOL_GROUP})
 #: Not a group: ``can_start`` is what grants them, and a ``tools`` list
 #: only narrows what the agent already gets.
 WORK_TOOL_NAMES: frozenset[str] = frozenset({"start_run", "file_issue"})
+
+#: The concierge tools that put work in the queue without asking any of an
+#: agent's guardrails. An agent offered :data:`WORK_TOOL_NAMES` is not also
+#: offered these (``daemon/concierge.py``), so ``start_run`` and
+#: ``file_issue`` are the only way it starts work.
+UNGUARDED_START_TOOLS: frozenset[str] = frozenset(
+    {
+        "create_issue",
+        "create_schedule",
+        "label_issue_for_run",
+        "start_entrygraph",
+        "start_workload",
+    }
+)
 
 TOOL_CATALOG: frozenset[str] = CONCIERGE_TOOLS | RUN_TOOLS | AGENT_TOOL_GROUPS | WORK_TOOL_NAMES
 

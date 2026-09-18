@@ -72,7 +72,14 @@ naming the next offset, and never hands back bytes that are not text.
   needs no `can_start` kind and does not ask the pool, but it answers to the
   chain depth, the daily cap and the duplicate check like every other start.
   A queued issue needs `code` in `can_start`; an agent with none can only
-  file one for a person to decide on. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
+  file one for a person to decide on. An agent offered these tools is not
+  also offered the concierge's own start tools (`create_issue`,
+  `label_issue_for_run`, `start_workload`, `start_entrygraph`,
+  `create_schedule`), which check none of those guardrails, so `start_run`
+  and `file_issue` are the only way it starts work. An issue an agent files
+  from a conversation leaves that channel with the daemon, as the
+  concierge's own filings do, so the code run a poll builds from it reports
+  back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned

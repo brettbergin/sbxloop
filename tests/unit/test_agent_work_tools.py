@@ -21,10 +21,17 @@ from sbxloop.agents.origin import (
     origin_marker,
     strip_origin_markers,
 )
-from sbxloop.agents.tools import agent_tool_handler, work_dedupe_key, work_granted
+from sbxloop.agents.tools import (
+    UNGUARDED_START_TOOLS,
+    agent_tool_handler,
+    work_dedupe_key,
+    work_granted,
+)
 from sbxloop.config import Config
 from sbxloop.daemon.agentwork import AgentWorkService
 from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, Principal
+from sbxloop.daemon.model import WorkItem
+from sbxloop.ghids import issue_item_id
 from sbxloop_worker.protocol import HostToolCall
 from tests.unit.test_daemon_loop import Harness
 
@@ -448,3 +455,88 @@ class TestDedupeSurvivesTheTurn:
         )
         assert "already" in text
         assert len(github.created) == 1
+
+
+class TestACodeStartAnswersWhereItWasAsked:
+    """A code start travels to discovery as an issue, but the run it becomes
+    still reports into the conversation that started it -- the channel is
+    left with the daemon, never read back out of the public issue body."""
+
+    @staticmethod
+    def _discovered(harness: Harness, number: int) -> Any:
+        harness.dstore.upsert_new(
+            WorkItem(
+                item_id=issue_item_id(number),
+                source_key=str(number),
+                title="t",
+                repo="o/r",
+                kind="code",
+            ),
+            harness.clock(),
+        )
+        return harness.dstore.get(issue_item_id(number))
+
+    def test_a_code_start_discovered_by_the_poll_carries_its_channel(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path)
+        tools = offered(work, scout(can_start=["code"]), channel_id="chn_code")
+        assert "queued issue" in call(tools, "start_run", kind="code", ask="Fix the flake")
+        item = self._discovered(harness, 101)
+        assert item is not None and item.channel_id == "chn_code"
+
+    def test_a_queued_issue_discovered_by_the_poll_carries_its_channel(
+        self, tmp_path: Path
+    ) -> None:
+        work, harness, _ = service(tmp_path)
+        tools = offered(work, scout(can_start=["code"]), channel_id="chn_code")
+        call(tools, "file_issue", repo="o/r", title="Do it", body="now", queue=True)
+        item = self._discovered(harness, 101)
+        assert item is not None and item.channel_id == "chn_code"
+
+    def test_a_marker_cannot_name_a_channel(self) -> None:
+        body = "<!-- sbxloop:origin item=none agent=scout depth=1 channel=chn_other -->"
+        assert origin_from_body(body) is None
+
+
+class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
+    """The concierge's own start tools check none of an agent's guardrails,
+    so an agent offered ``start_run`` / ``file_issue`` is not also offered
+    them: otherwise an agent that may only research could queue a code run
+    with ``create_issue`` and step round its own daily cap."""
+
+    UNGUARDED: frozenset[str] = frozenset(
+        {
+            "create_issue",
+            "create_schedule",
+            "label_issue_for_run",
+            "start_workload",
+            "start_entrygraph",
+        }
+    )
+
+    def test_the_withheld_set_is_every_concierge_tool_that_starts_work(self) -> None:
+        assert self.UNGUARDED == UNGUARDED_START_TOOLS
+
+    @staticmethod
+    def _offered(tmp_path: Path, agent_tools: list[Any]) -> set[str]:
+        from tests.unit.test_daemon_concierge import FakeGithub as ConciergeGithub, make
+
+        concierge, client, *_ = make(tmp_path, [{"text": "ok"}], github=ConciergeGithub())
+        concierge.submit_turn(
+            "@scout look into it",
+            author="ana",
+            allow_actions=True,
+            agent_role="planner",
+            agent_tools=agent_tools,
+        ).result(timeout=10)
+        (job,) = client.jobs
+        return {tool.name for tool in job.host_tools}
+
+    def test_the_unguarded_start_tools_are_withheld(self, tmp_path: Path) -> None:
+        work, _, _ = service(tmp_path / "work")
+        names = self._offered(tmp_path, offered(work, scout(can_start=["workload"])))
+        assert {"start_run", "file_issue"} <= names
+        assert names.isdisjoint(self.UNGUARDED)
+
+    def test_an_agent_that_declares_nothing_keeps_the_tools_it_had(self, tmp_path: Path) -> None:
+        names = self._offered(tmp_path, [])
+        assert names >= self.UNGUARDED

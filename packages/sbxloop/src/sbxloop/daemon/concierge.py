@@ -58,7 +58,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
-from sbxloop.agents.tools import AgentTool
+from sbxloop.agents.tools import UNGUARDED_START_TOOLS, WORK_TOOL_NAMES, AgentTool
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
@@ -1275,6 +1275,13 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
+        if any(tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools):
+            # An agent offered its own guarded start_run / file_issue starts
+            # work only through them: these check none of its can_start,
+            # chain depth, daily cap or dedupe, so leaving them beside the
+            # guarded pair would make every one of those a suggestion.
+            for name in UNGUARDED_START_TOOLS:
+                available.pop(name, None)
         for tool in self._turn_agent_tools:
             # Adapted to the roster's (args, by) shape; the agent acts as
             # itself, so who asked does not change what it keeps.

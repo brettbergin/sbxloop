@@ -197,6 +197,31 @@ class AgentWorkService:
             ),
         )
 
+    def _note_channel(self, request: IssueRequest, number: str) -> None:
+        """Leave the conversation the issue was filed from with the daemon,
+        so the item a poll later builds from it answers there -- the same
+        note the concierge leaves for an issue it files.
+
+        The channel is kept here, not in the origin marker: the issue body
+        is public, editable text, and a channel read back out of it would
+        let anyone who can write an issue route a run's result into a
+        conversation of their choosing. A note that cannot be written costs
+        the run its channel, never the issue that was already filed."""
+        if request.channel_id is None:
+            return
+        try:
+            self.loop.dstore.note_admission(
+                number, self.clock(), repo=request.repo, channel_id=request.channel_id
+            )
+        except Exception:
+            log.warning(
+                "agent_work.channel_note_failed",
+                agent=request.origin.agent_slug,
+                repo=request.repo,
+                number=number,
+                exc_info=True,
+            )
+
     # -- doing ----------------------------------------------------------------
 
     def start(self, request: StartRequest) -> str:
@@ -285,6 +310,7 @@ class AgentWorkService:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             raise ToolRejectedError(f"filing the issue failed: {exc}") from exc
         self._record(request, str(ref.url or ref.number), "code" if request.queue else "issue")
+        self._note_channel(request, str(ref.number))
         log.info(
             "agent_work.issue_filed",
             agent=request.origin.agent_slug,
