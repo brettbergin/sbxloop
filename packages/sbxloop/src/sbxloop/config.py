@@ -2960,6 +2960,30 @@ class AgentTeamConfig(_ConfigModel):
     progress_interval_s: float = Field(default=120.0, ge=0)
 
 
+class CollaborationConfig(_ConfigModel):
+    """What keeps agents talking to each other from running away.
+
+    An agent's reply is prose in a shared channel, so naming another agent
+    in it queues a turn by that agent. Without bounds two agents would
+    answer each other forever, so every follow-up passes these: how deep a
+    chain of agent-started turns may go, how many agent turns a channel and
+    a single agent may take within one window, and how long one agent waits
+    before addressing the same agent again. The channel's own silence and
+    the workspace token budget apply on top of them.
+    """
+
+    # How many agent-started turns may follow one human turn.
+    max_chain_depth: int = Field(default=4, ge=0, le=32)
+    # The window the two rate caps count within, in seconds.
+    window_s: float = Field(default=600.0, gt=0)
+    # Agent turns one channel may take within the window.
+    channel_turns_per_window: int = Field(default=20, ge=0)
+    # Agent turns one agent may take in a channel within the window.
+    agent_turns_per_window: int = Field(default=6, ge=0)
+    # How long one agent waits before addressing the same agent again.
+    pair_cooldown_s: float = Field(default=60.0, ge=0)
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # Runtime provenance, not operator knobs. Persisted so CLI precedence
@@ -3039,6 +3063,8 @@ class Config(_ConfigModel):
     # What agents may start on their own, how much of it, and what a run
     # says in the channel that asked for it.
     agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
+    # The bounds on agents addressing each other in a channel.
+    collaboration: CollaborationConfig = Field(default_factory=CollaborationConfig)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:

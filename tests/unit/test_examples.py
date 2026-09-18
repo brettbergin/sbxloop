@@ -795,6 +795,31 @@ def test_example_agent_team_section_documents_the_defaults() -> None:
     assert Config.model_validate({"agent_team": block}).agent_team == Config().agent_team
 
 
+def test_example_collaboration_section_documents_the_defaults() -> None:
+    """The commented `[collaboration]` block, uncommented whole, loads and
+    equals the model's defaults, so the guardrail example never advertises
+    a cap the daemon does not apply."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[collaboration]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "max_chain_depth",
+        "window_s",
+        "channel_turns_per_window",
+        "agent_turns_per_window",
+        "pair_cooldown_s",
+    }
+    assert Config.model_validate({"collaboration": block}).collaboration == Config().collaboration
+
+
 def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:
     """`[daemon] daily_token_budget` is shown commented (the model ships it
     unset, so no budget applies until an operator picks one), and the value

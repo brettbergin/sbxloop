@@ -95,6 +95,35 @@ a code run's checkout, is `404` like any other id from elsewhere.
   back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
 
+- **Agents address each other, under a person's control.** An agent's
+  reply is prose in a shared channel, so naming another agent in it now
+  addresses that agent: a follow-up turn is accepted for it, carrying
+  `trigger: "mention"`, the replying agent as its author, the reply as its
+  input message and one more `chain_depth`. A mention inside a code fence,
+  an inline code span or a block quote addresses nobody, an agent never
+  addresses itself, and one reply reaches at most four agents. Every
+  follow-up passes the new `[collaboration]` guardrails first — a chain
+  depth (default 4), a per-channel and a per-agent cap within a window
+  (20 and 6 per 10 minutes), a cooldown per ordered pair (60s), the
+  channel's silence and the workspace token budget — and each decision,
+  allowed or refused, records `collaboration.followup.queued` or
+  `collaboration.followup.suppressed` with its reason and never the
+  message text. A follow-up answers as a peer request, never as the
+  person's: the other agent's message is framed as that agent speaking,
+  with read-only tools and no handoff, and an agent still to answer in the
+  same turn is not addressed a second time. `POST /v1/channels/{id}/stop`
+  cancels the channel's turns, the runs its work is executing and the work
+  it queued (`cancelled_items`), for any member who may post, and silences
+  it,
+  `POST /v1/channels/{id}/resume` lifts that, and
+  `PUT /v1/channels/{id}/silence` quiets the agents without cancelling
+  anything; all three need only the right to post, because the person
+  watching is the guard that matters. `PUT /v1/channels/{id}/read` records
+  how far the caller has read, and the channel now reports `unread_count`.
+  Advertised as `collaboration.channel_stop`, `collaboration.silence` and
+  `collaboration.read_state`. `handoff_agent`, the peer request inside one
+  turn, is unchanged.
+
 - **A mention asks an agent to answer, not to queue a run.** Naming an
   agent in a chat turn used to rewrite the turn's intent to `delegate`,
   and the agent was told that anything it could not produce in the chat is
