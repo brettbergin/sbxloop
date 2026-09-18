@@ -427,6 +427,12 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "You have no scope of your own to police" in text
     assert "The topic is never yours to judge" in flat
     assert 'or "want me to queue a workload?"** — the ask *is* the yes' in flat
+    # a mention is a request to answer: an ask the reply itself can satisfy is
+    # answered in the reply, and managed work is for everything else
+    assert "**Answer here what a reply can answer.**" in text
+    assert "Being mentioned is not a request to queue anything." in flat
+    assert "**Never queue work in place of an answer you could write**" in flat
+    assert "an ask this reply can satisfy is answered, not queued" in flat
 
 
 def test_review_prompt_carries_contract() -> None:

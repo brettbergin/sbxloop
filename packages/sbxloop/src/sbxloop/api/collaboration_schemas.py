@@ -539,10 +539,15 @@ class TurnCreate(ApiModel):
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)
-    intent: Literal["conversation", "delegate", "code", "workload"] = "conversation"
+    intent: Literal["conversation", "delegate", "code", "workload", "auto"] = "conversation"
 
 
 class ParticipantOut(ApiModel):
+    """One agent's slot in a turn. ``assignees`` is set on the first slot of
+    a turn that may start managed work: the run roles the turn's mentions
+    declare, as ``role -> agent slug``, which admission uses to assign the
+    run."""
+
     agent_slug: str | None
     status: str
     error: str | None = None
@@ -550,6 +555,7 @@ class ParticipantOut(ApiModel):
     parent_index: int | None = None
     request: str | None = None
     read_only: bool = False
+    assignees: dict[str, str] | None = None
 
 
 class ChannelParticipantOut(ApiModel):
@@ -591,6 +597,7 @@ class TurnOut(ApiModel):
     author_id: str | None = None
     trigger: str | None = None
     parent_turn_id: str | None = None
+    intent: str | None = None
 
 
 class TurnAccepted(ApiModel):

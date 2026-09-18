@@ -4457,6 +4457,7 @@
       },
       "ParticipantOut": {
         "additionalProperties": false,
+        "description": "One agent's slot in a turn. ``assignees`` is set on the first slot of\na turn that may start managed work: the run roles the turn's mentions\ndeclare, as ``role -> agent slug``, which admission uses to assign the\nrun.",
         "properties": {
           "agent_slug": {
             "anyOf": [
@@ -4468,6 +4469,20 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "assignees": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignees"
           },
           "error": {
             "anyOf": [
@@ -6639,7 +6654,8 @@
               "conversation",
               "delegate",
               "code",
-              "workload"
+              "workload",
+              "auto"
             ],
             "title": "Intent",
             "type": "string"
@@ -6710,6 +6726,17 @@
           "input_message_id": {
             "title": "Input Message Id",
             "type": "string"
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intent"
           },
           "parent_turn_id": {
             "anyOf": [

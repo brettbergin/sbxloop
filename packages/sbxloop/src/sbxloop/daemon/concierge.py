@@ -204,6 +204,10 @@ class TurnContext:
     history: str | None = None
     persona: str | None = None
     allow_actions: bool = True
+    #: Whether the turn may start managed work (a workload, an issue for a
+    #: run, a scan or a schedule); a turn that may only reply keeps its
+    #: other tools.
+    start_work: bool = True
     role: Role = "concierge"
     read_only: bool = False
     handoff: Callable[[str, str], str] | None = None
@@ -529,6 +533,10 @@ class Concierge:
         return self._turn.allow_actions
 
     @property
+    def _turn_start_work(self) -> bool:
+        return self._turn.start_work
+
+    @property
     def _turn_role(self) -> Role:
         return self._turn.role
 
@@ -592,6 +600,7 @@ class Concierge:
         session_key: str | None = None,
         persona: str | None = None,
         allow_actions: bool = True,
+        start_work: bool = True,
         history: str | None = None,
         agent_role: Role = "concierge",
         read_only: bool = False,
@@ -620,7 +629,8 @@ class Concierge:
         usage is charged in the workspace budget pool: the product channel
         it answers and the agent that speaks (the role when unset);
         ``agent_tools`` are the answering agent's own tools (its memory),
-        offered only when the turn may act.
+        offered only when the turn may act. ``start_work`` false withholds
+        the tools that start managed work, so the turn can only reply.
         ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
         this turn starts is admitted with: the channel it answers to, the
         lead and the agent per run role (already checked by the caller)."""
@@ -647,6 +657,7 @@ class Concierge:
                 history=history,
                 persona=persona,
                 allow_actions=allow_actions,
+                start_work=start_work,
                 role=agent_role,
                 read_only=read_only,
                 handoff=handoff,
@@ -906,7 +917,12 @@ class Concierge:
             persona += (
                 "\n\nThis is an ordinary conversation turn. Do not perform or promise any "
                 "operation. No host or MCP tools are available. Explain that the person can "
-                "explicitly delegate work or mention an agent when action is wanted."
+                "select the Code, Workload or Auto mode when action is wanted."
+            )
+        elif not self._turn_start_work:
+            persona += (
+                "\n\nThis turn cannot start managed work: no workload, issue, scan or "
+                "schedule tools are available. Answer in this reply."
             )
         history = ""
         if self._turn_history:
@@ -1232,6 +1248,12 @@ class Concierge:
             if self._turn_role == "critic" or self._turn_read_only
             else offered
         )
+        if not self._turn_start_work:
+            # A turn that may only reply (a conversation that mentions an
+            # agent) keeps its read tools but none that start managed work.
+            available = {
+                name: tool for name, tool in available.items() if name not in UNGUARDED_START_TOOLS
+            }
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]
             if self._turn_role != "concierge":
@@ -1283,6 +1305,10 @@ class Concierge:
             for name in UNGUARDED_START_TOOLS:
                 available.pop(name, None)
         for tool in self._turn_agent_tools:
+            if not self._turn_start_work and tool.spec.name in WORK_TOOL_NAMES:
+                # A turn that may only reply gets none of an agent's own
+                # start tools either, whatever its can_start declares.
+                continue
             # Adapted to the roster's (args, by) shape; the agent acts as
             # itself, so who asked does not change what it keeps.
             available[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
