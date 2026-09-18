@@ -439,6 +439,76 @@ class AuthorOut(ApiModel):
     display_name: str | None = None
 
 
+BridgeBackendName = Literal["discord", "slack", "mattermost"]
+
+
+class MessageOriginOut(ApiModel):
+    """The bridge surface a message arrived on, for a message that did."""
+
+    backend: str
+    surface_id: str
+    external_message_id: str | None = None
+
+
+class BridgeOut(ApiModel):
+    """A chat service this release can bridge, and whether it is set up."""
+
+    backend: BridgeBackendName
+    configured: bool
+    label: str
+
+
+class BridgePage(ApiModel):
+    data: list[BridgeOut]
+
+
+class ChannelLinkCreate(ApiModel):
+    """Link a surface of a chat service to this channel.
+
+    ``allow_guests`` admits people on that surface who have linked no
+    account: their messages are stored under the name they use there.
+    """
+
+    backend: BridgeBackendName
+    surface_id: str = Field(min_length=1, max_length=200)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=200)
+    allow_guests: bool = False
+
+
+class ChannelLinkOut(ApiModel):
+    id: str
+    channel_id: str
+    backend: BridgeBackendName
+    surface_id: str
+    thread_id: str | None = None
+    allow_guests: bool = False
+    created_by: str | None = None
+    created_at: str
+    active: bool = True
+
+
+class ChannelLinkPage(ApiModel):
+    data: list[ChannelLinkOut]
+
+
+class LinkCodeOut(ApiModel):
+    """A code to type on a bridge, once, to prove an account is yours."""
+
+    code: str
+    expires_at: str
+
+
+class ExternalIdentityOut(ApiModel):
+    backend: BridgeBackendName
+    external_user_id: str
+    display_name: str | None = None
+    verified_at: str
+
+
+class ExternalIdentityPage(ApiModel):
+    data: list[ExternalIdentityOut]
+
+
 class MessageOut(ApiModel):
     id: str
     channel_id: str
@@ -455,6 +525,8 @@ class MessageOut(ApiModel):
     #: Files this message carries, readable by anyone who can read the
     #: channel (feature ``collaboration.message_artifacts``).
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    #: Where the message arrived from, when it came over a bridge.
+    origin: MessageOriginOut | None = None
 
 
 class ReactionSet(ApiModel):

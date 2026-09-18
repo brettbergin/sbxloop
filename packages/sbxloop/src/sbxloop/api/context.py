@@ -37,11 +37,13 @@ from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
     Message,
     Turn,
+    guest_user,
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
@@ -355,6 +357,38 @@ class ApiContext:
                     intent=turn.intent,
                 )
             return turn, message, created
+
+    def accept_bridge_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+    ) -> tuple[Turn, Message]:
+        """Accept a message from a linked bridge surface as a turn in the
+        channel that surface mirrors.
+
+        A mapped author answers as themselves. A guest — only where the link
+        admits one — has no account, so the turn runs for a stand-in carrying
+        the name they use on that service: no preferences to read, and no
+        standing to hand work off with.
+        """
+        store = self.collaboration
+        with self._turn_admission:
+            turn, message = store.accept_linked_turn(
+                link,
+                content=content,
+                author_user_id=author_user_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                now=self.clock(),
+            )
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else guest_user(display_name)
+            self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
+        return turn, message
 
     def start_collaboration_turn(
         self,

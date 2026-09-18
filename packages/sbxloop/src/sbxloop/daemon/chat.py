@@ -64,7 +64,7 @@ from sbxloop.daemon.chat_choices import (
     match_free_text,
     render_prose,
 )
-from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message
+from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message, strip_mentions
 from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.discord_format import (
@@ -807,6 +807,15 @@ class ChatBridge(ABC):
             # to fall between them. It is control-channel traffic, and the
             # answer goes to ``msg.channel``, which is still the thread.
             surface = control
+        if not msg.author_is_bot and not is_run_thread:
+            # A linked surface is a window onto a collaboration channel, so
+            # what is typed there belongs to that channel rather than to the
+            # daemon-wide concierge. Steering a run keeps its thread, and
+            # ``!sbx`` still runs an operator command (``link`` among them).
+            link = self._channel_link(msg)
+            if link is not None:
+                self._handle_linked(msg, link)
+                return
         route = route_message(
             content=msg.content,
             channel_id=surface,
@@ -842,6 +851,189 @@ class ChatBridge(ABC):
             self._schedule(self._concierge_turn(msg, self._choice_from_typed(msg, route.text)))
         elif route.kind == "steer":
             self._steer(msg, route.text)
+
+    # -- linked surfaces (a channel's window on this service) -----------------------
+
+    def _api_ctx(self) -> Any:
+        """The remote API's context, when this daemon serves one. It is what
+        holds the collaboration store and accepts channel turns; a daemon
+        without it has no channels, and every linked path is off."""
+        return getattr(self.loop_ref, "api_ctx", None)
+
+    def _collaboration(self) -> Any:
+        ctx = self._api_ctx()
+        return None if ctx is None else ctx.collaboration
+
+    def _channel_link(self, msg: Inbound) -> Any:
+        """The active link for the surface this message arrived on, or None.
+
+        A thread is looked up as a thread first (``parent`` is the channel it
+        lives in), then the surface itself, so linking a whole channel and
+        linking one thread in it both work.
+        """
+        store = self._collaboration()
+        if store is None or msg.channel_id is None:
+            return None
+        try:
+            if msg.parent_channel_id:
+                threaded = store.link_for_surface(
+                    self.backend, str(msg.parent_channel_id), str(msg.channel_id)
+                )
+                if threaded is not None:
+                    return threaded
+            return store.link_for_surface(self.backend, str(msg.channel_id), None)
+        except Exception:
+            # A link nobody can read is not a reason to drop the message:
+            # fall through to the behaviour an unlinked surface has.
+            self.log.warning("chat.link_lookup_failed", surface=msg.channel_id, exc_info=True)
+            return None
+
+    def _handle_linked(self, msg: Inbound, link: Any) -> None:
+        """Route a message on a linked surface: a command, or a channel turn.
+
+        Linking a channel makes a surface a window on it; it does not make
+        the people on that surface operators. ``route_message`` confines
+        operator commands to the control channel and to a run thread, and a
+        link must not widen that: anywhere else the only command is
+        ``link``, which claims an identity and touches no daemon state.
+        """
+        text = strip_mentions(
+            (msg.content or "").strip(), self._bot_user_id(), mention_re=self.mention_re
+        )
+        prefix = self.chat.command_prefix
+        if text.startswith(prefix):
+            cmd = text[len(prefix) :].strip()
+            if self._may_command(msg, cmd):
+                self._ack(msg, ACK_RECEIVED)
+                self._schedule(self._command(msg, cmd))
+            else:
+                self._schedule(self._refuse_command(msg, cmd))
+            return
+        if not text:
+            return
+        self._ack(msg, ACK_RECEIVED)
+        self._schedule(self._linked_turn(msg, link, text))
+
+    def _may_command(self, msg: Inbound, cmd: str) -> bool:
+        """May this command run from the surface it was typed on? Only on
+        the control channel — the operator surface ``route_message`` already
+        trusts — or when it is ``link``, which is identity, not control."""
+        if (cmd.split() or [""])[0].lower() == "link":
+            return True
+        control = self.chat.channel_ref or None
+        return (
+            control is not None
+            and msg.channel_id is not None
+            and str(msg.channel_id) == str(control)
+        )
+
+    async def _refuse_command(self, msg: Inbound, cmd: str) -> None:
+        """Say no to an operator command typed on a linked surface, and say
+        what this surface is for instead."""
+        # Whatever they typed is quoted back, so clip it: the word is theirs,
+        # not ours, and an inline span is no place for a paragraph.
+        word = _clip((cmd.split() or [""])[0].lower() or "that", 40)
+        self.log.info(
+            "chat.linked_command_refused",
+            backend=self.backend,
+            surface=msg.channel_id,
+            command=word,
+        )
+        await self._ack_now(msg, ACK_FAILED)
+        usage = code(f"{self.chat.command_prefix} link CODE")
+        await self._send(
+            msg.channel,
+            f"{code(word)} runs where I take operator commands, not here. "
+            f"This surface takes {usage} and whatever you want to say to the channel.",
+            reply_to=msg.raw,
+        )
+
+    async def _linked_turn(self, msg: Inbound, link: Any, text: str) -> None:
+        """One message on a linked surface, as a turn in its channel."""
+        ctx = self._api_ctx()
+        store = self._collaboration()
+        if ctx is None or store is None:
+            return
+        external_id = "" if msg.author_id is None else str(msg.author_id)
+        user_id = store.identity_user(self.backend, external_id) if external_id else None
+        if user_id is None and not link.allow_guests:
+            await self._ack_now(msg, ACK_FAILED)
+            usage = code(f"{self.chat.command_prefix} link CODE")
+            await self._send(
+                msg.channel,
+                f"I do not know whose account that is. Link yours with {usage}, "
+                "using a code from your profile.",
+                reply_to=msg.raw,
+            )
+            return
+        accept = functools.partial(
+            ctx.accept_bridge_turn,
+            link,
+            content=text,
+            author_user_id=user_id,
+            display_name=msg.author_name,
+            external_message_id=str(msg.message_id or ""),
+        )
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, accept)
+        except Exception as exc:
+            self.log.warning("chat.linked_turn_failed", channel=link.channel_id, exc_info=True)
+            await self._ack_now(msg, ACK_FAILED)
+            await self._send(msg.channel, f"⚠ {_one_line(str(exc), 300)}", reply_to=msg.raw)
+            return
+        await self._ack_now(msg, ACK_ANSWERED)
+
+    async def _link_identity(self, msg: Inbound, cmd: str) -> None:
+        """``!sbx link <code>``: prove that this service account is the one
+        behind a local user, with a code they asked their own profile for."""
+        store = self._collaboration()
+        parts = cmd.split()
+        value = parts[1] if len(parts) > 1 else ""
+        if store is None:
+            await self._send(msg.channel, "this daemon serves no accounts to link to.")
+            return
+        if not value:
+            await self._send(msg.channel, f"usage: {code(self.chat.command_prefix + ' link CODE')}")
+            return
+        if msg.author_id is None:
+            await self._send(msg.channel, "this service did not say who sent that.")
+            return
+        identity = store.redeem_link_code(
+            value,
+            backend=self.backend,
+            external_user_id=str(msg.author_id),
+            display_name=msg.author_name,
+            now=time.time(),
+        )
+        if identity is None:
+            await self._send(
+                msg.channel, "that code has been used or has expired; ask for a new one."
+            )
+            return
+        self.log.info("chat.identity_linked", backend=self.backend, user=identity.user_id)
+        await self._send(msg.channel, "linked — what you say on a linked surface now posts as you.")
+
+    def post_to_surface(self, surface_id: str, thread_id: str | None, text: str) -> None:
+        """Post text to a linked surface. Non-blocking: the send runs on the
+        bridge's own loop, like every other post this module makes."""
+        self._schedule(self._post_to_surface(surface_id, thread_id, text))
+
+    async def _post_to_surface(self, surface_id: str, thread_id: str | None, text: str) -> None:
+        try:
+            target = await self._link_target(surface_id, thread_id)
+        except Exception:
+            self.log.warning("chat.mirror_target_failed", surface=surface_id, exc_info=True)
+            return
+        if target is None:
+            return
+        for chunk in split_markdown(text, self.chat.max_message_chars):
+            await self._send(target, chunk)
+
+    async def _link_target(self, surface_id: str, thread_id: str | None) -> Any:
+        """The send target for a linked surface. On a service where a thread
+        id is a channel id of its own (Discord) this is the thread handle;
+        the services that address a thread as (channel, thread) override it."""
+        return await self._thread_handle(thread_id or surface_id)
 
     def _is_run_thread(self, channel_id: str | None) -> bool:
         """Is this surface a thread we opened for a run? The control channel
@@ -1626,6 +1818,11 @@ class ChatBridge(ABC):
             return
         loop = self.loop_ref
         channel = msg.channel
+        if (cmd.split() or [""])[0].lower() == "link":
+            # Identity, not daemon state: it needs the backend and the
+            # author, which the prose dispatcher never sees.
+            await self._link_identity(msg, cmd)
+            return
         if loop is None:
             await self._send(channel, "daemon loop not attached")
             return

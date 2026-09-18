@@ -3018,6 +3018,7 @@ def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
     from sbxloop.api.context import ApiContext
     from sbxloop.api.frontend import ApiFrontend
     from sbxloop.api.server import ApiServer
+    from sbxloop.daemon.channel_mirror import ChannelMirror
 
     ctx = ApiContext(
         config,
@@ -3029,6 +3030,13 @@ def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
     )
     server = ApiServer(create_app(ctx), config.api, ctx=ctx)
     frontend.add_observer(ApiFrontend(ctx.chronology, ctx.hub, ctx.projector, clock=ctx.clock))
+    # The bridges reach the channels through the loop, and the channels
+    # reach the bridges through the mirror: inbound and outbound halves of
+    # one channel link.
+    loop.api_ctx = ctx
+    ctx.collaboration.add_message_observer(
+        ChannelMirror(ctx.collaboration, frontend.bridge_for).message_appended
+    )
     server.start()
     return server
 

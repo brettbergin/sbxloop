@@ -11,16 +11,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
-from sbxloop.api.channel_access import ChannelAccess, ChannelRole, Need
+from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
 
 # The role names belong to this module's membership contract, so they are
 # re-exported explicitly (``X as X``) for strictly type-checked consumers.
@@ -36,10 +37,12 @@ from sbxloop.daemon.controls.principal import (
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
+    ChannelLinkRow,
     ChannelMemberRow,
     ChannelParticipantRow,
     ChannelRow,
     ChannelSummaryRow,
+    ExternalIdentityRow,
     LocalUserRow,
     MessageArtifactRow,
     MessageRow,
@@ -68,6 +71,8 @@ MAX_HANDOFF_DEPTH = 4
 HISTORY_MESSAGES = 200
 #: Characters one turn's history may spend on those messages.
 HISTORY_CHARS = 60_000
+#: How long a bridge identity link code is worth typing.
+LINK_CODE_TTL_S = 600.0
 
 
 class CollaborationError(Exception):
@@ -200,6 +205,32 @@ class ChannelSummary:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelLink:
+    """A bridge surface that mirrors a channel."""
+
+    id: str
+    channel_id: str
+    backend: str
+    surface_id: str
+    thread_id: str | None
+    allow_guests: bool
+    created_by: str | None
+    created_at: float
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalIdentity:
+    """Who a local user is on a bridge."""
+
+    backend: str
+    external_user_id: str
+    user_id: str
+    display_name: str | None
+    verified_at: float
+
+
 #: Who a store read or write is made for: a workspace member (or their user
 #: id, resolved to the member), or ``None`` for a plain API client or the
 #: daemon itself, which keep full access.
@@ -300,6 +331,23 @@ def _user(row: LocalUserRow) -> LocalUser:
     )
 
 
+def guest_user(display_name: str | None) -> LocalUser:
+    """The stand-in a guest's turn runs for: a name, and nothing else. Its
+    empty id belongs to no member, so every check that reads it refuses."""
+    name = (display_name or "guest").strip() or "guest"
+    return LocalUser(
+        id="",
+        client_id="",
+        username=name,
+        email="",
+        full_name=name,
+        timezone="UTC",
+        active=True,
+        created_at=0.0,
+        updated_at=0.0,
+    )
+
+
 def _role(value: str) -> Role:
     for role in ROLES:
         if role == value:
@@ -359,6 +407,28 @@ def message_author(role: str, kind: str, agent_slug: str | None, owner_id: str |
     if kind in SYSTEM_MESSAGE_KINDS:
         return SYSTEM_AUTHOR
     return Author("agent", agent_slug or ANGIE_SLUG)
+
+
+def bridge_origin(
+    backend: str, surface_id: str, external_message_id: str, author_name: str | None = None
+) -> dict[str, Any]:
+    """Where a message that arrived over a bridge came from. ``author_name``
+    rides along for a guest, who has no account to read a name from."""
+    origin: dict[str, Any] = {
+        "backend": backend,
+        "surface_id": surface_id,
+        "external_message_id": external_message_id,
+    }
+    if author_name:
+        origin["author_name"] = author_name
+    return origin
+
+
+def _origin_name(origin: dict[str, Any] | None) -> str | None:
+    if not isinstance(origin, dict):
+        return None
+    name = origin.get("author_name")
+    return str(name) if name else None
 
 
 def _human_name(session: Any, user_id: str | None) -> str | None:
@@ -476,6 +546,53 @@ def _participant_activity(
     )
 
 
+def _channel_link(row: ChannelLinkRow) -> ChannelLink:
+    return ChannelLink(
+        id=str(row.id),
+        channel_id=str(row.channel_id),
+        backend=str(row.backend),
+        surface_id=str(row.surface_id),
+        thread_id=None if row.thread_id is None else str(row.thread_id),
+        allow_guests=bool(row.allow_guests),
+        created_by=None if row.created_by is None else str(row.created_by),
+        created_at=float(row.created_at),
+        active=bool(row.active),
+    )
+
+
+def _identity(row: ExternalIdentityRow) -> ExternalIdentity:
+    return ExternalIdentity(
+        backend=str(row.backend),
+        external_user_id=str(row.external_user_id),
+        user_id=str(row.user_id),
+        display_name=None if row.display_name is None else str(row.display_name),
+        verified_at=float(row.verified_at),
+    )
+
+
+def _active_link(
+    session: Any, backend: str, surface_id: str, thread_id: str | None
+) -> ChannelLinkRow | None:
+    """The one active link for a surface. ``thread_id`` is matched exactly,
+    including its absence, which SQLite's unique index cannot do for NULL."""
+    condition = (
+        ChannelLinkRow.thread_id.is_(None)
+        if thread_id is None
+        else ChannelLinkRow.thread_id == thread_id
+    )
+    found: ChannelLinkRow | None = session.scalars(
+        select(ChannelLinkRow)
+        .where(
+            ChannelLinkRow.backend == backend,
+            ChannelLinkRow.surface_id == surface_id,
+            condition,
+            ChannelLinkRow.active == 1,
+        )
+        .limit(1)
+    ).first()
+    return found
+
+
 def _latest_summary(session: Any, channel_id: str) -> ChannelSummary | None:
     """The newest compaction of a channel's history, if it has one."""
     row = session.scalars(
@@ -527,12 +644,17 @@ def _message(
 ) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
+    origin = json.loads(row.origin_json) if row.origin_json else None
     if row.kind == "work_result":
         # Runner results stored before attribution carry no author; they were Angie's.
         agent_slug = agent_slug or ANGIE_SLUG
         if isinstance(work, dict) and work.get("agent_slug") is None:
             work["agent_slug"] = ANGIE_SLUG
     author = _author(session, row.author_kind, row.author_id)
+    if author is not None and author.kind == "human" and author.id is None:
+        # A guest on a linked surface: no account, so the name they use
+        # there is the only one there is, and it rides with the origin.
+        author = Author("human", None, _origin_name(origin))
     if author is None:
         # Written by a release that recorded no author.
         derived = message_author(
@@ -558,6 +680,7 @@ def _message(
             if attachments is None
             else attachments.get(str(row.id), ())
         ),
+        origin=origin,
     )
 
 
@@ -659,6 +782,11 @@ def _event(
 class CollaborationStore:
     def __init__(self, dstore: DaemonStore) -> None:
         self.dstore = dstore
+        #: Called with every message appended to a channel, after commit.
+        self._message_observers: list[Callable[[Message], None]] = []
+        #: Outstanding bridge identity link codes: code -> (user, expiry).
+        self._link_codes: dict[str, tuple[str, float]] = {}
+        self._link_code_lock = threading.Lock()
 
     # -- local profile -------------------------------------------------------------
 
@@ -1720,6 +1848,245 @@ class CollaborationStore:
                 if participant.get("status") == "running"
             }
 
+    # -- bridge links and external identities --------------------------------------
+
+    def add_message_observer(self, observer: Callable[[Message], None]) -> None:
+        """Hear every message appended to a channel, after it is committed.
+
+        The mirror that posts channel traffic out to linked bridge surfaces
+        is one; an observer that raises is logged and never fails the write.
+        """
+        self._message_observers.append(observer)
+
+    def _appended(self, message: Message | None) -> Message | None:
+        """Tell the observers about ``message``; returns it, so a caller can
+        end with ``return self._appended(...)``."""
+        if message is not None:
+            for observer in tuple(self._message_observers):
+                try:
+                    observer(message)
+                except Exception:
+                    log.warning("collaboration.message_observer_failed", exc_info=True)
+        return message
+
+    def list_channel_links(self, viewer: Viewer, channel_id: str) -> list[ChannelLink]:
+        with self.dstore.read() as session:
+            _access(session, channel_id, viewer, "manage")
+            rows = session.scalars(
+                select(ChannelLinkRow)
+                .where(ChannelLinkRow.channel_id == channel_id, ChannelLinkRow.active == 1)
+                .order_by(ChannelLinkRow.created_at.asc())
+            )
+            return [_channel_link(row) for row in rows]
+
+    def create_channel_link(
+        self,
+        viewer: Viewer,
+        channel_id: str,
+        *,
+        backend: str,
+        surface_id: str,
+        thread_id: str | None,
+        allow_guests: bool,
+        created_by: str | None,
+        now: float,
+    ) -> ChannelLink:
+        """Link a bridge surface to the channel.
+
+        Takes managing the channel *and* administering the workspace: a link
+        makes the channel capture what everyone on that surface says and post
+        its own traffic there, which reaches past the channel. A run's thread
+        belongs to its run and is refused.
+        """
+        if backend == "discord" and thread_id is not None:
+            # A Discord thread is a channel of its own: messages typed there
+            # arrive with the thread's id as their channel, and a post to it
+            # goes to that id. So the thread is the surface.
+            surface_id, thread_id = thread_id, None
+        # A run's thread is recorded once, when the run opens it, so reading
+        # it ahead of the write transaction races nothing that matters.
+        run_thread = self.dstore.run_for_thread(thread_id or surface_id, backend) is not None
+        with self.dstore.immediate_transaction() as session:
+            _, member = _access(session, channel_id, viewer, "manage", now=now)
+            if member is not None and member.role not in MANAGING_ROLES:
+                raise CollaborationError(
+                    "channel_forbidden", "linking a surface takes a workspace admin"
+                )
+            if run_thread:
+                raise CollaborationError(
+                    "link_run_thread", "that surface is a run's thread and cannot be linked"
+                )
+            if _active_link(session, backend, surface_id, thread_id) is not None:
+                raise CollaborationError(
+                    "link_exists", "that surface is already linked to a channel"
+                )
+            if thread_id is not None:
+                # A retired link to this thread would trip the unique index
+                # (NULL threads never do). Nothing reads a retired row, since
+                # each message carries its own origin, so it gives way.
+                session.execute(
+                    delete(ChannelLinkRow).where(
+                        ChannelLinkRow.backend == backend,
+                        ChannelLinkRow.surface_id == surface_id,
+                        ChannelLinkRow.thread_id == thread_id,
+                        ChannelLinkRow.active == 0,
+                    )
+                )
+            link_id = "lnk_" + _token(16)
+            session.execute(
+                insert(ChannelLinkRow).values(
+                    id=link_id,
+                    channel_id=channel_id,
+                    backend=backend,
+                    surface_id=surface_id,
+                    thread_id=thread_id,
+                    allow_guests=1 if allow_guests else 0,
+                    created_by=created_by,
+                    created_at=now,
+                    active=1,
+                )
+            )
+            _event(
+                session,
+                "collaboration.link.added",
+                now,
+                data={"channel_id": channel_id, "link_id": link_id, "backend": backend},
+            )
+            row = session.get(ChannelLinkRow, link_id)
+            assert row is not None  # nosec B101 - just inserted
+            return _channel_link(row)
+
+    def delete_channel_link(
+        self, viewer: Viewer, channel_id: str, link_id: str, now: float
+    ) -> None:
+        """Retire a link. The row stays, inactive, so the messages that named
+        the surface keep an origin that can still be read back."""
+        with self.dstore.immediate_transaction() as session:
+            _access(session, channel_id, viewer, "manage", now=now)
+            row = session.get(ChannelLinkRow, link_id)
+            if row is None or str(row.channel_id) != channel_id or not row.active:
+                raise CollaborationError("link_not_found", "link not found")
+            row.active = 0
+            _event(
+                session,
+                "collaboration.link.removed",
+                now,
+                data={"channel_id": channel_id, "link_id": link_id, "backend": str(row.backend)},
+            )
+
+    def link_for_surface(
+        self, backend: str, surface_id: str, thread_id: str | None = None
+    ) -> ChannelLink | None:
+        """The active link for a surface, or None when it is not linked."""
+        with self.dstore.read() as session:
+            row = _active_link(session, backend, surface_id, thread_id)
+            return None if row is None else _channel_link(row)
+
+    def create_link_code(self, user_id: str, now: float) -> tuple[str, float]:
+        """A short code the person types on a bridge to prove who they are.
+
+        Codes live in this process only: they are single use and expire in
+        minutes, so a daemon restart costs one retyped code rather than a
+        table of half-finished identities.
+        """
+        expires_at = now + LINK_CODE_TTL_S
+        code = _token(8)
+        with self._link_code_lock:
+            self._link_codes = {
+                value: pending for value, pending in self._link_codes.items() if pending[1] > now
+            }
+            self._link_codes[code] = (user_id, expires_at)
+        return code, expires_at
+
+    def redeem_link_code(
+        self,
+        code: str,
+        *,
+        backend: str,
+        external_user_id: str,
+        display_name: str | None,
+        now: float,
+    ) -> ExternalIdentity | None:
+        """Spend a code: map this bridge account to the user who asked for
+        it. An unknown, spent or expired code maps nothing."""
+        with self._link_code_lock:
+            pending = self._link_codes.pop(code.strip(), None)
+        if pending is None or pending[1] <= now:
+            return None
+        return self.link_identity(
+            pending[0],
+            backend=backend,
+            external_user_id=external_user_id,
+            display_name=display_name,
+            now=now,
+        )
+
+    def link_identity(
+        self,
+        user_id: str,
+        *,
+        backend: str,
+        external_user_id: str,
+        display_name: str | None,
+        now: float,
+    ) -> ExternalIdentity:
+        """Map a bridge account to a local one, replacing any earlier map."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(ExternalIdentityRow, (backend, external_user_id))
+            if row is None:
+                row = ExternalIdentityRow(
+                    backend=backend,
+                    external_user_id=external_user_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    verified_at=now,
+                )
+                session.add(row)
+            else:
+                row.user_id = user_id
+                row.display_name = display_name
+                row.verified_at = now
+            return _identity(row)
+
+    def identity_user(self, backend: str, external_user_id: str) -> str | None:
+        """The local user a bridge account belongs to, or None.
+
+        A map outlives the membership it was made under, so the membership
+        is what answers: a user who has been removed from the workspace or
+        deactivated is no longer anybody here, exactly as ``_resolve`` has
+        it. The caller then treats the author as unmapped and the link's
+        own ``allow_guests`` rule decides what happens to the message.
+        """
+        with self.dstore.read() as session:
+            row = session.get(ExternalIdentityRow, (backend, external_user_id))
+            if row is None:
+                return None
+            member = _member_in(session, str(row.user_id))
+            if member is None or not member.user.active:
+                return None
+            return str(row.user_id)
+
+    def list_identities(self, user_id: str) -> list[ExternalIdentity]:
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(ExternalIdentityRow)
+                .where(ExternalIdentityRow.user_id == user_id)
+                .order_by(ExternalIdentityRow.backend.asc())
+            )
+            return [_identity(row) for row in rows]
+
+    def unlink_identity(self, user_id: str, backend: str) -> bool:
+        with self.dstore.immediate_transaction() as session:
+            rows = session.scalars(
+                select(ExternalIdentityRow).where(
+                    ExternalIdentityRow.user_id == user_id,
+                    ExternalIdentityRow.backend == backend,
+                )
+            ).all()
+            for row in rows:
+                session.delete(row)
+            return bool(rows)
+
     # -- messages and turns --------------------------------------------------------
 
     @staticmethod
@@ -1908,7 +2275,107 @@ class CollaborationStore:
                     "author_id": user_id,
                 },
             )
-            return _turn(session, turn_row), _message(session, message_row), True
+            accepted = (_turn(session, turn_row), _message(session, message_row), True)
+        self._appended(accepted[1])
+        return accepted
+
+    def accept_linked_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+        now: float,
+    ) -> tuple[Turn, Message]:
+        """Append a message that arrived on a linked bridge surface, and the
+        turn that answers it.
+
+        The link is the authorization: whoever may post on the surface the
+        channel's owner linked posts here. A mapped author is credited to
+        their account; a guest (only where the link admits one) is a human
+        with no account, named by the handle they use on that service.
+        """
+        origin = bridge_origin(
+            link.backend,
+            link.surface_id,
+            external_message_id,
+            None if author_user_id else display_name,
+        )
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, link.channel_id)
+            if channel is None or channel.state != "active":
+                raise CollaborationError("channel_not_found", "channel not found")
+            turn_id = "trn_" + _token(16)
+            message_id = "msg_" + _token(16)
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=link.channel_id,
+                    turn_id=turn_id,
+                    sequence=self._next_sequence(session, link.channel_id),
+                    role="user",
+                    kind="message",
+                    content=content,
+                    reactions_json=json.dumps(["⏳"]),
+                    created_at=now,
+                    author_kind="human",
+                    author_id=author_user_id,
+                    origin_json=json.dumps(origin),
+                )
+            )
+            session.execute(
+                insert(TurnRow).values(
+                    id=turn_id,
+                    channel_id=link.channel_id,
+                    input_message_id=message_id,
+                    status="accepted",
+                    targets_json=json.dumps([]),
+                    intent="conversation",
+                    participants_json=json.dumps(
+                        [
+                            {
+                                "agent_slug": None,
+                                "status": "queued",
+                                "error": None,
+                                "read_only": False,
+                            }
+                        ]
+                    ),
+                    created_at=now,
+                    author_kind="human",
+                    author_id=author_user_id,
+                    trigger="human",
+                    chain_depth=0,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            turn_row = session.get(TurnRow, turn_id)
+            message_row = session.get(MessageRow, message_id)
+            assert turn_row is not None and message_row is not None  # nosec B101
+            _event(
+                session,
+                "collaboration.turn.accepted",
+                now,
+                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": []},
+            )
+            _event(
+                session,
+                "collaboration.message.created",
+                now,
+                data={
+                    "channel_id": link.channel_id,
+                    "message_id": message_id,
+                    "sequence": message_row.sequence,
+                    "author_kind": "human",
+                    "author_id": author_user_id,
+                },
+            )
+            accepted = (_turn(session, turn_row), _message(session, message_row))
+        self._appended(accepted[1])
+        return accepted
 
     def start_turn(self, turn_id: str, now: float) -> bool:
         with self.dstore.transaction() as session:
@@ -1989,7 +2456,8 @@ class CollaborationStore:
                     "author_id": author_id,
                 },
             )
-            return _message(session, row)
+            appended = _message(session, row)
+        return self._appended(appended)
 
     def append_work_result(
         self,
@@ -2049,7 +2517,8 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "turn_id": turn_id, "message_id": message_id},
             )
-            return _message(session, row)
+            delivered = _message(session, row)
+        return self._appended(delivered)
 
     @staticmethod
     def _attach_artifacts(
@@ -2268,6 +2737,10 @@ class CollaborationStore:
             return _message(session, row)
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
+        # A turn that ends badly leaves the only answer the asker gets, and
+        # a linked surface hears about it the same way it hears about a
+        # reply: through the observers, once the write has committed.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
@@ -2333,6 +2806,10 @@ class CollaborationStore:
                         "author_id": None,
                     },
                 )
+                session.flush()
+                message_row = session.get(MessageRow, message_id)
+                if message_row is not None:
+                    appended = _message(session, message_row)
             session.flush()
             _event(
                 session,
@@ -2340,7 +2817,9 @@ class CollaborationStore:
                 now,
                 data={"channel_id": row.channel_id, "turn_id": row.id, "error": error},
             )
-            return _turn(session, row)
+            finished = _turn(session, row)
+        self._appended(appended)
+        return finished
 
     def recover_turns(self, now: float) -> list[tuple[Turn, LocalUser, str]]:
         """Settle interrupted execution and return only work that never started.
@@ -2377,10 +2856,28 @@ class CollaborationStore:
                     interrupted.append((row.id, expected <= replies))
                     continue
                 channel = session.get(ChannelRow, row.channel_id)
+                message = session.get(MessageRow, row.input_message_id)
+                stored_origin = message.origin_json if message is not None else None
+                origin = json.loads(stored_origin) if stored_origin else None
+                if row.author_kind == "human" and row.author_id is None and origin:
+                    # A guest on a linked surface: the turn runs for the same
+                    # stand-in it would have run for live, never for the
+                    # channel's owner, whose identity would answer a stranger.
+                    if channel and channel.state == "active" and message:
+                        queued.append(
+                            (
+                                message.sequence,
+                                _turn(session, row),
+                                guest_user(_origin_name(origin)),
+                                message.content,
+                            )
+                        )
+                    else:
+                        interrupted.append((row.id, False))
+                    continue
                 author_id = row.author_id if row.author_kind == "human" else None
                 user_id = author_id or (channel.user_id if channel else None)
                 user = session.get(LocalUserRow, user_id) if user_id else None
-                message = session.get(MessageRow, row.input_message_id)
                 if user is not None and not self._may_read(session, row.channel_id, user.id):
                     user = None
                 if channel and channel.state == "active" and user and user.active and message:
@@ -2760,6 +3257,9 @@ class CollaborationStore:
             )
         message = message.strip()
         key = hashlib.sha256(json.dumps([source_index, agent_slug, message]).encode()).hexdigest()
+        # One agent asking another is channel traffic like any other, so the
+        # observers — and through them a linked surface — hear it too.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             try:
                 channel, _ = _access(session, channel_id, user_id, "post", now=now)
@@ -2857,7 +3357,13 @@ class CollaborationStore:
                     "message_id": message_id,
                 },
             )
-            return f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+            session.flush()
+            message_row = session.get(MessageRow, message_id)
+            if message_row is not None:
+                appended = _message(session, message_row)
+            queued = f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+        self._appended(appended)
+        return queued
 
     # -- teams ---------------------------------------------------------------------
 

@@ -16,6 +16,37 @@ naming the next offset, and never hands back bytes that are not text.
 
 ### Added
 
+- **A channel can have a window onto Slack, Discord or Mattermost.** A
+  bridge surface linked to a channel stops routing to the daemon-wide
+  concierge: what people type there becomes a turn in that channel, with
+  its own history and the agents in it, credited to whoever's account the
+  author is mapped to. People map themselves once, with
+  `POST /v1/users/me/identities/link-code` and `!sbx link <code>` typed on
+  the bridge; `GET` and `DELETE /v1/users/me/identities` show and undo it.
+  An author nobody has mapped is refused with a short reply, unless the
+  link was created with `allow_guests`, in which case the message is stored
+  as a person with no account under the name they use there; an account
+  that has since left the workspace, or been deactivated, counts as
+  unmapped again, so revoking someone's access here revokes it on the
+  bridge too. Outbound, every message appended to a linked channel is
+  posted to each linked surface under a `**name**` header, never back to
+  the surface it arrived on, so two services mirror each other without
+  looping; a failed or cancelled turn's message and one agent's request to
+  another travel that way as well, so an ask that fails is answered on the
+  surface it came from. `GET /v1/bridges` lists the services and whether
+  one is configured here, and `GET`, `POST` and
+  `DELETE /v1/channels/{id}/links` manage a channel's links (creating one
+  takes managing the channel and a workspace owner or admin, and a run's
+  thread cannot be linked; a Discord thread is linked as a surface of its
+  own). A guest's turn that a daemon restart interrupts before it starts
+  resumes for the guest, never for the channel's owner. Messages gain `origin`, naming the surface a message arrived
+  on. Linking a surface grants nobody operator powers: a link cannot widen
+  where `!sbx` runs, so on a linked surface that is not the control channel
+  the only command is `!sbx link`, and every other one is refused with a
+  note saying where it does run. Commands on the control channel,
+  run-thread steering and an unlinked surface behave exactly as before.
+  Advertised as `collaboration.bridges`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -24,9 +24,11 @@ from sbxloop.api.collaboration import (
     ArtifactRef,
     Author,
     Channel,
+    ChannelLink,
     ChannelMember,
     ChannelParticipant,
     CollaborationError,
+    ExternalIdentity,
     LocalUser,
     Member,
     Message,
@@ -39,8 +41,13 @@ from sbxloop.api.collaboration import (
 from sbxloop.api.collaboration_schemas import (
     ArtifactRefOut,
     AuthorOut,
+    BridgeOut,
+    BridgePage,
     ChannelArtifactPage,
     ChannelCreate,
+    ChannelLinkCreate,
+    ChannelLinkOut,
+    ChannelLinkPage,
     ChannelMemberCreate,
     ChannelMemberOut,
     ChannelMemberPage,
@@ -56,10 +63,14 @@ from sbxloop.api.collaboration_schemas import (
     ConnectionOut,
     ConnectionTestOut,
     DetailOut,
+    ExternalIdentityOut,
+    ExternalIdentityPage,
+    LinkCodeOut,
     LocalLoginRequest,
     LocalRegisterRequest,
     LocalUserOut,
     LocalUserUpdate,
+    MessageOriginOut,
     MessageOut,
     ParticipantOut,
     PreferenceDefinitionOut,
@@ -83,6 +94,7 @@ from sbxloop.api.models import TokenResponse, rfc3339
 from sbxloop.api.routes.agents import addressable
 from sbxloop.api.routes.artifacts import stream_artifact
 from sbxloop.api.routes.auth import grant_tokens
+from sbxloop.chatservices import CHAT_SERVICES
 
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
@@ -331,6 +343,7 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         reactions=list(message.reactions),
         author=_author_out(message.author, ctx),
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
+        origin=_origin_out(message.origin),
     )
 
 
@@ -341,6 +354,19 @@ def _artifact_ref_out(ref: ArtifactRef) -> ArtifactRefOut:
         relpath=ref.relpath,
         media_type=ref.media_type,
         size=ref.size,
+    )
+
+
+def _origin_out(origin: dict[str, Any] | None) -> MessageOriginOut | None:
+    """The three public facts of a message's origin. The stored value may
+    carry more — a guest's name, which is served as the author instead."""
+    if not isinstance(origin, dict) or not origin.get("backend"):
+        return None
+    external = origin.get("external_message_id")
+    return MessageOriginOut(
+        backend=str(origin["backend"]),
+        surface_id=str(origin.get("surface_id") or ""),
+        external_message_id=None if external is None else str(external),
     )
 
 
@@ -1420,6 +1446,155 @@ async def download_channel_artifact(
     if artifact is None:
         raise Problem(404, "artifact_not_found", "artifact not found")
     return await stream_artifact(ctx, artifact.id)
+
+
+# -- bridges, channel links and external identities -------------------------------
+
+
+def _link_out(link: ChannelLink) -> ChannelLinkOut:
+    return ChannelLinkOut(
+        id=link.id,
+        channel_id=link.channel_id,
+        backend=link.backend,  # type: ignore[arg-type]
+        surface_id=link.surface_id,
+        thread_id=link.thread_id,
+        allow_guests=link.allow_guests,
+        created_by=link.created_by,
+        created_at=rfc3339(link.created_at) or "",
+        active=link.active,
+    )
+
+
+def _identity_out(identity: ExternalIdentity) -> ExternalIdentityOut:
+    return ExternalIdentityOut(
+        backend=identity.backend,  # type: ignore[arg-type]
+        external_user_id=identity.external_user_id,
+        display_name=identity.display_name,
+        verified_at=rfc3339(identity.verified_at) or "",
+    )
+
+
+@router.get("/bridges", response_model=BridgePage)
+async def list_bridges(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+) -> BridgePage:
+    """The chat services a channel can be linked to, and whether this daemon
+    has one set up. An unconfigured service can still be linked: the link
+    starts working when the operator configures the bridge."""
+    return BridgePage(
+        data=[
+            BridgeOut(
+                backend=service.name,  # type: ignore[arg-type]
+                configured=bool(ctx.config.chat_section(service.name).enabled),  # type: ignore[arg-type]
+                label=service.label,
+            )
+            for service in CHAT_SERVICES
+        ]
+    )
+
+
+@router.get("/channels/{channel_id}/links", response_model=ChannelLinkPage)
+async def list_channel_links(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelLinkPage:
+    """The bridge surfaces mirroring this channel; takes managing it."""
+    try:
+        links = await ctx.call(ctx.collaboration.list_channel_links, member, channel_id)
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    return ChannelLinkPage(data=[_link_out(link) for link in links])
+
+
+@router.post("/channels/{channel_id}/links", response_model=ChannelLinkOut, status_code=201)
+async def create_channel_link(
+    channel_id: str,
+    body: ChannelLinkCreate,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelLinkOut:
+    """Mirror a bridge surface into this channel; takes managing it and a
+    workspace owner or admin. A surface carries one link, so a second one
+    is refused, and a run's thread cannot be linked."""
+    try:
+        link = await ctx.call(
+            ctx.collaboration.create_channel_link,
+            member,
+            channel_id,
+            backend=body.backend,
+            surface_id=body.surface_id,
+            thread_id=body.thread_id,
+            allow_guests=body.allow_guests,
+            created_by=member.user.id,
+            now=ctx.clock(),
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return _link_out(link)
+
+
+@router.delete("/channels/{channel_id}/links/{link_id}", status_code=204)
+async def delete_channel_link(
+    channel_id: str,
+    link_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> Response:
+    try:
+        await ctx.call(
+            ctx.collaboration.delete_channel_link, member, channel_id, link_id, ctx.clock()
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return Response(status_code=204)
+
+
+@router.post("/users/me/identities/link-code", response_model=LinkCodeOut, status_code=201)
+async def create_link_code(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> LinkCodeOut:
+    """A code to type on a bridge, as ``!sbx link <code>``, so messages you
+    send on a linked surface post under this account. It is single use and
+    short-lived, and this is the only place it is shown."""
+    code, expires_at = await ctx.call(
+        ctx.collaboration.create_link_code, member.user.id, ctx.clock()
+    )
+    return LinkCodeOut(code=code, expires_at=rfc3339(expires_at) or "")
+
+
+@router.get("/users/me/identities", response_model=ExternalIdentityPage)
+async def list_identities(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ExternalIdentityPage:
+    identities = await ctx.call(ctx.collaboration.list_identities, member.user.id)
+    return ExternalIdentityPage(data=[_identity_out(value) for value in identities])
+
+
+@router.delete("/users/me/identities/{backend}", status_code=204)
+async def delete_identity(
+    backend: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> Response:
+    """Forget who this account is on a bridge. Messages already stored keep
+    the author they were written with."""
+    removed = await ctx.call(ctx.collaboration.unlink_identity, member.user.id, backend)
+    if not removed:
+        raise Problem(404, "identity_not_found", "no identity is linked on that service")
+    ctx.hub.notify()
+    return Response(status_code=204)
 
 
 __all__ = ["router"]
