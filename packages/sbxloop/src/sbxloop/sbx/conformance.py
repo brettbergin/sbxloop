@@ -73,6 +73,10 @@ PROBE_API_HOST_UNREACHABLE = "api-host-unreachable"
 VERDICT_STDIN_DELIVERS = "delivers"
 VERDICT_STDIN_NO_DELIVERY = "no-delivery"
 
+# The remote API's default port (`[api] port`), probed when no config says
+# otherwise.
+API_PROBE_PORT = 8420
+
 VERDICT_ERROR = "error"
 VERDICT_UNPROBED = "unprobed"
 
@@ -87,6 +91,8 @@ class ProbeContext:
     cli: SbxCLI
     sandbox: Sandbox | None = None  # the shared scratch sandbox (deep runs)
     workspace: Path | None = None  # host dir the scratch sandbox was created on
+    api_bind: str | None = None  # `[api] bind`: the address the listener serves on
+    api_port: int = API_PROBE_PORT  # `[api] port`
 
 
 @dataclass(frozen=True)
@@ -414,14 +420,22 @@ def _probe_secret_exists_error(ctx: ProbeContext) -> tuple[str, str]:
         _cleanup_probe_secret(ctx.cli, _DUP_PROBE_ENV, name)
 
 
-# The remote API's default port (`[api] port`), and the marker the in-VM
-# script carries so a fake sbx can answer it without touching a network.
-API_PROBE_PORT = 8420
+# The marker the in-VM script carries so a fake sbx can answer it without
+# touching a network.
 API_PROBE_MARKER = "SBXLOOP_API_REACH_PROBE"
-_API_PROBE_SCRIPT = f"""\
-# {API_PROBE_MARKER}
-import socket
-PORT = {API_PROBE_PORT}
+# Addresses that name no destination: a listener bound to one serves every
+# host address, which the loopback and gateway targets already cover.
+_UNSPECIFIED_BINDS = frozenset({"0.0.0.0", "::", "[::]", "*"})  # nosec B104 - compared, never bound
+# argv: the API port, then any further hosts to try. Each target is asked
+# for the API's own liveness answer twice, directly and through the
+# sandbox's proxy environment; only that answer counts as reaching the
+# API. A bare connect proves nothing: sbx's network layer accepts
+# connections its policy then drops unanswered.
+_API_PROBE_SCRIPT = f"""# {API_PROBE_MARKER}
+import json
+import sys
+import urllib.request
+PORT = int(sys.argv[1])
 def gateway():
     try:
         for line in open("/proc/net/route").read().splitlines()[1:]:
@@ -433,14 +447,21 @@ def gateway():
         return None
     return None
 gw = gateway()
-targets = [("127.0.0.1", PORT)] + ([(gw, PORT)] if gw else [])
+hosts = ["127.0.0.1", "host.docker.internal"] + ([gw] if gw else []) + sys.argv[2:]
+routes = (
+    ("direct", urllib.request.build_opener(urllib.request.ProxyHandler({{}}))),
+    ("proxy", urllib.request.build_opener()),
+)
 reached = []
-for host, port in targets:
-    try:
-        socket.create_connection((host, port), timeout=3).close()
-        reached.append(host)
-    except OSError:
-        pass
+for host in dict.fromkeys(hosts):
+    netloc = "[" + host + "]" if ":" in host else host
+    for route, opener in routes:
+        try:
+            with opener.open("http://" + netloc + ":" + str(PORT) + "/health/live", timeout=3) as r:
+                if json.loads(r.read(4096)) == {{"status": "ok"}}:
+                    reached.append(host + "/" + route)
+        except Exception:
+            pass
 if reached:
     print("reachable " + ",".join(reached))
 else:
@@ -451,25 +472,30 @@ else:
 def _probe_api_host_unreachable(ctx: ProbeContext) -> tuple[str, str]:
     """Whether a worker sandbox can reach the host's remote API (#1041).
 
-    Two facts, from inside the scratch sandbox and from the policy: a TCP
-    connect to the API's default port on the guest's own loopback and on
-    its default gateway (the host side of the VM's network), and the
-    network policy's answer for those two addresses. ``unreachable`` is
-    both refused; ``reachable`` a connect that succeeded; ``policy-allows``
-    nothing listening but a policy that would let a connection through —
-    the listener would be reachable the day it binds beyond loopback.
+    Two facts, from inside the scratch sandbox and from the policy: a
+    request for the API's liveness answer on the API port, sent directly
+    and through the sandbox's proxy, to the guest's own loopback,
+    ``host.docker.internal``, the guest's default gateway (the host side of
+    the VM's network) and the configured ``[api] bind`` address; and the
+    network policy's answer for those addresses. ``unreachable`` is no
+    answer from the API and a policy that denies them all; ``reachable``
+    the API answered; ``policy-allows`` no answer but a policy that would
+    let a connection through. A connection that opens and then closes
+    unanswered is not reachable: sbx accepts connections its policy drops.
     """
     assert ctx.sandbox is not None
-    result = ctx.sandbox.exec(["python3", "-c", _API_PROBE_SCRIPT])
+    extra = [ctx.api_bind] if ctx.api_bind and ctx.api_bind not in _UNSPECIFIED_BINDS else []
+    result = ctx.sandbox.exec(["python3", "-c", _API_PROBE_SCRIPT, str(ctx.api_port), *extra])
     line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
     verdict, _, detail = line.partition(" ")
     if verdict == "reachable":
-        return "reachable", f"connected to the API port from the sandbox: {detail}"
+        return "reachable", f"the API answered from inside the sandbox: {detail}"
     if verdict != "unreachable":
         return "unknown", f"the in-sandbox probe answered {line!r} (rc={result.returncode})"
     hosts = ["127.0.0.1"]
     if detail.startswith("gateway="):
         hosts.append(detail.removeprefix("gateway="))
+    hosts.extend(host for host in extra if host not in hosts)
     allowed: list[str] = []
     for host in hosts:
         try:
@@ -478,8 +504,9 @@ def _probe_api_host_unreachable(ctx: ProbeContext) -> tuple[str, str]:
         except SbxError as exc:
             return "unknown", f"policy check for {host} failed: {exc}"
     if allowed:
-        return "policy-allows", f"no listener answered, but the policy allows {', '.join(allowed)}"
-    return "unreachable", f"connect refused and policy denies {', '.join(hosts)}"
+        allows = ", ".join(allowed)
+        return "policy-allows", f"the API did not answer, but the policy allows {allows}"
+    return "unreachable", f"the API did not answer and policy denies {', '.join(hosts)}"
 
 
 CATALOG: tuple[Probe, ...] = (
@@ -606,13 +633,14 @@ CATALOG: tuple[Probe, ...] = (
     ),
     Probe(
         id=PROBE_API_HOST_UNREACHABLE,
-        summary="the host's remote API port is unreachable from inside a worker sandbox",
+        summary="the host's remote API never answers a request from inside a worker sandbox",
         tier="sandbox",
         expected="unreachable",
         depends="the remote API's isolation claim: a worker sandbox can never call the "
-        "listener the daemon serves beside it (the sandbox network policy never names "
-        "the host, and the listener binds loopback) — a reachable or policy-allows "
-        "verdict means an agent could steer its own daemon",
+        "listener the daemon serves beside it, on loopback, the VM gateway, "
+        "host.docker.internal or the [api] bind address (the sandbox network policy never "
+        "names the host) — a reachable or policy-allows verdict means an agent could "
+        "steer its own daemon",
         run=_probe_api_host_unreachable,
     ),
 )
@@ -817,6 +845,8 @@ def run_conformance(
     template: str | None = None,
     resources: SandboxResources | None = None,
     progress: ProgressFn | None = None,
+    api_bind: str | None = None,
+    api_port: int = API_PROBE_PORT,
 ) -> ConformanceReport:
     """Run the probe catalog and reconcile with the version-keyed cache.
 
@@ -851,7 +881,9 @@ def run_conformance(
         report_progress("creating scratch sandbox for deep probes (first boot can be slow)")
         sandbox, workspace = _scratch_sandbox(cli, home, template, resources)
         try:
-            ctx = ProbeContext(cli, sandbox=sandbox, workspace=workspace)
+            ctx = ProbeContext(
+                cli, sandbox=sandbox, workspace=workspace, api_bind=api_bind, api_port=api_port
+            )
             for probe in sandbox_probes:
                 report_progress(f"probing {probe.id}")
                 note(_run_probe(probe, ctx))

@@ -976,9 +976,13 @@ A worker sandbox can never reach the daemon's API. Two facts hold it:
   refuses a bare address, a loopback name, a container runtime's host
   alias and `*` (`tests/unit/test_api_isolation.py`).
 - `sbxloop doctor --deep` probes it live: the `api-host-unreachable`
-  conformance probe connects from inside a scratch sandbox to the API's
-  port on the guest's loopback and on its default gateway, and asks the
-  network policy about both addresses. Anything but `unreachable` fails the
+  conformance probe asks, from inside a scratch sandbox, for the API's
+  `/health/live` answer on `[api] port` at the guest's loopback,
+  `host.docker.internal`, its default gateway and the `[api] bind` address,
+  both directly and through the sandbox's proxy, and asks the network
+  policy about those addresses. Only the API's own answer counts as
+  reachable: sbx accepts connections its policy then closes unanswered, so
+  an opened connection proves nothing. Anything but `unreachable` fails the
   drift gate on CI runners.
 
 **Field-unverified:** the probe's verdict against a real sbx release is
