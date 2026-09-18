@@ -3767,6 +3767,25 @@
               }
             ]
           },
+          "post_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "plan",
+                  "progress",
+                  "review",
+                  "delivery",
+                  "reply",
+                  "notice"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Kind"
+          },
           "reactions": {
             "items": {
               "type": "string"

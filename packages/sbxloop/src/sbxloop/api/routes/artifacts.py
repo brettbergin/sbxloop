@@ -170,6 +170,7 @@ async def download_artifact(
     """The bytes, as an attachment: never rendered, never a path the
     client chose, opened relative to the run's own directory without
     following a link out of it. ``410`` once the run was pruned."""
+    await ctx.call(lambda: _admit(ctx, auth, lambda: _lookup(ctx, artifact_id), _lookup_run))
     return await stream_artifact(ctx, artifact_id)
 
 
@@ -179,7 +180,7 @@ async def stream_artifact(ctx: ApiContext, artifact_id: str) -> StreamingRespons
     already decided that the artifact is theirs to read."""
 
     def prepare() -> tuple[Artifact, RunRecord, Any]:
-        artifact, record = _admit(ctx, auth, lambda: _lookup(ctx, artifact_id), _lookup_run)
+        artifact, record = _lookup(ctx, artifact_id)
         if not artifact.available:
             raise Problem(
                 410, "artifact_gone", "the run's payload was pruned", artifact_id=artifact.id

@@ -39,8 +39,8 @@ from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
-from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.channel_posts import ApiChannelPoster
+from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
     ChannelLink,
