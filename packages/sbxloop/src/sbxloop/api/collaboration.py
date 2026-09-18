@@ -2156,13 +2156,16 @@ class CollaborationStore:
         now: float,
         intent: str = "conversation",
         participants: tuple[str, ...] = (),
+        assignees: dict[str, str] | None = None,
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
         A repeated client turn id returns the original resources. A reused id
         with different text is rejected instead of silently changing meaning.
         ``participants`` are the agents the message mentions: each one not in
-        the channel yet joins it, answering when mentioned.
+        the channel yet joins it, answering when mentioned. ``assignees`` are
+        the run roles those mentions declare on a turn that may start managed
+        work; they ride the first participant slot, where admission reads them.
         """
         with self.dstore.immediate_transaction() as session:
             channel, _ = _access(session, channel_id, user_id, "post", now=now)
@@ -2221,8 +2224,13 @@ class CollaborationStore:
                                 "status": "queued",
                                 "error": None,
                                 "read_only": target == "critic",
+                                **(
+                                    {"assignees": dict(assignees)}
+                                    if assignees and index == 0
+                                    else {}
+                                ),
                             }
-                            for target in (targets or (None,))
+                            for index, target in enumerate(targets or (None,))
                         ]
                     ),
                     created_at=now,

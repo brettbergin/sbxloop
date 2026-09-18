@@ -185,6 +185,29 @@ decompose/build/review/fix/CI/merge lifecycle, and the workload runner owns its
 plan/execute/judge/revise/publish lifecycle. Explicit runner intents cannot be
 combined with `target_slugs`.
 
+A mention is a request to reply. It records the agent as a target and joins it
+to the channel, but it no longer rewrites the turn's `intent`: a turn sent as a
+`conversation` stays one. The mentioned agent keeps its read tools but is not
+offered the tools that start managed work, so it answers in the chat, and says
+which intent to pick when the ask needs execution, external sources, a
+repository change or a produced file. A turn that may start work (`delegate`,
+`code`, `workload` or `auto`) is told to answer whatever the reply itself can
+satisfy — a list, an explanation, a short plan, an opinion, a judgement about
+work already in the channel — and to start managed work only for those asks.
+`TurnOut` carries the recorded `intent` back.
+
+When `/v1/capabilities` lists `collaboration.lead_orchestrator`, `intent` also
+accepts `auto`: the client does not know whether the ask is a question or a
+piece of work, and the lead decides for that turn whether to answer, start a
+code run or start a workload. `auto` accepts mentions and `target_slugs` the way
+a conversation does.
+
+On a turn that may start managed work (`intent` `code`, `workload` or `auto`),
+the agents the message mentions that declare a run role are recorded on the
+first entry of `participants` as `assignees`, a `role -> agent slug` map, and
+work admitted from that turn is assigned from it. Other turns leave `assignees`
+null.
+
 Team members receive separate role-scoped sessions and their replies are
 persisted as separate messages. Conversational peers choose their own bounded
 handoffs and may return review findings to an author or coordinator for revision
