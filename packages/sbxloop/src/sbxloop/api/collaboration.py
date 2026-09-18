@@ -39,6 +39,7 @@ from sbxloop.daemon.controls.principal import (
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
+    AgentMemoryRow,
     ChannelLinkRow,
     ChannelMemberRow,
     ChannelParticipantRow,
@@ -334,6 +335,54 @@ class Workflow:
     enabled: bool
     created_at: float
     updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class MergeReport:
+    """What :meth:`CollaborationStore.merge_users` moved, or would move.
+
+    ``moved`` counts rows per kind, in a stable order. A preference both
+    accounts hold keeps the target's value and is named in
+    ``preference_conflicts``; a team or workflow whose slug the target
+    already uses moves under a new slug, listed as ``(old, new)``.
+    """
+
+    source_id: str
+    source_username: str
+    target_id: str
+    target_username: str
+    dry_run: bool
+    moved: dict[str, int]
+    preference_conflicts: tuple[str, ...]
+    renamed_teams: tuple[tuple[str, str], ...]
+    renamed_workflows: tuple[tuple[str, str], ...]
+    #: The provider identity that moved to the target, if the source had one.
+    identity: tuple[str, str] | None
+    #: The target's workspace role before and after the merge.
+    previous_role: Role | None
+    role: Role
+
+
+#: Workspace roles, weakest first: a merge keeps the stronger of two.
+_ROLE_RANK: dict[str, int] = {"member": 0, "admin": 1, "owner": 2}
+_CHANNEL_ROLE_RANK: dict[str, int] = {"member": 0, "owner": 1}
+
+
+class _DryRun(Exception):
+    """Unwinds a dry-run merge's transaction, carrying what it found."""
+
+    def __init__(self, report: MergeReport) -> None:
+        super().__init__("dry run")
+        self.report = report
+
+
+def _free_slug(taken: set[str], slug: str) -> str:
+    candidate = f"{slug}-merged"
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{slug}-merged{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _user(row: LocalUserRow) -> LocalUser:
@@ -1222,6 +1271,311 @@ class CollaborationStore:
                 select(LocalUserRow).where(LocalUserRow.username == username.strip())
             ).first()
             return None if row is None else _user(row)
+
+    def find_user(self, selector: str) -> LocalUser | None:
+        """The user a selector names: a user id, or else a username."""
+        selector = selector.strip()
+        with self.dstore.read() as session:
+            row = session.get(LocalUserRow, selector)
+            if row is None:
+                row = session.scalars(
+                    select(LocalUserRow).where(LocalUserRow.username == selector)
+                ).first()
+            return None if row is None else _user(row)
+
+    # -- merging two accounts --------------------------------------------------------
+
+    def merge_users(
+        self, source_id: str, target_id: str, now: float, *, dry_run: bool = False
+    ) -> MergeReport:
+        """Fold ``source_id`` into ``target_id``, in one immediate transaction.
+
+        This is for one person holding two accounts: typically a local
+        account and the one a provider's first sign-in created because it
+        shared no verified email to link by. Everything the source made or
+        belongs to moves to the target: channel ownership and membership
+        (the stronger channel role and the further read position are kept),
+        human message and turn authorship, teams, preferences (the target's
+        value wins a clash), workflows, agent memories the source authored,
+        the invites it created, its bridge identities and the events meant
+        for it alone. The target keeps the stronger of the two workspace
+        roles.
+
+        The source's provider identity moves onto the target, which keeps
+        its username, email, password and ``auth_source``: an account that
+        still signs in with a password is ``local`` with a provider identity
+        recorded beside it, exactly as an email link leaves it. So both
+        sign-in methods reach the target afterwards. The source is then
+        deactivated, loses its membership, its provider identity and every
+        capability, and its refresh tokens are revoked, as a removed member's
+        are. The audit event names the two ids and nothing else.
+
+        Refused: merging a user into itself (``merge_same_user``), a user
+        that does not exist (``user_not_found``), an inactive target
+        (``merge_target_inactive``), and a target already bound to a
+        different provider identity than the source's
+        (``merge_identity_conflict``). ``dry_run`` does all of it inside the
+        transaction and rolls it back, so the report is exactly what a real
+        merge would do and nothing is written.
+        """
+        try:
+            with self.dstore.immediate_transaction() as session:
+                report = self._merge(session, source_id, target_id, now, dry_run=dry_run)
+                if dry_run:
+                    raise _DryRun(report)
+                return report
+        except _DryRun as unwound:
+            return unwound.report
+
+    def _merge(
+        self, session: Any, source_id: str, target_id: str, now: float, *, dry_run: bool
+    ) -> MergeReport:
+        if source_id == target_id:
+            raise CollaborationError("merge_same_user", "a user cannot be merged into itself")
+        source: LocalUserRow | None = session.get(LocalUserRow, source_id)
+        target: LocalUserRow | None = session.get(LocalUserRow, target_id)
+        if source is None or target is None:
+            missing = source_id if source is None else target_id
+            raise CollaborationError("user_not_found", f"no user {missing}")
+        if not target.active:
+            raise CollaborationError(
+                "merge_target_inactive", "the account to merge into is deactivated"
+            )
+        source_identity = (
+            None
+            if source.oidc_issuer is None or source.oidc_subject is None
+            else (str(source.oidc_issuer), str(source.oidc_subject))
+        )
+        target_identity = (
+            None
+            if target.oidc_issuer is None or target.oidc_subject is None
+            else (str(target.oidc_issuer), str(target.oidc_subject))
+        )
+        if target_identity is not None and target_identity != source_identity:
+            raise CollaborationError(
+                "merge_identity_conflict",
+                "the account to merge into already signs in through another provider identity",
+            )
+        moved: dict[str, int] = {}
+
+        def count(kind: str, result: Any) -> None:
+            moved[kind] = moved.get(kind, 0) + int(result.rowcount or 0)
+
+        # Channels the source owns or made.
+        count(
+            "channels",
+            session.execute(
+                update(ChannelRow).where(ChannelRow.user_id == source_id).values(user_id=target_id)
+            ),
+        )
+        session.execute(
+            update(ChannelRow)
+            .where(ChannelRow.created_by == source_id)
+            .values(created_by=target_id)
+        )
+        # Channel memberships: one row per channel, the stronger role and
+        # the further read position.
+        memberships = 0
+        for own in session.scalars(
+            select(ChannelMemberRow).where(ChannelMemberRow.user_id == source_id)
+        ).all():
+            theirs: ChannelMemberRow | None = session.get(
+                ChannelMemberRow, (own.channel_id, target_id)
+            )
+            if theirs is None:
+                session.execute(
+                    update(ChannelMemberRow)
+                    .where(
+                        ChannelMemberRow.channel_id == own.channel_id,
+                        ChannelMemberRow.user_id == source_id,
+                    )
+                    .values(user_id=target_id)
+                )
+            else:
+                if _CHANNEL_ROLE_RANK.get(str(own.role), 0) > _CHANNEL_ROLE_RANK.get(
+                    str(theirs.role), 0
+                ):
+                    theirs.role = own.role
+                theirs.last_read_sequence = max(
+                    int(theirs.last_read_sequence), int(own.last_read_sequence)
+                )
+                session.delete(own)
+            memberships += 1
+        session.flush()
+        session.expire_all()
+        moved["channel_memberships"] = memberships
+        session.execute(
+            update(ChannelMemberRow)
+            .where(ChannelMemberRow.added_by == source_id)
+            .values(added_by=target_id)
+        )
+        session.execute(
+            update(ChannelParticipantRow)
+            .where(
+                ChannelParticipantRow.added_by_kind == "human",
+                ChannelParticipantRow.added_by_id == source_id,
+            )
+            .values(added_by_id=target_id)
+        )
+        session.execute(
+            update(ChannelLinkRow)
+            .where(ChannelLinkRow.created_by == source_id)
+            .values(created_by=target_id)
+        )
+        # What the source said.
+        count(
+            "messages",
+            session.execute(
+                update(MessageRow)
+                .where(MessageRow.author_kind == "human", MessageRow.author_id == source_id)
+                .values(author_id=target_id)
+            ),
+        )
+        count(
+            "turns",
+            session.execute(
+                update(TurnRow)
+                .where(TurnRow.author_kind == "human", TurnRow.author_id == source_id)
+                .values(author_id=target_id)
+            ),
+        )
+        # Teams and workflows are unique per user by slug; a clash moves
+        # under a new slug rather than losing either.
+        renamed: dict[str, list[tuple[str, str]]] = {"teams": [], "workflows": []}
+        for kind, model in (("teams", TeamRow), ("workflows", WorkflowRow)):
+            taken = set(session.scalars(select(model.slug).where(model.user_id == target_id)).all())
+            rows = session.scalars(select(model).where(model.user_id == source_id)).all()
+            for row in rows:
+                slug = str(row.slug)
+                if slug in taken:
+                    new_slug = _free_slug(taken, slug)
+                    renamed[kind].append((slug, new_slug))
+                    row.slug = new_slug
+                    slug = new_slug
+                taken.add(slug)
+                row.user_id = target_id
+                row.updated_at = now
+            moved[kind] = len(rows)
+        session.flush()
+        # Preferences: the target's own answer wins.
+        target_names = set(
+            session.scalars(
+                select(PreferenceRow.name).where(PreferenceRow.user_id == target_id)
+            ).all()
+        )
+        conflicts: list[str] = []
+        preferences = 0
+        for pref in session.scalars(
+            select(PreferenceRow).where(PreferenceRow.user_id == source_id)
+        ).all():
+            if pref.name in target_names:
+                conflicts.append(str(pref.name))
+                session.delete(pref)
+            else:
+                pref.user_id = target_id
+                pref.updated_at = now
+                preferences += 1
+        moved["preferences"] = preferences
+        session.flush()
+        count(
+            "memories",
+            session.execute(
+                update(AgentMemoryRow)
+                .where(AgentMemoryRow.author == f"user:{source_id}")
+                .values(author=f"user:{target_id}")
+            ),
+        )
+        count(
+            "invites",
+            session.execute(
+                update(WorkspaceInviteRow)
+                .where(WorkspaceInviteRow.created_by == source_id)
+                .values(created_by=target_id)
+            ),
+        )
+        session.execute(
+            update(WorkspaceMemberRow)
+            .where(WorkspaceMemberRow.invited_by == source_id)
+            .values(invited_by=target_id)
+        )
+        count(
+            "bridge_identities",
+            session.execute(
+                update(ExternalIdentityRow)
+                .where(ExternalIdentityRow.user_id == source_id)
+                .values(user_id=target_id)
+            ),
+        )
+        count(
+            "private_events",
+            session.execute(
+                update(ApiEventRow)
+                .where(ApiEventRow.audience_user_id == source_id)
+                .values(audience_user_id=target_id)
+            ),
+        )
+        session.expire_all()
+        source = session.get(LocalUserRow, source_id)
+        target = session.get(LocalUserRow, target_id)
+        assert source is not None and target is not None  # nosec B101 - read above
+        # Workspace membership: the target keeps the stronger role.
+        source_member = self._member_row(session, source_id)
+        target_member = self._member_row(session, target_id)
+        previous_role: Role | None = (
+            None if target_member is None else _role(str(target_member.role))
+        )
+        candidates = [str(m.role) for m in (source_member, target_member) if m is not None]
+        role = _role(max(candidates, key=lambda r: _ROLE_RANK[r]) if candidates else "member")
+        if target_member is None:
+            session.add(
+                WorkspaceMemberRow(
+                    workspace_id=WORKSPACE_ID,
+                    user_id=target_id,
+                    role=role,
+                    created_at=now,
+                    invited_by=None,
+                )
+            )
+        else:
+            target_member.role = role
+        if source_member is not None:
+            session.delete(source_member)
+        session.flush()
+        # The provider identity moves: the source's row gives it up first,
+        # so the unique index never sees it twice.
+        source.oidc_issuer = None
+        source.oidc_subject = None
+        source.active = 0
+        source.updated_at = now
+        session.flush()
+        if source_identity is not None:
+            target.oidc_issuer, target.oidc_subject = source_identity
+        target.updated_at = now
+        self._grant_role(session, target, role)
+        self._grant_role(session, source, None)
+        self._revoke_refresh(session, str(source.client_id), now)
+        session.flush()
+        if not dry_run:
+            _event(
+                session,
+                "collaboration.user.merged",
+                now,
+                data={"source_user_id": source_id, "target_user_id": target_id},
+            )
+        return MergeReport(
+            source_id=source_id,
+            source_username=str(source.username),
+            target_id=target_id,
+            target_username=str(target.username),
+            dry_run=dry_run,
+            moved=moved,
+            preference_conflicts=tuple(conflicts),
+            renamed_teams=tuple(renamed["teams"]),
+            renamed_workflows=tuple(renamed["workflows"]),
+            identity=source_identity,
+            previous_role=previous_role,
+            role=role,
+        )
 
     def user_by_client(self, client_id: str) -> LocalUser | None:
         with self.dstore.read() as session:
@@ -2210,6 +2564,17 @@ class CollaborationStore:
             if row is None or row.silenced_until is None:
                 return None
             return float(row.silenced_until)
+
+    def may_post(self, viewer: Viewer, channel_id: str, now: float) -> bool:
+        """Whether ``viewer`` may post in the channel, by the same check
+        :meth:`set_silence` and a new turn make: the rule a channel stop
+        answers to, from chat as from ``POST /v1/channels/{id}/stop``."""
+        with self.dstore.transaction() as session:
+            try:
+                _access(session, channel_id, viewer, "post", now=now)
+            except CollaborationError:
+                return False
+            return True
 
     def set_silence(
         self, viewer: Viewer, channel_id: str, until: float | None, now: float

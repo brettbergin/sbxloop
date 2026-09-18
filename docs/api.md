@@ -1003,12 +1003,16 @@ alone, for the third), through the same cancel the API's
 `POST /v1/runs/{id}/cancel` uses. A message that merely argues for stopping
 is steering, not a stop.
 
-Both act as the person who wrote the message, with the capabilities their
-workspace role grants: a `member` holds `runs:steer` but not
-`runs:control`, so a member's mention steers and a member's `/stop` is
-refused with a reply saying so. Only a mention the person wrote steers; an
-agent reached through another agent's handoff answers the request it was
-handed.
+Both act as the person who wrote the message. A steer takes the
+capabilities their workspace role grants (`runs:steer`, which a `member`
+holds). A stop takes the rule `POST /v1/channels/{id}/stop` takes: anyone
+who may post in the channel may stop the runs that channel asked for,
+without `runs:control`, so a plain `member` may stop as well as steer. The
+cancel is recorded in the person's name and reaches only that channel's
+runs; someone who may not post there is told nothing was stopped. Only a
+message the person wrote steers or stops: a turn another agent started
+never does, and an agent reached through another agent's handoff answers
+the request it was handed.
 
 ### Who sees which events
 

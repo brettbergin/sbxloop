@@ -29,6 +29,18 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **`sbxloop users merge --from A --into B` folds one person's second
+  account into their first.** A provider that sends no verified email cannot
+  be linked to an existing local account, so the first sign-in through it
+  creates a separate one. The command (a dry run without `--yes`) moves that
+  account's channels, memberships, messages, turns, teams, preferences (the
+  target's value wins a clash), workflows, agent memories, invites and
+  bridge identities to the target in one immediate transaction, keeps the
+  stronger workspace role, moves the provider identity onto the target so
+  both the password and the provider sign in to it, and deactivates the
+  source with its refresh tokens revoked. `CollaborationStore.merge_users`
+  does the work; it records `collaboration.user.merged` with the two ids.
+
 - **A channel can have a window onto Slack, Discord or Mattermost.** A
   bridge surface linked to a channel stops routing to the daemon-wide
   concierge: what people type there becomes a turn in that channel, with
@@ -76,9 +88,12 @@ a code run's checkout, is `404` like any other id from elsewhere.
   ordinary turn. Only a person's own mention steers: an agent another agent
   hands off to answers the request it was handed. Stopping stays explicit:
   `/stop`, `/cancel` or exactly `@agent stop` cancels that channel's runs
-  through the same control service the API's cancel uses, as the person who
-  typed it and with their workspace role's capabilities, so a `member` (who
-  may steer but not cancel) is told they may not stop runs. New capability `collaboration.mention_steering`;
+  through the same control service the API's cancel uses. It takes the rule
+  `POST /v1/channels/{id}/stop` takes: anyone who may post in the channel
+  may stop the runs that channel asked for, so a plain `member` may stop as
+  well as steer, and the cancel is recorded in their name. Someone who may
+  not post there is told nothing was stopped, and a turn an agent started
+  never stops anything. New capability `collaboration.mention_steering`;
   revision 0031 adds the turn column. An instruction that names no target is
   answered exactly as before.
 
