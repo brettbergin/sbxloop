@@ -19,7 +19,7 @@ from typing import Any
 
 from sqlalchemy import insert, update
 
-from sbxloop.agents.posts import ArtifactRef, ChannelPost, ChannelPoster
+from sbxloop.agents.posts import ArtifactRef, ChannelPost, ChannelPoster, RunPostLedger
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.daemon.model import WorkItem
@@ -176,6 +176,84 @@ def test_the_channel_of_an_item_is_the_one_it_was_admitted_with(api: Any) -> Non
     assert api.ctx.poster.channel_for_item(item.item_id) == channel
     assert api.ctx.poster.channel_for_item(detached.item_id) == channel
     assert api.ctx.poster.channel_for_item("api:missing") is None
+
+
+def test_a_post_hangs_on_the_turn_that_asked_for_the_work(api: Any) -> None:
+    """A channel runs several turns at once, so the newest turn when a post
+    lands is routinely an unrelated question. A post that names the message
+    it answers is grouped under the turn that asked for the work."""
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    asked = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Give me a list of items to make bread"},
+    ).json()["turn"]
+    assert api.ctx.turns.wait_idle(timeout=5)
+    item = WorkItem(
+        item_id=chat_item_id(asked["input_message_id"]),
+        source_key=asked["input_message_id"],
+        title="Bread list",
+        body="Give me a list of items to make bread",
+        kind="workload",
+        channel_id=channel,
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.harness.clock.t += 10
+    newest = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Unrelated question"},
+    ).json()["turn"]
+    assert api.ctx.turns.wait_idle(timeout=5)
+    assert newest["id"] != asked["id"]
+
+    def _post(dedupe: str, reply_to: str | None) -> None:
+        api.ctx.poster.post(
+            ChannelPost(
+                channel_id=channel,
+                author_agent="planner",
+                kind="plan",
+                text="Split the ask into 5 tasks",
+                run_id="r1",
+                item_id=item.item_id,
+                dedupe_key=dedupe,
+                reply_to_message_id=reply_to,
+            )
+        )
+
+    _post("r1:plan", asked["input_message_id"])
+    # A post that names no message still finds the turn that asked for its
+    # work through the item, and never the channel's newest turn.
+    _post("r1:plan:unnamed", None)
+
+    posted = _messages(api, headers, channel)
+    assert [m["work"]["turn_id"] for m in posted] == [asked["id"], asked["id"]]
+
+
+def test_the_poster_knows_what_a_run_already_posted(api: Any) -> None:
+    """A resumed run counts the posts it made before towards its cap, so
+    the poster answers which keys a run has posted under."""
+    _headers, channel, item = _channel_with_work(api)
+    poster = api.ctx.poster
+    assert isinstance(poster, RunPostLedger)
+    assert poster.run_post_keys("r1") == frozenset()
+
+    for run_id, key in (("r1", "r1:plan"), ("r1", "r1:progress:t1"), ("r2", "r2:plan")):
+        poster.post(
+            ChannelPost(
+                channel_id=channel,
+                author_agent="planner",
+                kind="plan",
+                text="Split the ask into 2 tasks",
+                run_id=run_id,
+                item_id=item.item_id,
+                dedupe_key=key,
+            )
+        )
+
+    assert poster.run_post_keys("r1") == frozenset({"r1:plan", "r1:progress:t1"})
 
 
 def test_a_post_into_a_channel_that_is_gone_is_dropped(api: Any) -> None:

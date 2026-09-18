@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sbxloop.engine.model import RunKind
 
 __all__ = [
+    "BUILTIN_FOR_ROLE",
     "RUN_ROLES",
     "WORKING_PHASES",
     "AgentAssignment",
@@ -52,9 +53,10 @@ RUN_ROLES: tuple[RunRole, ...] = get_args(RunRole)
 WORKING_PHASES = frozenset({"build", "operator_execute"})
 
 #: The built-in agent for each role.
-_BUILTIN_FOR_ROLE: dict[str, str] = {
+BUILTIN_FOR_ROLE: dict[str, str] = {
     role: agent.slug for agent in PRIMARY_BUILTINS for role in agent.spec.roles
 }
+_BUILTIN_FOR_ROLE = BUILTIN_FOR_ROLE
 
 
 class MemoryBlocks(Protocol):

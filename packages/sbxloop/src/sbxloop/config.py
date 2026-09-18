@@ -2927,7 +2927,8 @@ class MemoryConfig(_ConfigModel):
 
 
 class AgentTeamConfig(_ConfigModel):
-    """What the agent team may do on its own initiative (S-A12).
+    """What the agent team may do on its own initiative (S-A12), and what a
+    run tells the channel that asked for it.
 
     An agent that declares ``can_start`` gets ``start_run`` and
     ``file_issue``. Two bounds keep that from becoming a spiral: how deep
@@ -2937,6 +2938,12 @@ class AgentTeamConfig(_ConfigModel):
     ``max_chain_depth = 0`` stops agent-started work entirely without
     editing every agent; ``max_agent_runs_per_day`` is the default an
     ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+
+    ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
+    replies, the delivery and any notice; ``"quiet"`` posts only what ends
+    a run (its delivery, and a notice when it stopped); ``"off"`` posts
+    nothing. The delivery and a terminal notice are posted whatever the
+    cap, because a run nobody hears finish is a run nobody can act on.
     """
 
     # Work a person asked for is depth 0; the run an agent starts from it
@@ -2944,6 +2951,13 @@ class AgentTeamConfig(_ConfigModel):
     max_chain_depth: int = Field(default=2, ge=0)
     # The daily cap for an agent whose spec names none.
     max_agent_runs_per_day: int = Field(default=4, ge=0)
+    # What a run posts in the channel that asked for it.
+    chronicle: Literal["normal", "quiet", "off"] = "normal"
+    # The most posts one run makes, across its resumes; the delivery and
+    # terminal notices are above it.
+    max_posts_per_run: int = Field(default=12, ge=1)
+    # Progress posts are coalesced to at most one this often.
+    progress_interval_s: float = Field(default=120.0, ge=0)
 
 
 class Config(_ConfigModel):
@@ -3022,7 +3036,8 @@ class Config(_ConfigModel):
     agents: list[AgentSpec] = Field(default_factory=list)
     # Each agent's long-term memory (bounds and the on/off switch).
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
-    # What agents may start on their own, and how much of it.
+    # What agents may start on their own, how much of it, and what a run
+    # says in the channel that asked for it.
     agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
 
     @model_validator(mode="after")

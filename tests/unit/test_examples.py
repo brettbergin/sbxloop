@@ -771,8 +771,9 @@ def test_example_memory_section_documents_the_defaults() -> None:
 
 def test_example_agent_team_section_documents_the_defaults() -> None:
     """The commented `[agent_team]` block, uncommented whole, loads and
-    equals the model's defaults: the example never advertises a chain depth
-    or a per-agent cap the daemon does not actually apply."""
+    equals the model's defaults: the example never advertises a chain depth,
+    a per-agent cap or a value for what a run says in its channel that the
+    daemon does not actually apply."""
     text = ""
     in_block = False
     for line in DEFAULT_CONFIG_TOML.splitlines():
@@ -784,7 +785,13 @@ def test_example_agent_team_section_documents_the_defaults() -> None:
         elif in_block and not line.strip():
             break
     block = tomllib.loads(text)
-    assert set(block) == {"max_chain_depth", "max_agent_runs_per_day"}
+    assert set(block) == {
+        "max_chain_depth",
+        "max_agent_runs_per_day",
+        "chronicle",
+        "max_posts_per_run",
+        "progress_interval_s",
+    }
     assert Config.model_validate({"agent_team": block}).agent_team == Config().agent_team
 
 

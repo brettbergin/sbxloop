@@ -123,6 +123,35 @@ a code run's checkout, is `404` like any other id from elsewhere.
   run from. An ask that genuinely needs work is still started without
   asking for confirmation, and nothing is ever refused as out of scope.
 
+- **A run tells the channel that asked for it what it is doing.** The new
+  `RunChronicle` turns a run's events into short posts under the name of
+  the agent that did the work: the plan by the planner ("Split the ask
+  into 5 tasks"), each task by its agent ("Finished task 2 of 5: ...", or
+  "Task failed: ..." when it broke), the verdict by the critic ("2
+  findings, 1 blocking"), a steering reply by the agent that was asked,
+  and the delivery (with the run's files and the pull request link) or a
+  notice by the lead. Only work that finished is counted, so a failed or
+  skipped task never reads as one more task done. A run publishing to
+  several sinks makes one delivery post, and it is the answer the chat
+  sink carried rather than the line about where a file landed; a run with
+  no chat sink names where its result went instead. Each post names the
+  message that asked for the work, so it joins that turn in a channel
+  running several at once. It is attached to a run whose item names a
+  channel, and re-attached on a resume, where the re-announced roster
+  restores the count of tasks already finished; each post carries a key
+  naming its moment, so a resumed or replayed run says each thing once. A
+  stop belongs to the segment that reached it, so a run an operator
+  resumes that fails again says so again. A merge a person approves at a
+  `[landing] merge_gate` or a review wait is the run's delivery, posted
+  as the engine's own merge would be.
+  `[agent_team] chronicle` (`normal`, `quiet`, `off`),
+  `max_posts_per_run` (12) and `progress_interval_s` (120) bound it:
+  progress is coalesced to one post per interval and a run is capped
+  across its resumes, but the delivery and a terminal notice are always
+  posted. A run no channel
+  asked for posts nothing, and nothing about a run with the built-in team
+  changes.
+
 - **A run can say what it is doing in the channel that asked for it.** A
   run linked to a channel posts under the name of the agent doing the
   work: an `agent_update` message with that agent as its author, the kind

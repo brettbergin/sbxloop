@@ -17,11 +17,12 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from sbxloop.agents.posts import ArtifactRef, ChannelPost
 from sbxloop.api.collaboration_schemas import ChannelWorkOut
 from sbxloop.api.publicids import run_public_id
-from sbxloop.db.collaboration_models import ChannelRow
+from sbxloop.db.collaboration_models import ChannelRow, ChannelRunPostRow
 from sbxloop.db.event_scope import channel_for_item
 from sbxloop.log import get_logger
 
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     from sbxloop.api.context import ApiContext
 
 log = get_logger(__name__)
+
+#: Files named on one post; the run's own catalog lists the rest.
+ARTIFACTS_MAX = 50
 
 
 def _artifacts(refs: Sequence[ArtifactRef]) -> list[dict[str, Any]]:
@@ -70,6 +74,30 @@ class ApiChannelPoster:
                 exc_info=True,
             )
             return None
+
+    def artifacts_for_run(self, run_id: str) -> tuple[ArtifactRef, ...]:
+        """The files ``run_id`` delivered and still has, by path, at most
+        :data:`ARTIFACTS_MAX`."""
+        return tuple(
+            ArtifactRef(
+                id=artifact.id,
+                run_id=artifact.run_id,
+                relpath=artifact.relpath,
+                media_type=artifact.media_type,
+                size=artifact.size,
+            )
+            for artifact in self.ctx.artifacts.for_run(run_id)
+            if artifact.available
+        )[:ARTIFACTS_MAX]
+
+    def run_post_keys(self, run_id: str) -> frozenset[str]:
+        """The dedupe keys ``run_id`` has posted under, in any segment."""
+        with self.ctx.loop.dstore.read() as session:
+            return frozenset(
+                session.scalars(
+                    select(ChannelRunPostRow.dedupe_key).where(ChannelRunPostRow.run_id == run_id)
+                )
+            )
 
     def channel_for_item(self, item_id: str) -> str | None:
         try:
