@@ -2193,6 +2193,15 @@ class CollaborationStore:
             row = session.get(MessageRow, message_id)
             return None if row is None else str(row.content)
 
+    def get_message(self, channel_id: str, message_id: str) -> Message | None:
+        """One message of a channel, read for the daemon rather than for a
+        viewer: the subject an ambient decision is made about."""
+        with self.dstore.read() as session:
+            row = session.get(MessageRow, message_id)
+            if row is None or str(row.channel_id) != channel_id:
+                return None
+            return _message(session, row)
+
     def silenced_until(self, channel_id: str) -> float | None:
         """When the channel's silence lifts, or ``None``. Read by the
         guardrails, which run for the daemon and not for a viewer."""
@@ -2262,14 +2271,15 @@ class CollaborationStore:
             return _channel_member(entry, user)
 
     def agent_turns_since(self, channel_id: str, since: float) -> list[AgentTurnRecord]:
-        """The channel's agent-authored turns created at or after ``since``,
-        oldest first: what the rate caps and the pair cooldown count."""
+        """The channel's agent-started turns created at or after ``since``,
+        oldest first: what the rate caps and the pair cooldown count. A turn
+        a person asked for is not one of them, whoever it addresses."""
         with self.dstore.read() as session:
             rows = session.scalars(
                 select(TurnRow)
                 .where(
                     TurnRow.channel_id == channel_id,
-                    TurnRow.author_kind == "agent",
+                    TurnRow.trigger.in_(("mention", "ambient")),
                     TurnRow.created_at >= since,
                 )
                 .order_by(TurnRow.created_at.asc())
@@ -2284,6 +2294,33 @@ class CollaborationStore:
                 )
                 for row in rows
             ]
+
+    def ambient_turns_since(self, channel_id: str, agent_slug: str, since: float) -> int:
+        """How often ``agent_slug`` has spoken unprompted in the channel at
+        or after ``since``: what ``ambient_max_per_hour`` counts."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(TurnRow.targets_json).where(
+                    TurnRow.channel_id == channel_id,
+                    TurnRow.trigger == "ambient",
+                    TurnRow.created_at >= since,
+                )
+            )
+            return sum(1 for value in rows if agent_slug in json.loads(value or "[]"))
+
+    def recent_messages(self, channel_id: str, limit: int) -> list[Message]:
+        """The channel's newest messages, oldest first: the window an
+        ambient decision reads."""
+        with self.dstore.read() as session:
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.channel_id == channel_id)
+                    .order_by(MessageRow.sequence.desc())
+                    .limit(max(1, limit))
+                )
+            )
+            return [_message(session, row) for row in reversed(rows)]
 
     def record_followup_decision(
         self,
