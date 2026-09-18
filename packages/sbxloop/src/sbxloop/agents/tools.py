@@ -71,6 +71,7 @@ CONCIERGE_TOOLS: frozenset[str] = frozenset(
         "comment_on_issue",
         "close_issue",
         "load_skill",
+        "read_channel_artifact",
     }
 )
 

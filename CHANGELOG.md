@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**Files delivered into a conversation are now the whole channel's to read, and
+a long channel keeps a summary of what fell out of its history.** A work
+result's files are attached to the message in the same transaction that writes
+it and served on `MessageOut.artifacts`. `GET /v1/channels/{id}/artifacts` and
+`GET /v1/channels/{id}/artifacts/{artifact_id}/content` serve them to anyone
+who can read the channel, without `artifacts:read`; the run artifact routes are
+unchanged. A chat turn's history lines now name the sequence, the author, the
+message kind and the files each message carried, and a trimmed history opens
+with the channel's latest summary, written after a turn settles by one
+tool-less call on the concierge's model. Agents answering in a channel get
+`read_channel_artifact`, which reads a file that channel can see -- for
+read-only roles too -- refuses one from anywhere else, truncates with a marker
+naming the next offset, and never hands back bytes that are not text.
+
 ### Added
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned

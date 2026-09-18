@@ -298,3 +298,46 @@ class AgentMemoryRow(Base):
     last_used_at: Mapped[float | None] = mapped_column(REAL)
     deleted_at: Mapped[float | None] = mapped_column(REAL)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class MessageArtifactRow(Base):
+    """A file a message carries (revision 0028).
+
+    The row is written in the same transaction as the message, so a result
+    and the files it delivered are never half-recorded. ``channel_id`` is
+    denormalised from the message: it is what scopes a channel's file list
+    and the ``read_channel_artifact`` tool, and it is indexed for both.
+    ``run_id`` is the run's public id, as the work snapshot carries it.
+    """
+
+    __tablename__ = "collaboration_message_artifacts"
+    __table_args__ = (
+        PrimaryKeyConstraint("message_id", "artifact_id"),
+        Index("idx_collaboration_message_artifacts_channel", "channel_id"),
+    )
+
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[str | None] = mapped_column(Text)
+    relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    media_type: Mapped[str] = mapped_column(Text, nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class ChannelSummaryRow(Base):
+    """What a channel said before its history window (revision 0028).
+
+    One row per compaction: ``through_sequence`` is the last message the
+    summary covers, so the newest row is the one a trimmed history opens
+    with and the watermark the next compaction starts from.
+    """
+
+    __tablename__ = "collaboration_channel_summaries"
+    __table_args__ = (PrimaryKeyConstraint("channel_id", "through_sequence"),)
+
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    through_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)

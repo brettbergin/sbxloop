@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -39,7 +39,9 @@ from sbxloop.db.collaboration_models import (
     ChannelMemberRow,
     ChannelParticipantRow,
     ChannelRow,
+    ChannelSummaryRow,
     LocalUserRow,
+    MessageArtifactRow,
     MessageRow,
     PreferenceRow,
     TeamRow,
@@ -48,6 +50,7 @@ from sbxloop.db.collaboration_models import (
     WorkspaceInviteRow,
     WorkspaceMemberRow,
 )
+from sbxloop.db.daemon_models import WorkItemRow
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -61,6 +64,10 @@ MAX_HANDOFFS_PER_RESPONSE = 2
 # -> reviewer -> author -> coordinator. The agents choose the path; this is a
 # circuit breaker, not a workflow definition.
 MAX_HANDOFF_DEPTH = 4
+#: Messages one turn's history may carry, newest first.
+HISTORY_MESSAGES = 200
+#: Characters one turn's history may spend on those messages.
+HISTORY_CHARS = 60_000
 
 
 class CollaborationError(Exception):
@@ -171,6 +178,28 @@ class ChannelParticipant:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactRef:
+    """A file a message carries, by catalog identity. ``run_id`` is the
+    run's public id; the bytes are served by the artifact routes."""
+
+    id: str
+    run_id: str
+    relpath: str
+    media_type: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelSummary:
+    """What a channel said up to ``through_sequence``, in a few sentences."""
+
+    channel_id: str
+    through_sequence: int
+    content: str
+    created_at: float
+
+
 #: Who a store read or write is made for: a workspace member (or their user
 #: id, resolved to the member), or ``None`` for a plain API client or the
 #: daemon itself, which keep full access.
@@ -192,7 +221,7 @@ class Message:
     work: dict[str, Any] | None = None
     reactions: tuple[str, ...] = ()
     author: Author = SYSTEM_AUTHOR
-    artifacts: tuple[Any, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
     origin: dict[str, Any] | None = None
 
 
@@ -447,7 +476,55 @@ def _participant_activity(
     )
 
 
-def _message(session: Any, row: MessageRow) -> Message:
+def _latest_summary(session: Any, channel_id: str) -> ChannelSummary | None:
+    """The newest compaction of a channel's history, if it has one."""
+    row = session.scalars(
+        select(ChannelSummaryRow)
+        .where(ChannelSummaryRow.channel_id == channel_id)
+        .order_by(ChannelSummaryRow.through_sequence.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    return ChannelSummary(
+        channel_id=str(row.channel_id),
+        through_sequence=int(row.through_sequence),
+        content=str(row.content),
+        created_at=float(row.created_at),
+    )
+
+
+def _artifact_ref(row: MessageArtifactRow) -> ArtifactRef:
+    return ArtifactRef(
+        id=str(row.artifact_id),
+        run_id="" if row.run_id is None else str(row.run_id),
+        relpath=str(row.relpath),
+        media_type=str(row.media_type),
+        size=int(row.size),
+    )
+
+
+def _attachments(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[ArtifactRef, ...]]:
+    """The files each of ``message_ids`` carries, in one read: a channel's
+    whole history is projected without a query per message."""
+    found: dict[str, list[ArtifactRef]] = {}
+    if not message_ids:
+        return {}
+    rows = session.scalars(
+        select(MessageArtifactRow)
+        .where(MessageArtifactRow.message_id.in_(list(message_ids)))
+        .order_by(MessageArtifactRow.relpath.asc())
+    )
+    for row in rows:
+        found.setdefault(str(row.message_id), []).append(_artifact_ref(row))
+    return {key: tuple(value) for key, value in found.items()}
+
+
+def _message(
+    session: Any,
+    row: MessageRow,
+    attachments: Mapping[str, tuple[ArtifactRef, ...]] | None = None,
+) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
     if row.kind == "work_result":
@@ -476,6 +553,11 @@ def _message(session: Any, row: MessageRow) -> Message:
         work=work,
         reactions=tuple(str(value) for value in json.loads(row.reactions_json or "[]")),
         author=author,
+        artifacts=(
+            _attachments(session, [str(row.id)]).get(str(row.id), ())
+            if attachments is None
+            else attachments.get(str(row.id), ())
+        ),
     )
 
 
@@ -1684,12 +1766,15 @@ class CollaborationStore:
                 _access(session, channel_id, viewer, "read")
             except CollaborationError:
                 return None
-            rows = session.scalars(
-                select(MessageRow)
-                .where(MessageRow.channel_id == channel_id, MessageRow.sequence > after)
-                .order_by(MessageRow.sequence.asc())
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.channel_id == channel_id, MessageRow.sequence > after)
+                    .order_by(MessageRow.sequence.asc())
+                )
             )
-            return [_message(session, row) for row in rows]
+            attachments = _attachments(session, [str(row.id) for row in rows])
+            return [_message(session, row, attachments) for row in rows]
 
     def accept_turn(
         self,
@@ -1916,8 +2001,14 @@ class CollaborationStore:
         agent_slug: str | None,
         work: dict[str, Any],
         now: float,
+        artifacts: Sequence[Mapping[str, Any]] = (),
     ) -> Message | None:
-        """Append one server-owned work result, idempotently."""
+        """Append one server-owned work result, idempotently.
+
+        ``artifacts`` are the files the run delivered, as the work snapshot
+        names them. They are attached in the same transaction as the
+        message, so a result never exists without the files it announced.
+        """
         with self.dstore.immediate_transaction() as session:
             existing = session.get(MessageRow, message_id)
             if existing is not None:
@@ -1947,6 +2038,7 @@ class CollaborationStore:
                     author_id=agent_slug or ANGIE_SLUG,
                 )
             )
+            self._attach_artifacts(session, message_id, channel_id, artifacts, now)
             channel.updated_at = now
             channel.revision += 1
             row = session.get(MessageRow, message_id)
@@ -1958,6 +2050,166 @@ class CollaborationStore:
                 data={"channel_id": channel_id, "turn_id": turn_id, "message_id": message_id},
             )
             return _message(session, row)
+
+    @staticmethod
+    def _attach_artifacts(
+        session: Any,
+        message_id: str,
+        channel_id: str,
+        artifacts: Sequence[Mapping[str, Any]],
+        now: float,
+    ) -> None:
+        """Record the files a message carries, inside the caller's
+        transaction. A file named twice on one message is one row."""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            artifact_id = artifact.get("id")
+            relpath = artifact.get("relpath")
+            if not isinstance(artifact_id, str) or not isinstance(relpath, str):
+                continue
+            if artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            run_id = artifact.get("run_id")
+            size = artifact.get("size")
+            rows.append(
+                {
+                    "message_id": message_id,
+                    "artifact_id": artifact_id,
+                    "channel_id": channel_id,
+                    "run_id": run_id if isinstance(run_id, str) else None,
+                    "relpath": relpath,
+                    "media_type": str(artifact.get("media_type") or "application/octet-stream"),
+                    "size": size if isinstance(size, int) and not isinstance(size, bool) else 0,
+                    "created_at": now,
+                }
+            )
+        if rows:
+            session.execute(insert(MessageArtifactRow).prefix_with("OR IGNORE"), rows)
+
+    def channel_artifacts(self, viewer: Viewer, channel_id: str) -> list[ArtifactRef] | None:
+        """Every file the channel's messages carry, newest message first;
+        ``None`` when the channel is not this viewer's to read."""
+        with self.dstore.read() as session:
+            try:
+                _access(session, channel_id, viewer, "read")
+            except CollaborationError:
+                return None
+            rows = session.scalars(
+                select(MessageArtifactRow)
+                .join(MessageRow, MessageRow.id == MessageArtifactRow.message_id)
+                .where(MessageArtifactRow.channel_id == channel_id)
+                .order_by(MessageRow.sequence.desc(), MessageArtifactRow.relpath.asc())
+            )
+            found: dict[str, ArtifactRef] = {}
+            for row in rows:
+                found.setdefault(str(row.artifact_id), _artifact_ref(row))
+            return list(found.values())
+
+    def artifact_attached(self, channel_id: str, artifact_id: str) -> bool:
+        """Whether a message in this channel carries that file."""
+        with self.dstore.read() as session:
+            return (
+                session.scalars(
+                    select(MessageArtifactRow.artifact_id)
+                    .where(
+                        MessageArtifactRow.channel_id == channel_id,
+                        MessageArtifactRow.artifact_id == artifact_id,
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def channel_owns_run(self, channel_id: str, run_id: str) -> bool:
+        """Whether a work item admitted for this channel produced ``run_id``.
+
+        A run linked to the channel is part of its shared context even
+        before its result message lands, so its files are readable there.
+        """
+        with self.dstore.read() as session:
+            return (
+                session.scalars(
+                    select(WorkItemRow.item_id)
+                    .where(WorkItemRow.channel_id == channel_id, WorkItemRow.run_id == run_id)
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def put_channel_summary(
+        self, channel_id: str, through_sequence: int, content: str, now: float
+    ) -> ChannelSummary:
+        """Record what the channel said up to ``through_sequence``."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(ChannelSummaryRow, (channel_id, through_sequence))
+            if row is None:
+                session.execute(
+                    insert(ChannelSummaryRow).values(
+                        channel_id=channel_id,
+                        through_sequence=through_sequence,
+                        content=content,
+                        created_at=now,
+                    )
+                )
+            else:
+                row.content = content
+                row.created_at = now
+        return ChannelSummary(channel_id, through_sequence, content, now)
+
+    def latest_channel_summary(self, channel_id: str) -> ChannelSummary | None:
+        with self.dstore.read() as session:
+            return _latest_summary(session, channel_id)
+
+    def summary_backlog(
+        self, channel_id: str, *, keep: int = HISTORY_MESSAGES, max_chars: int = HISTORY_CHARS
+    ) -> tuple[int, str | None, str] | None:
+        """What a compaction job has to summarise, or ``None`` when nothing
+        has fallen out of the channel's history window yet.
+
+        Returns the last sequence covered, the previous summary (so the new
+        one continues it) and the transcript of the messages that fell out,
+        oldest first and bounded by ``max_chars``.
+        """
+        with self.dstore.read() as session:
+            kept = list(
+                session.scalars(
+                    select(MessageRow.sequence)
+                    .where(MessageRow.channel_id == channel_id)
+                    .order_by(MessageRow.sequence.desc())
+                    .limit(keep)
+                )
+            )
+            if len(kept) < keep:
+                return None
+            previous = _latest_summary(session, channel_id)
+            covered = 0 if previous is None else previous.through_sequence
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(
+                        MessageRow.channel_id == channel_id,
+                        MessageRow.sequence < min(kept),
+                        MessageRow.sequence > covered,
+                    )
+                    .order_by(MessageRow.sequence.asc())
+                )
+            )
+            if not rows:
+                return None
+            through = int(rows[-1].sequence)
+            lines: list[str] = []
+            spent = 0
+            for row in rows:
+                author = _author(session, row.author_kind, row.author_id)
+                who = (author.display_name or author.id or author.kind) if author else str(row.role)
+                line = f"{who}: {' '.join(str(row.content).split())}"
+                if spent + len(line) > max_chars:
+                    break
+                lines.append(line)
+                spent += len(line) + 1
+            return through, None if previous is None else previous.content, "\n".join(lines)
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:
@@ -2160,8 +2412,16 @@ class CollaborationStore:
             return False
         return True
 
-    def turn_history(self, turn: Turn, *, max_chars: int = 60_000) -> str:
-        """Prior turns and completed peers in this turn, without future input."""
+    def turn_history(self, turn: Turn, *, max_chars: int = HISTORY_CHARS) -> str:
+        """Prior turns and completed peers in this turn, without future input.
+
+        One JSON object per line, oldest last written first: the sequence,
+        who wrote it, the message kind, the text and the files it carried.
+        Bounded to :data:`HISTORY_MESSAGES` messages and ``max_chars``
+        characters; when anything was dropped the channel's latest summary
+        opens the history as a ``channel_summary`` line, so the agent still
+        knows what came before rather than silently losing it.
+        """
         with self.dstore.read() as session:
             current = session.get(MessageRow, turn.input_message_id)
             if current is None:
@@ -2173,7 +2433,7 @@ class CollaborationStore:
                 MessageRow.role == "user",
                 MessageRow.sequence < current.sequence,
             )
-            rows = session.scalars(
+            eligible = (
                 select(MessageRow)
                 .where(
                     MessageRow.channel_id == turn.channel_id,
@@ -2181,23 +2441,67 @@ class CollaborationStore:
                     | ((MessageRow.turn_id == turn.id) & (MessageRow.role == "assistant")),
                 )
                 .order_by(MessageRow.sequence.desc())
-                .limit(200)
             )
+            # One more than the cap tells the reader whether anything was left out.
+            rows = list(session.scalars(eligible.limit(HISTORY_MESSAGES + 1)))
+            dropped = len(rows) > HISTORY_MESSAGES
+            rows = rows[:HISTORY_MESSAGES]
+            attachments = _attachments(session, [str(row.id) for row in rows])
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                chunk = json.dumps(
-                    {
-                        "role": row.role,
-                        "agent": row.agent_slug,
-                        "content": row.content,
-                    },
-                    ensure_ascii=False,
-                )
+                line: dict[str, Any] = {
+                    "seq": int(row.sequence),
+                    "author_kind": None,
+                    "author": None,
+                    "role": str(row.role),
+                    "kind": str(row.kind),
+                    "content": str(row.content),
+                }
+                author = _author(session, row.author_kind, row.author_id)
+                if author is None:
+                    derived = message_author(
+                        str(row.role),
+                        str(row.kind),
+                        None if row.agent_slug is None else str(row.agent_slug),
+                        _owner_id(session, str(row.channel_id)),
+                    )
+                    author = _author(session, derived.kind, derived.id) or derived
+                line["author_kind"] = author.kind
+                line["author"] = author.id
+                files = attachments.get(str(row.id), ())
+                if files:
+                    line["artifacts"] = [
+                        {
+                            "id": ref.id,
+                            "name": ref.relpath,
+                            "media_type": ref.media_type,
+                            "size": ref.size,
+                        }
+                        for ref in files
+                    ]
+                chunk = json.dumps(line, ensure_ascii=False)
                 if len(chunk) > remaining:
+                    dropped = True
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk) + 1
+            if dropped:
+                summary = _latest_summary(session, turn.channel_id)
+                if summary is not None:
+                    chunks.append(
+                        json.dumps(
+                            {
+                                "seq": summary.through_sequence,
+                                "author_kind": "system",
+                                "author": None,
+                                "role": "assistant",
+                                "kind": "channel_summary",
+                                "content": summary.content,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
         return "\n".join(reversed(chunks))
 
     def participant_result(self, turn: Turn, index: int) -> Message | None:

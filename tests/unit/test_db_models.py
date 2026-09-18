@@ -65,6 +65,8 @@ COLLABORATION_TABLES = (
     "collaboration_channel_members",
     "collaboration_channel_participants",
     "collaboration_messages",
+    "collaboration_message_artifacts",
+    "collaboration_channel_summaries",
     "collaboration_turns",
     "collaboration_teams",
     "collaboration_preferences",

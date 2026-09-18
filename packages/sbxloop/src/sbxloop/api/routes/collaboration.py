@@ -7,6 +7,7 @@ import re
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import StreamingResponse
 
 from sbxloop.agents.registry import AgentRegistry
 from sbxloop.api.auth.deps import (
@@ -18,7 +19,9 @@ from sbxloop.api.auth.deps import (
     require,
 )
 from sbxloop.api.auth.store import AuthError
+from sbxloop.api.channel_artifacts import resolve as resolve_channel_artifact
 from sbxloop.api.collaboration import (
+    ArtifactRef,
     Author,
     Channel,
     ChannelMember,
@@ -34,7 +37,9 @@ from sbxloop.api.collaboration import (
     Workflow,
 )
 from sbxloop.api.collaboration_schemas import (
+    ArtifactRefOut,
     AuthorOut,
+    ChannelArtifactPage,
     ChannelCreate,
     ChannelMemberCreate,
     ChannelMemberOut,
@@ -76,6 +81,7 @@ from sbxloop.api.context import PAGE_MAX, ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import TokenResponse, rfc3339
 from sbxloop.api.routes.agents import addressable
+from sbxloop.api.routes.artifacts import stream_artifact
 from sbxloop.api.routes.auth import grant_tokens
 
 router = APIRouter(prefix="/v1", tags=["collaboration"])
@@ -324,6 +330,17 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         work=ChannelWorkOut.model_validate(message.work) if message.work else None,
         reactions=list(message.reactions),
         author=_author_out(message.author, ctx),
+        artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
+    )
+
+
+def _artifact_ref_out(ref: ArtifactRef) -> ArtifactRefOut:
+    return ArtifactRefOut(
+        id=ref.id,
+        run_id=ref.run_id,
+        relpath=ref.relpath,
+        media_type=ref.media_type,
+        size=ref.size,
     )
 
 
@@ -1360,6 +1377,49 @@ async def remove_channel_participant(
         raise _problem(exc) from exc
     ctx.hub.notify()
     return Response(status_code=204)
+
+
+@router.get("/channels/{channel_id}/artifacts", response_model=ChannelArtifactPage)
+async def list_channel_artifacts(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelArtifactPage:
+    """Every file this channel's messages carry, newest message first.
+
+    Channel read permission, not ``artifacts:read``: a file delivered into
+    a conversation belongs to the people in it. ``GET /v1/runs/{id}/artifacts``
+    is unchanged and still takes ``artifacts:read``.
+    """
+    await ctx.call(ctx.project_work, channel_id)
+    refs = await ctx.call(ctx.collaboration.channel_artifacts, member, channel_id)
+    if refs is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    return ChannelArtifactPage(data=[_artifact_ref_out(ref) for ref in refs])
+
+
+@router.get("/channels/{channel_id}/artifacts/{artifact_id}/content")
+async def download_channel_artifact(
+    channel_id: str,
+    artifact_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> StreamingResponse:
+    """The bytes of one of the channel's files, as an attachment.
+
+    Resolved through the channel: a file this channel does not carry is
+    ``404`` whatever else the caller may read, so an id from elsewhere
+    never leaks through here.
+    """
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    artifact = await ctx.call(resolve_channel_artifact, ctx, channel_id, artifact_id)
+    if artifact is None:
+        raise Problem(404, "artifact_not_found", "artifact not found")
+    return await stream_artifact(ctx, artifact.id)
 
 
 __all__ = ["router"]
