@@ -656,6 +656,21 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A chat bridge turn waiting behind another no longer holds a concierge
+  worker, so chat cannot deadlock or starve other channels.** A turn took its
+  place in its session's lane and was handed to the pool in two separate
+  steps, then blocked on a pool worker until the turn ahead of it finished.
+  The local console and a configured bridge submit from their own threads
+  into the same default lane, so at `[concierge] max_concurrent_turns = 1`
+  the later turn could take the only worker and wait forever for the earlier
+  one, which never got a worker: the concierge stopped answering until a
+  restart, and every channel's turn lane stalled behind it. At a wider pool,
+  a burst of bridge messages parked every worker, so product-channel turns
+  and summaries waited for the burst to drain. Only a lane's head is now on
+  the pool; the next turn is handed over when it finishes. A turn cancelled
+  while it waits is passed over and no longer counts as pending, and
+  closing the concierge cancels the turns still waiting.
+
 - **A chat ask or scheduled workload no longer fetches the primary
   repository's checkout anonymously on a daemon with several
   repositories.** An item that names no repository selected no forge

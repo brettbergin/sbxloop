@@ -51,7 +51,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, suppress
+from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -284,6 +284,15 @@ class ConciergeReply(NamedTuple):
     work_products: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, eq=False)
+class _QueuedTurn:
+    """A submitted turn waiting in its session's lane: the Future its caller
+    holds and the work that settles it."""
+
+    future: Future[ConciergeReply]
+    run: Callable[[], ConciergeReply]
+
+
 class SessionHost(Protocol):
     """Where the concierge's session runs (``DaemonAgent`` in production)."""
 
@@ -447,9 +456,10 @@ class Concierge:
         # None and so resumes the one default session, so they all share a
         # single reserved lane. Each lane is FIFO in arrival order, so a
         # surface's messages are still answered in the order they were sent
-        # whatever ``[concierge] max_concurrent_turns`` is set to.
-        self._lanes: dict[str, deque[object]] = {}
-        self._lanes_changed = threading.Condition()
+        # whatever ``[concierge] max_concurrent_turns`` is set to. Only a
+        # lane's head is on the pool; the rest wait here, holding no worker.
+        self._lanes: dict[str, deque[_QueuedTurn]] = {}
+        self._lanes_lock = threading.Lock()
         self._tool_lock = threading.Lock()
         self._closed = False
         self._tools: dict[str, HostTool] = {t.spec.name: t for t in self._build_tools()}
@@ -646,9 +656,6 @@ class Concierge:
             if self._closed:
                 raise RuntimeError("concierge is closed")
             self._pending += 1
-        # Take this turn's place in its session's lane now, under the
-        # caller's ordering, not when a pool thread happens to pick it up.
-        lane_key, ticket = self._join_lane(session_key)
 
         def turn() -> ConciergeReply:
             with self._state_lock:
@@ -703,64 +710,85 @@ class Concierge:
                 updates["work_products"] = tuple(dict.fromkeys(turn_work_products))
             return reply._replace(**updates) if updates else reply
 
-        def run() -> ConciergeReply:
-            # One turn at a time per session: the next one in the lane starts
-            # only once this one has written the session back.
-            self._await_lane(lane_key, ticket)
-            try:
-                return turn()
-            finally:
-                self._leave_lane(lane_key, ticket)
-
-        def release(future: Future[ConciergeReply]) -> None:
-            # A cancelled turn never runs, so nothing else would give its
-            # lane place back and the turns behind it would wait forever.
-            if future.cancelled():
-                self._leave_lane(lane_key, ticket)
-
+        queued = _QueuedTurn(Future(), turn)
         try:
-            future = self._executor.submit(run)
+            self._enqueue(session_key or "", queued)
         except BaseException:
-            self._leave_lane(lane_key, ticket)
-            with self._state_lock:
-                self._pending -= 1
+            self._forget_pending()
             raise
-        future.add_done_callback(release)
-        return future
+        return queued.future
 
     # -- session lanes ----------------------------------------------------------
 
-    def _join_lane(self, session_key: str | None) -> tuple[str, object]:
-        """Reserve the back of the lane a turn on ``session_key`` runs in.
+    def _enqueue(self, lane_key: str, queued: _QueuedTurn) -> None:
+        """Take this turn's place at the back of its session's lane, now,
+        under the caller's ordering; hand it to the pool if the lane was empty.
 
         The reserved key ``""`` is the default session every bridge turn
         resumes; a keyed turn (one product channel's participant) has a lane
-        of its own.
+        of its own. Only a lane's head is ever on the pool: a turn waiting for
+        the one ahead of it holds no worker, so it can neither keep another
+        session's turn from a worker nor keep the turn it waits for from one.
         """
-        lane_key = session_key or ""
-        ticket = object()
-        with self._lanes_changed:
-            self._lanes.setdefault(lane_key, deque()).append(ticket)
-        return lane_key, ticket
+        with self._lanes_lock:
+            if self._closed:
+                raise RuntimeError("concierge is closed")
+            lane = self._lanes.setdefault(lane_key, deque())
+            lane.append(queued)
+            if len(lane) > 1:
+                return
+            try:
+                self._executor.submit(self._drive, lane_key, queued)
+            except BaseException:
+                del self._lanes[lane_key]
+                raise
 
-    def _await_lane(self, lane_key: str, ticket: object) -> None:
-        """Block until every turn reserved before this one has finished."""
-        with self._lanes_changed:
-            self._lanes_changed.wait_for(lambda: self._head_of(lane_key) is ticket)
+    def _drive(self, lane_key: str, queued: _QueuedTurn) -> None:
+        """Run a lane's head on a pool worker, then start the next turn in the
+        lane: one turn at a time per session, each after the one before it has
+        written the session back."""
+        try:
+            if queued.future.set_running_or_notify_cancel():
+                try:
+                    reply = queued.run()
+                except BaseException as exc:
+                    queued.future.set_exception(exc)
+                else:
+                    queued.future.set_result(reply)
+            else:
+                self._forget_pending()
+        finally:
+            with self._lanes_lock:
+                lane = self._lanes.get(lane_key)
+                if lane and lane[0] is queued:
+                    lane.popleft()
+                abandoned = self._start_head(lane_key)
+            for waiting in abandoned:
+                waiting.future.cancel()
 
-    def _leave_lane(self, lane_key: str, ticket: object) -> None:
-        with self._lanes_changed:
-            lane = self._lanes.get(lane_key)
-            if lane is not None:
-                with suppress(ValueError):
-                    lane.remove(ticket)
-                if not lane:
-                    del self._lanes[lane_key]
-            self._lanes_changed.notify_all()
-
-    def _head_of(self, lane_key: str) -> object | None:
+    def _start_head(self, lane_key: str) -> list[_QueuedTurn]:
+        """Hand the lane's next turn to the pool, passing over any cancelled
+        while it waited. Called with ``_lanes_lock`` held; returns the turns
+        left to cancel when the pool has shut down under the lane."""
         lane = self._lanes.get(lane_key)
-        return lane[0] if lane else None
+        while lane:
+            head = lane[0]
+            if not head.future.cancelled():
+                try:
+                    self._executor.submit(self._drive, lane_key, head)
+                except RuntimeError:
+                    break
+                return []
+            lane.popleft()
+            self._forget_pending()
+        abandoned = list(lane or ())
+        self._lanes.pop(lane_key, None)
+        return abandoned
+
+    def _forget_pending(self) -> None:
+        """A turn that will never run is no longer waiting."""
+        with self._state_lock:
+            self._pending -= 1
 
     def reset_session(self, session_key: str | None = None) -> None:
         self.dstore.set_value(self._session_state_key(STATE_SESSION_ID, session_key), None)
@@ -771,6 +799,13 @@ class Concierge:
     def close(self) -> None:
         with self._state_lock:
             self._closed = True
+        with self._lanes_lock:
+            # A turn still waiting in a lane never reaches the pool now; the
+            # one running at a lane's head finishes and starts nothing.
+            waiting = [queued for lane in self._lanes.values() for queued in lane]
+            self._lanes.clear()
+        for queued in waiting:
+            queued.future.cancel()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self.host.close()
         store, self._store = self._store, None
