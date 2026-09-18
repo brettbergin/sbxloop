@@ -1309,9 +1309,9 @@ class ApiContext:
         """The person behind a chat turn, holding what their workspace role
         grants and nothing more (S-A11).
 
-        A stop or a steer from chat is the same operation the API performs,
-        so it answers to the same role model: a ``member`` may steer but may
-        not cancel a run, from either surface. The id is the user's, so the
+        A steer from chat is the same operation the API performs, so it
+        answers to the same role model; a stop answers to the channel stop's
+        rule instead (see :meth:`_stop_from_chat`). The id is the user's, so the
         recorded operation names the person; the display name is only the
         attribution the source hears. Someone who is no longer a member, or
         whose account is deactivated, holds nothing.
@@ -1343,8 +1343,13 @@ class ApiContext:
         Only the exact words stop anything -- `/stop`, `/cancel`, or
         `@agent stop` naming the agent whose turn this is. A message that
         merely argues for stopping is steering, and goes the other way.
-        Every cancel runs through the control service, so this is the same
-        operation the API's cancel is.
+
+        It takes the rule ``POST /v1/channels/{id}/stop`` takes: anyone who
+        may post in the channel may stop the runs *this channel* asked for,
+        so a plain member may stop as well as steer. The cancels run through
+        the control service under the same channel-scoped principal the
+        route uses, keeping the person's identity for the audit record. A
+        turn another agent started never reaches here.
         """
         scope = stop_command(text, target)
         if scope is None or self.loop is None:
@@ -1352,17 +1357,17 @@ class ApiContext:
         stop = getattr(self.loop, "stop_channel", None)
         if not callable(stop):
             return None
-        if not principal.can("runs:control"):
-            return "Nothing was stopped: you do not have permission to stop runs."
+        if not self._may_stop_channel(turn.channel_id, principal):
+            return "Nothing was stopped: you may not stop work in this channel."
         try:
             stopped = stop(
                 turn.channel_id,
-                principal,
+                _channel_stop_principal(principal),
                 agent_slug=target if scope == "agent" else None,
             )
         except ControlError as exc:
             if exc.code == "forbidden":
-                return "Nothing was stopped: you do not have permission to stop runs."
+                return "Nothing was stopped: you may not stop work in this channel."
             return f"Nothing was stopped: {exc.message}"
         except Exception:
             log.warning("collaboration.stop_failed", channel=turn.channel_id, exc_info=True)
@@ -1374,6 +1379,18 @@ class ApiContext:
             f"Stopping {runs}. Work already done stays where it is; "
             "`resume-run` would continue, `retry` would start over."
         )
+
+    def _may_stop_channel(self, channel_id: str, principal: Principal) -> bool:
+        """Whether the person behind ``principal`` may stop ``channel_id``:
+        what the stop route asks of its caller, that they may start a turn
+        (``collaboration:delegate``) and may post in the channel."""
+        if principal.kind != "client" or not principal.can("collaboration:delegate"):
+            return False
+        try:
+            return self.collaboration.may_post(principal.id, channel_id, self.clock())
+        except Exception:
+            log.warning("collaboration.stop_access_failed", channel=channel_id, exc_info=True)
+            return False
 
     def _steer_by_mention(
         self, turn: Turn, target: str | None, text: str, principal: Principal
