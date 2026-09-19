@@ -60,6 +60,12 @@ class WorkItemRow(Base):
         # The key that actually guards correctness; see the module docstring.
         UniqueConstraint("source_key", "repo"),
         Index("idx_daemon_items_state", "state", "created_at"),
+        # What the chat projection joins work to its conversation on
+        # (revision 0032). It used to compare the message id against a
+        # prefix of ``source_key``: a function on a column, which SQLite
+        # cannot index, so every delivery read cost one pass over the
+        # messages table per work item.
+        Index("idx_daemon_items_message", "message_id"),
     )
 
     item_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
@@ -107,6 +113,11 @@ class WorkItemRow(Base):
     origin_agent: Mapped[str | None] = mapped_column(Text)
     parent_item_id: Mapped[str | None] = mapped_column(Text)
     chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    # The chat message that asked for this work (revision 0032), derived
+    # from ``source_key`` at insert and backfilled for the rows that
+    # predate the column. NULL for work an issue, a schedule or an inbox
+    # file asked for: those name no message and link by channel instead.
+    message_id: Mapped[str | None] = mapped_column(Text)
 
 
 class DaemonRunRow(Base):

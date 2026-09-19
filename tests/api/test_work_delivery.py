@@ -99,14 +99,17 @@ def test_failure_before_run_creation_is_delivered(api: Any) -> None:
 
 
 def test_source_identity_requires_a_complete_message_id(api: Any) -> None:
-    headers, channel, item = setup_work(api)
-    # Underscores must not become SQL LIKE wildcards; nor may a mere prefix match.
-    with api.harness.dstore.immediate_transaction() as session:
+    # A key that merely starts with the message's id names a different
+    # message. Underscores must not become SQL LIKE wildcards either: the
+    # link is an equality on the message id the item was admitted with.
+    headers, channel, item = setup_work(api, suffix="unrelated")
+    with api.harness.dstore.read() as session:
         from sbxloop.db.daemon_models import WorkItemRow
 
         row = session.get(WorkItemRow, item.item_id)
         assert row is not None
-        row.source_key = item.source_key + "unrelated"
+        assert row.source_key == item.source_key
+        assert row.message_id == item.source_key
     response = api.client.get(f"/v1/channels/{channel}/work", headers=headers)
     assert response.status_code == 200, response.text
     assert response.json() == []

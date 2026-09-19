@@ -1787,3 +1787,66 @@ class TestRecipeItemsAreToolRuns:
         again = DaemonStore(path)
         plain = again.get("chat:ask")
         assert plain is not None and plain.kind == "workload" and plain.recipe is None
+
+
+class TestChatMessageLink:
+    """A chat ask records the message that made it, so the conversation it
+    belongs to is found by an indexed equality rather than by matching the
+    source key's prefix against every message in the database."""
+
+    def test_a_chat_ask_records_the_message_its_key_names(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("msg_a1", item_id="chat:msg_a1", kind="workload"), now=1.0)
+        # A key with a participant suffix names the same message.
+        store.upsert_new(item("msg_a1:2", item_id="chat:msg_a1:2", kind="workload"), now=1.0)
+        store.upsert_new(
+            item("msg_b2:entrygraph:9f", item_id="chat:msg_b2:entrygraph:9f", kind="tool"),
+            now=1.0,
+        )
+        # A code run is keyed by the issue that asked; it names no message.
+        store.upsert_new(item("7"), now=1.0)
+        rows = dict(query_raw(store, "SELECT item_id, message_id FROM daemon_work_items"))
+        assert rows == {
+            "chat:msg_a1": "msg_a1",
+            "chat:msg_a1:2": "msg_a1",
+            "chat:msg_b2:entrygraph:9f": "msg_b2",
+            "gh:issue:7": None,
+        }
+        store.close()
+
+    def test_a_superseded_row_is_re_keyed_to_its_message(self, tmp_path: Path) -> None:
+        """An edited ask deletes the row and writes a new one: the new row
+        carries the message id too, never an empty one."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("msg_c3", item_id="chat:msg_c3", kind="workload"), now=1.0)
+        store.mark_done("chat:msg_c3", now=2.0)
+        assert store.upsert_new(
+            item("msg_c3", item_id="chat:msg_c3", kind="workload", body="edited"), now=3.0
+        )
+        rows = dict(query_raw(store, "SELECT item_id, message_id FROM daemon_work_items"))
+        assert rows == {"chat:msg_c3": "msg_c3"}
+        store.close()
+
+    def test_the_channel_s_live_work_is_read_without_listing_every_item(
+        self, tmp_path: Path
+    ) -> None:
+        """What a channel-wide stop needs: the runs its items are executing
+        and the ids of the ones it queued, for this channel alone."""
+        store = DaemonStore(tmp_path / "state.db")
+        for name, channel in (("d1", "c1"), ("d2", "c1"), ("d3", "c2"), ("d4", "c1")):
+            store.upsert_new(
+                item(
+                    f"msg_{name}",
+                    item_id=f"chat:msg_{name}",
+                    kind="workload",
+                    channel_id=channel,
+                ),
+                now=1.0,
+            )
+        store.mark_running("chat:msg_d2", "r_live", now=2.0)
+        store.mark_done("chat:msg_d4", now=2.0)
+        assert store.channel_live_work("c1") == (["r_live"], ["chat:msg_d1"])
+        # A channel whose work is all still queued, and one with none.
+        assert store.channel_live_work("c2") == ([], ["chat:msg_d3"])
+        assert store.channel_live_work("c3") == ([], [])
+        store.close()

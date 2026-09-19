@@ -755,6 +755,20 @@ class StateStore:
                 raise StateError(f"unknown run {run_id}")
             return self._run_record(row)
 
+    def get_runs(self, run_ids: Sequence[str]) -> dict[str, RunRecord]:
+        """The records for ``run_ids`` in one query, keyed by run id.
+
+        For a projection holding a page of runs: a run id with no row is
+        absent rather than raising, because the caller is answering "what
+        is on record for these" rather than asking about one run.
+        """
+        wanted = list(dict.fromkeys(run_ids))
+        if not wanted:
+            return {}
+        with self._read() as session:
+            rows = session.scalars(select(Run).where(Run.run_id.in_(wanted))).all()
+            return {str(row.run_id): self._run_record(row) for row in rows}
+
     def set_run_assignment(self, run_id: str, assignment_json: str | None) -> None:
         """Record the named-agent assignment the run was started with."""
         with self._write() as session:

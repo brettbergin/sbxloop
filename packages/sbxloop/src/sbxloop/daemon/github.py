@@ -379,7 +379,9 @@ class DaemonGithub:
                 job_env=self.provisioner.job_env("github", self.repo, sandbox=sandbox),
             )
             if self.install_workers:
-                client.install(extras="")
+                # A baked template (`[sandbox] template`) carries the worker:
+                # probe it instead of running the ladder on every provision.
+                client.install(extras="", expect_prebaked=bool(self.config.sandbox.template))
             clients.append(client)
 
         started = time.monotonic()

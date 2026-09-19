@@ -1852,6 +1852,13 @@ class DaemonConfig(_ConfigModel):
     # tick launches runs up to this many and returns; the next tick settles
     # what finished. Two code runs never share a repository.
     max_concurrent_runs: int = Field(default=1, ge=1, le=4)
+    # Sandbox sets provisioned before a run asks for them (#47): the daemon
+    # keeps this many ready (microVMs booted, workers installed) under run
+    # ids nobody has used yet, and a fresh run takes one instead of paying
+    # the boot and the install ladder. 0 warms nothing.
+    warm_pairs: int = Field(default=0, ge=0, le=4)
+    # A ready set older than this is removed and replaced.
+    warm_ttl_s: float = Field(default=6 * 3600.0, gt=0)
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"
