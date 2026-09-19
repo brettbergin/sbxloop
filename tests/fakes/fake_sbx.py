@@ -406,13 +406,15 @@ def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
         # an sbx semantic sbxloop field-probes (exec-stdin-env, #592). The
         # fake stays conservative — stdin consumed, not forwarded — unless a
         # test opts in, so both probe verdicts are exercisable.
+        # "stream" hands the exec'd process the live pipe itself (main()
+        # left it unread), the way a resident worker is spoken to.
         forward = os.environ.get("SBX_FAKE_EXEC_STDIN")
         proc = subprocess.run(
             rewritten,
             cwd=home,
             env=env,
             check=False,
-            input=stdin if forward else None,
+            input=stdin if forward and forward != "stream" else None,
             text=True,
         )
     except FileNotFoundError:
@@ -668,8 +670,12 @@ def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
 
 def main() -> int:
     root = state_dir()
-    stdin = "" if sys.stdin.isatty() else sys.stdin.read()
     args = strip_app_name(sys.argv[1:])
+    # A resident worker reads its jobs from the exec's stdin for as long as
+    # it lives: under SBX_FAKE_EXEC_STDIN=stream an exec leaves the pipe to
+    # the process it starts instead of draining it here.
+    streams = os.environ.get("SBX_FAKE_EXEC_STDIN") == "stream" and args[:1] == ["exec"]
+    stdin = "" if streams or sys.stdin.isatty() else sys.stdin.read()
     # Provisioning/install run the pair on parallel threads (#127), so fake
     # invocations arrive concurrently. An exclusive file lock guards the
     # shared state files — responses.json once-removal and the

@@ -29,6 +29,25 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **A resident worker per sandbox: `worker_transport = "resident"`.** Every
+  `sbx exec` and `sbx cp` costs about a second of round trip through the
+  sandbox backend whatever it runs (field, db 2026-09-19: `exec true` 1.15s,
+  `cp` of a one-line file 1.1s), and the stream transport paid three of them
+  per job plus one per host-tool response: 11,897 forge-op jobs at 2.8s mean
+  over five days, a concierge turn's 9s floor, ~3s on every phase of a run.
+  `python -m sbxloop_worker serve` is started once per sandbox with one
+  exec; the host writes each job to its stdin and reads the job's events and
+  result back on its stdout, and a tool response rides the same stdin, so a
+  job costs no sbx call at all. Each job still runs in a forked child with
+  the same runner, events file and result file; a cancel signals the child's
+  own process group. Credentials take the road per-job stdin delivery already
+  uses, once before the first job and again when they change, and are never
+  at rest in the VM. The transport needs that stdin delivery (the
+  `exec-stdin-env` verdict); a client without it, or whose server never
+  reports ready, streams as before. Opt-in for this release; the host still
+  initiates everything and the server listens on nothing
+  (`docs/worker-protocol.md`).
+
 - **`sbxloop users merge --from A --into B` folds one person's second
   account into their first.** A provider that sends no verified email cannot
   be linked to an existing local account, so the first sign-in through it

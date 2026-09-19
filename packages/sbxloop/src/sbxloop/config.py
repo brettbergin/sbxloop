@@ -178,7 +178,7 @@ def _refuse_secret_env(data: Any, where: str) -> Any:
     return data
 
 
-WorkerTransport = Literal["stream", "poll"]
+WorkerTransport = Literal["stream", "resident", "poll"]
 WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
