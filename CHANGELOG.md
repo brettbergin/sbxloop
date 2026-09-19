@@ -664,6 +664,13 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Changed
 
+- **A workload planner is told when its tasks run at the same time.** With
+  `max_parallel_tasks` above 1 (in `[budgets]` or a profile's own
+  `[workloads.budgets]`), independent tasks share one workspace at once, and
+  `depends_on` is the planner's own word: the plan prompt's bounds now say
+  how many run together, that each task gets its own output files, and that
+  two tasks never edit the same file (one depends on the other instead).
+
 - **Chat turns wait in a queue per channel instead of one daemon-wide
   queue.** Accepted product-channel turns now run over a shared pool of
   `[concierge] max_concurrent_turns` workers, so turns in one channel still
