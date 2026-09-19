@@ -505,18 +505,73 @@ def _origin_name(origin: dict[str, Any] | None) -> str | None:
     return str(name) if name else None
 
 
-def _human_name(session: Any, user_id: str | None) -> str | None:
+@dataclass(frozen=True, slots=True)
+class _Directory:
+    """The people and channels a page of messages names, read once.
+
+    Attributing a message asks who wrote it and, when the row records no
+    author, who owns its channel. Asked row by row that is a query per
+    author and a query per channel, under the store's single lock, for
+    every history a turn builds and every messages page the browser polls.
+    :func:`_directory` answers all of them in two queries; a lookup that
+    misses falls back to the row-at-a-time path, so a page is never wrong,
+    only slower.
+    """
+
+    #: User id -> display name, for the ids the page's rows carry.
+    names: Mapping[str, str | None]
+    #: Channel id -> owning user id.
+    owners: Mapping[str, str | None]
+
+
+#: Nothing read ahead: every lookup falls back to its own query.
+_NO_DIRECTORY = _Directory(names={}, owners={})
+
+
+def _directory(session: Any, rows: Sequence[Any]) -> _Directory:
+    """The authors and channel owners ``rows`` name, in one query each."""
+    user_ids = {
+        str(row.author_id)
+        for row in rows
+        if row.author_kind == "human" and row.author_id is not None
+    }
+    names: dict[str, str | None] = {}
+    if user_ids:
+        for user in session.scalars(
+            select(LocalUserRow).where(LocalUserRow.id.in_(sorted(user_ids)))
+        ):
+            names[str(user.id)] = str(user.full_name or user.username)
+    channel_ids = {str(row.channel_id) for row in rows if row.channel_id is not None}
+    owners: dict[str, str | None] = {}
+    if channel_ids:
+        for channel in session.scalars(
+            select(ChannelRow).where(ChannelRow.id.in_(sorted(channel_ids)))
+        ):
+            owners[str(channel.id)] = str(channel.user_id)
+    return _Directory(names=names, owners=owners)
+
+
+def _human_name(
+    session: Any, user_id: str | None, directory: _Directory = _NO_DIRECTORY
+) -> str | None:
     if user_id is None:
         return None
+    if user_id in directory.names:
+        return directory.names[user_id]
     user = session.get(LocalUserRow, user_id)
     if user is None:
         return None
     return str(user.full_name or user.username)
 
 
-def _author(session: Any, kind: str | None, author_id: str | None) -> Author | None:
+def _author(
+    session: Any,
+    kind: str | None,
+    author_id: str | None,
+    directory: _Directory = _NO_DIRECTORY,
+) -> Author | None:
     if kind == "human":
-        return Author("human", author_id, _human_name(session, author_id))
+        return Author("human", author_id, _human_name(session, author_id, directory))
     if kind == "agent":
         return Author("agent", author_id)
     if kind == "system":
@@ -524,7 +579,9 @@ def _author(session: Any, kind: str | None, author_id: str | None) -> Author | N
     return None
 
 
-def _owner_id(session: Any, channel_id: str) -> str | None:
+def _owner_id(session: Any, channel_id: str, directory: _Directory = _NO_DIRECTORY) -> str | None:
+    if channel_id in directory.owners:
+        return directory.owners[channel_id]
     channel = session.get(ChannelRow, channel_id)
     return None if channel is None else str(channel.user_id)
 
@@ -717,7 +774,12 @@ def _artifact_ref(row: MessageArtifactRow) -> ArtifactRef:
     )
 
 
-def _history_line(session: Any, row: Any, files: tuple[ArtifactRef, ...]) -> str:
+def _history_line(
+    session: Any,
+    row: Any,
+    files: tuple[ArtifactRef, ...],
+    directory: _Directory = _NO_DIRECTORY,
+) -> str:
     """One message as a turn's history carries it.
 
     The single place that shape is written, so what counts against the
@@ -732,15 +794,15 @@ def _history_line(session: Any, row: Any, files: tuple[ArtifactRef, ...]) -> str
         "kind": str(row.kind),
         "content": str(row.content),
     }
-    author = _author(session, row.author_kind, row.author_id)
+    author = _author(session, row.author_kind, row.author_id, directory)
     if author is None:
         derived = message_author(
             str(row.role),
             str(row.kind),
             None if row.agent_slug is None else str(row.agent_slug),
-            _owner_id(session, str(row.channel_id)),
+            _owner_id(session, str(row.channel_id), directory),
         )
-        author = _author(session, derived.kind, derived.id) or derived
+        author = _author(session, derived.kind, derived.id, directory) or derived
     line["author_kind"] = author.kind
     line["author"] = author.id
     if files:
@@ -771,6 +833,7 @@ def _message(
     session: Any,
     row: MessageRow,
     attachments: Mapping[str, tuple[ArtifactRef, ...]] | None = None,
+    directory: _Directory = _NO_DIRECTORY,
 ) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
@@ -780,7 +843,7 @@ def _message(
         agent_slug = agent_slug or ANGIE_SLUG
         if isinstance(work, dict) and work.get("agent_slug") is None:
             work["agent_slug"] = ANGIE_SLUG
-    author = _author(session, row.author_kind, row.author_id)
+    author = _author(session, row.author_kind, row.author_id, directory)
     if author is not None and author.kind == "human" and author.id is None:
         # A guest on a linked surface: no account, so the name they use
         # there is the only one there is, and it rides with the origin.
@@ -788,9 +851,12 @@ def _message(
     if author is None:
         # Written by a release that recorded no author.
         derived = message_author(
-            str(row.role), str(row.kind), agent_slug, _owner_id(session, str(row.channel_id))
+            str(row.role),
+            str(row.kind),
+            agent_slug,
+            _owner_id(session, str(row.channel_id), directory),
         )
-        author = _author(session, derived.kind, derived.id) or derived
+        author = _author(session, derived.kind, derived.id, directory) or derived
     return Message(
         id=str(row.id),
         channel_id=str(row.channel_id),
@@ -2841,7 +2907,8 @@ class CollaborationStore:
                 )
             )
             attachments = _attachments(session, [str(row.id) for row in rows])
-            return [_message(session, row, attachments) for row in rows]
+            known = _directory(session, rows)
+            return [_message(session, row, attachments, known) for row in rows]
 
     def accept_turn(
         self,
@@ -3380,10 +3447,12 @@ class CollaborationStore:
                 )
             )
             carried = _attachments(session, [str(message.id) for message in newest])
+            known = _directory(session, newest)
             kept: list[int] = []
             held = 0
             for message in newest:
-                held += len(_history_line(session, message, carried.get(str(message.id), ()))) + 1
+                line = _history_line(session, message, carried.get(str(message.id), ()), known)
+                held += len(line) + 1
                 if kept and held > max_chars:
                     break
                 kept.append(int(message.sequence))
@@ -3825,10 +3894,11 @@ class CollaborationStore:
             dropped = len(rows) > HISTORY_MESSAGES
             rows = rows[:HISTORY_MESSAGES]
             attachments = _attachments(session, [str(row.id) for row in rows])
+            known = _directory(session, rows)
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                chunk = _history_line(session, row, attachments.get(str(row.id), ()))
+                chunk = _history_line(session, row, attachments.get(str(row.id), ()), known)
                 if len(chunk) > remaining:
                     dropped = True
                     break
