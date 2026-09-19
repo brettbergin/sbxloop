@@ -430,6 +430,25 @@ jobs:
 
           echo "::notice::${HOST} is healthy on ${VERSION}"
 
+      - name: Refresh the baked template
+        # A template baked under the previous release carries the previous
+        # worker: provisioning probes it stale and runs the install ladder
+        # on every sandbox until someone re-bakes (doctor says so, nobody
+        # reads doctor after every deploy). Re-bake once per deploy, on the
+        # hosts that have baked before (the bake record is their opt-in).
+        # Best effort: a bake that fails leaves the daemon on the ladder,
+        # never down, and the deploy is already healthy above.
+        if: steps.final.outputs.changed == 'true' && steps.health.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          record="${SBXLOOP_HOME}/state/bake.json"
+          if [ ! -f "${record}" ]; then
+            echo "no bake record at ${record}; this host does not use a baked template"
+            exit 0
+          fi
+          "${SBXLOOP}" bake </dev/null
+
       - name: Roll back
         id: rollback
         # Only once the upgrade ran: a failure before it (wheels, the wait)
