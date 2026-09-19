@@ -355,4 +355,7 @@ def upsert(loop: Any, item: WorkItem, *, by: str | None) -> tuple[WorkItem, bool
         fresh=fresh,
         title=stored.title[:80],
     )
+    if fresh:
+        # The row is in; the loop need not sit out its poll interval.
+        loop.wake()
     return stored, fresh

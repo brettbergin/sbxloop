@@ -225,6 +225,11 @@ class FakeLoop:
         # restart (#969): supervised unless a test says otherwise
         self.supervisor_kind: str | None = "systemd"
         self.restarts: list[dict[str, Any]] = []
+        # `wake()` calls: work queued from outside the tick.
+        self.wakes = 0
+
+    def wake(self) -> None:
+        self.wakes += 1
 
     @property
     def paused(self) -> bool:

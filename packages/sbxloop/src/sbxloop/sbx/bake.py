@@ -175,6 +175,10 @@ def bake_template(
             sandbox.mkdirs(SBXLOOP_DIR)
             sandbox.write_text(BAKE_MANIFEST, json.dumps(manifest))
 
+            # sbx refuses to save a running sandbox (0.43: "is running and
+            # must be stopped before saving"); the scratch box is done.
+            report(f"stopping {name}")
+            cli.stop(name)
             report(f"saving template {ref}")
             cli.template_save(name, ref)
         except SbxloopError as exc:

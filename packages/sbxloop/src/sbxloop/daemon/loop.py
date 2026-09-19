@@ -408,6 +408,12 @@ class DaemonLoop:
         # at dispatch, the same one its run gets; a test may set it.
         self.memory: MemoryBlocks | None = None
         self._stop = threading.Event()
+        # What ends the wait between ticks early: a stop, and `wake()`, the
+        # signal that something queued work from outside the tick (the
+        # concierge's `start_workload`, an API admission). Cleared just
+        # before each tick, so a wake that lands mid-tick is never lost:
+        # the next wait returns at once and that tick finds the row.
+        self._wake = threading.Event()
         # An operator's `stop`: unlike a signal, it lets a landing the
         # daemon is completing finish before the process exits.
         self._graceful = False
@@ -651,6 +657,7 @@ class DaemonLoop:
         and any landing in progress, then let ``run_forever`` return."""
         self._graceful = True
         self._stop.set()
+        self._wake.set()
 
     # -- restart (#969) ------------------------------------------------------------
 
@@ -1489,6 +1496,7 @@ class DaemonLoop:
         in-flight engine to cancel, wait briefly. Stable across runs — it
         looks up the current engine at call time."""
         self._stop.set()
+        self._wake.set()
         handles = self.runs
         if not handles:
             log.info("daemon.quiesce", run=None)
@@ -1652,6 +1660,7 @@ class DaemonLoop:
         ticks = 0
         try:
             while not self._stop.is_set():
+                self._wake.clear()
                 started = time.monotonic()
                 result = self.tick()
                 ticks += 1
@@ -1673,9 +1682,10 @@ class DaemonLoop:
         """Wait for the next poll. With runs in flight the wait ends as soon
         as one of them finishes, so its slot is refilled (and its item
         settled) without sitting out the poll interval, and an operator
-        override from another process is noticed within a second."""
+        override from another process is noticed within a second. A
+        ``wake()`` (work queued from outside the tick) ends it at once."""
         if not self.runs:
-            self._stop.wait(timeout)
+            self._wake.wait(timeout)
             return
         deadline = time.monotonic() + timeout
         while not self._stop.is_set():
@@ -1686,7 +1696,14 @@ class DaemonLoop:
             left = deadline - time.monotonic()
             if left <= 0:
                 return
-            self._stop.wait(min(1.0, left))
+            if self._wake.wait(min(1.0, left)):
+                return
+
+    def wake(self) -> None:
+        """Something queued work from outside the tick: end the wait between
+        ticks now rather than at the next poll interval. Cheap and
+        idempotent; a wake with nothing to run costs one empty tick."""
+        self._wake.set()
 
     def drain(self) -> tuple[tuple[str, TickOutcome], ...]:
         """Wait for every run in flight to end and settle each one; what
@@ -1756,7 +1773,33 @@ class DaemonLoop:
         idle = self._dispatch_gate(now, first=True)
         if idle is not None:
             return idle
-        discovered = self._discover(now) + self._fire_schedules(now)
+        # What is already queued (a chat ask, an API admission, a schedule's
+        # tick, an issue an earlier poll found) runs before the forge is
+        # polled: the poll is seconds of sandbox execs, and a person's ask
+        # does not wait behind it (field: 17-137s from ask to dispatch).
+        # Schedules are the store's own clock, cheap and due on every tick,
+        # so they fire first and their items join the same pass.
+        fired = self._fire_schedules(now)
+        result = self._dispatch_pass(now, discovered=fired)
+        if result.launched and self._serial:
+            # One item per tick, settled before the tick returns; the next
+            # tick follows at once and polls then.
+            return result
+        discovered = fired + self._discover(now)
+        if discovered == fired:
+            return result
+        if result.launched and (self._stop.is_set() or self._dispatch_gate(now) is not None):
+            return result._replace(discovered=discovered)
+        again = self._dispatch_pass(now, discovered)
+        if not result.launched:
+            return again
+        if not again.launched:
+            return result._replace(discovered=discovered)
+        return result._replace(discovered=discovered, launched=result.launched + again.launched)
+
+    def _dispatch_pass(self, now: float, discovered: int) -> TickResult:
+        """Start queued items while there is room for them (one, when runs
+        are serial); the tick's result when nothing more can start."""
         limit = self.config.daemon.max_concurrent_runs
         launched: list[str] = []
         outcome: TickOutcome | None = None

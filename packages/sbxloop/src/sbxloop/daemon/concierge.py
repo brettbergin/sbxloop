@@ -2390,6 +2390,8 @@ class Concierge:
         profile_text = f"profile `{profile.name}`" if profile is not None else "no profile"
         if not queued:
             return f"`{item.item_id}` is already queued or running ({profile_text})."
+        # The row is in; the loop need not sit out its poll interval.
+        self.loop.wake()
         status = self.loop.status()
         note = ""
         if status.get("paused"):
@@ -2398,9 +2400,8 @@ class Concierge:
             note = " The breaker is OPEN — nothing runs until it resets."
         return (
             f"queued workload `{item.item_id}` under {profile_text} — the daemon starts it "
-            f"within {self.config.daemon.poll_interval_s:g}s, after anything already queued; "
-            "a run thread will appear here and the person will be pinged when the result "
-            f"is published.{note}"
+            "now, after anything already queued; a run thread will appear here and the "
+            f"person will be pinged when the result is published.{note}"
         )
 
     def _entrygraph_tools(self) -> list[HostTool]:
@@ -2506,6 +2507,8 @@ class Concierge:
                 by=by,
                 fresh=queued,
             )
+            if queued:
+                self.loop.wake()
             state = "queued" if queued else "already queued or running"
             lines.append(f"{state} entrygraph workload `{item_id}` for {target}.")
         lines.append(
