@@ -2881,6 +2881,10 @@ class Concierge:
             queued=queued,
         )
         self._note_code_admission(str(ref.number), repo)
+        if queued:
+            # The labelled issue is on the forge; the next poll finds it,
+            # and the poll need not wait out the interval (field: 55s).
+            self.loop.wake()
         if not queued:
             return (
                 f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
@@ -3040,10 +3044,11 @@ class Concierge:
         self._note_code_admission(str(number), repo)
         if self._turn_code_work is not None:
             self._turn_code_work(repo, number, f"Issue #{number}")
+        # The label is on the forge; the poll need not wait out the interval.
+        self.loop.wake()
         return (
-            f"added `{trigger}` to #{number} — the daemon claims it on its next poll "
-            f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
-            "already queued."
+            f"added `{trigger}` to #{number} — the daemon polls for it now "
+            "and runs it after anything already queued."
         )
 
     def _tool_comment_on_issue(self, args: dict[str, Any], by: str) -> str:

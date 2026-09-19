@@ -698,6 +698,13 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **An issue the concierge files or labels is polled for at once.** Field
+  (db, 2026-09-19): a code task asked for in chat was filed as a labelled
+  issue in 11s and then sat 55s until the next forge poll found it. The
+  `create_issue` and `label_issue_for_run` tools now wake the loop, which
+  polls the forge on that tick; the replies say so instead of quoting the
+  poll interval.
+
 - **The chat UI's polling no longer serialises behind reads that grow with a
   channel's history.** Over five days one daemon served 14,593
   `GET /v1/channels/{id}/work` at 186 ms mean (915 ms worst) and 14,591

@@ -1487,7 +1487,7 @@ class TestTools:
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
         origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
-        concierge, client, _, _, dstore = make(
+        concierge, client, _, loop, dstore = make(
             tmp_path,
             [
                 {
@@ -1525,6 +1525,9 @@ class TestTools:
         assert body.startswith("Wrap fetch().\n\n---\nFiled by Discord user `ana` (via concierge)")
         assert "777" not in body  # the requester never reaches the public issue
         assert not any("/labels" in p for p in github.paths)  # already queued: no label call
+        # The labelled issue is on the forge: the loop is woken to poll for
+        # it now rather than at its next interval (field: 55s of waiting).
+        assert loop.wakes == 1
         # ...but the daemon's store knows who asked, so the work item will.
         dstore.upsert_new(
             WorkItem(item_id="gh:issue:41", source_key="41", title="Add retries"), 1.0
@@ -1540,7 +1543,9 @@ class TestTools:
         assert origins[-1] == ("owner/repo", 12, "Issue #12")
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
+        assert "polls for it now" in labelled.text
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
+        assert loop.wakes == 2
 
     def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
         origins: list[tuple[str, int, str]] = []
