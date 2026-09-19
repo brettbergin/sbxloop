@@ -3256,11 +3256,13 @@ class TestStartWorkload:
         return response.text or "", dstore, loop
 
     def test_queues_a_chat_item_under_the_default_profile(self, tmp_path: Path) -> None:
-        text, dstore, _ = self._call(
+        text, dstore, loop = self._call(
             tmp_path, {"ask": "Summarise last week's deploys\n\nOne paragraph per day."}
         )
         assert text.startswith("queued workload `chat:9001` under profile `research`")
-        assert "within 60s" in text and "run thread will appear here" in text
+        assert "starts it now" in text and "run thread will appear here" in text
+        # The loop is woken rather than left to its poll interval.
+        assert loop.wakes == 1
         item = dstore.get("chat:9001")
         assert item is not None
         assert item.kind == "workload" and item.profile == "research"

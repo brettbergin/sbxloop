@@ -656,6 +656,20 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A queued ask no longer waits for the poll interval, or behind the forge
+  poll.** Field (db, 2026-09-19): a chat ask sat 17-137s between the
+  concierge's `start_workload` and `run.dispatch`, because nothing woke the
+  loop from its `poll_interval_s` wait and the tick polled the forge (four
+  cold worker boots, ~11s) before it read the queue. `DaemonLoop.wake()` now
+  ends the wait the moment the concierge or the API intake queues an item,
+  and a tick fires its schedules and dispatches what is already queued before
+  it polls; a poll that finds something dispatches again while slots remain.
+  The concierge's queued reply says "starts it now" rather than "within Ns".
+
+- **`sbxloop bake` completes on sbx 0.43.** `sbx template save` refuses a
+  running sandbox, so the bake failed at its last step on every host with
+  that sbx; it now stops the scratch box first.
+
 - **A conversation that mentions an agent can no longer operate the
   daemon.** Such a turn may only reply, but it lost only the five tools that
   start managed work and kept every other host tool, including
