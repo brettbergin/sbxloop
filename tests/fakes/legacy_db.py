@@ -25,6 +25,9 @@ Daemon store (``daemon_work_items`` and friends):
   ``daemon_chat_threads`` with ``PRIMARY KEY (run_id)``,
   ``daemon_run_watches`` without a ``backend`` column, and the gate's
   prompt location on the ``daemon_merge_gates`` row itself.
+- ``pre_message_link``: before revision 0032: the item table carries its
+  ``run_kind`` but no ``message_id``, so a chat ask's message was read out
+  of ``source_key`` with a prefix match no index can serve.
 
 Engine store (``runs`` / ``phase_attempts``):
 
@@ -97,6 +100,15 @@ _DAEMON_ITEMS_PRIOR = _DAEMON_ITEMS_CLAIM_TOKEN.replace(
     "claim_token TEXT, prior_run_id TEXT, prior_branch TEXT, prior_pr_number INTEGER, ",
 )
 
+# The item table at the 1.0 baseline: it carries the run kind, which is
+# what revision 0032's backfill reads, and no message link. The columns
+# later revisions add are left to those revisions, so opening this shape
+# runs the whole chain the way a database in the field does.
+_DAEMON_ITEMS_PRE_MESSAGE = _DAEMON_ITEMS_PRIOR.replace(
+    "UNIQUE(source_key, repo))",
+    "run_kind TEXT NOT NULL DEFAULT 'code', profile TEXT, UNIQUE(source_key, repo))",
+)
+
 # The chat tables as every release before the local bridge wrote them:
 # one thread per run, one watcher list per run, the prompt on the gate.
 _DAEMON_CHAT_THREADS_RUN_KEYED = (
@@ -131,6 +143,7 @@ DAEMON_SHAPES: dict[DaemonShape, tuple[str, ...]] = {
         _DAEMON_MERGE_GATES_PROMPT_ON_ROW,
         _DAEMON_STATE,
     ),
+    "pre_message_link": (_DAEMON_ITEMS_PRE_MESSAGE, _DAEMON_REQUESTERS_REPO),
 }
 
 # Every state a work-item row can be in, with the bookkeeping a deployed
@@ -216,6 +229,20 @@ def every_daemon_row(
             written.append((item_id, str(state["state"])))
             n += 1
     return written
+
+
+def raw_daemon_message_ids(path: Path) -> dict[str, str | None]:
+    """``item_id -> message_id`` straight from the file, bypassing the store."""
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            str(item_id): None if message_id is None else str(message_id)
+            for item_id, message_id in conn.execute(
+                "SELECT item_id, message_id FROM daemon_work_items"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
 
 
 def raw_daemon_rows(path: Path) -> list[tuple[str, str]]:
