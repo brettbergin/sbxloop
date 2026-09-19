@@ -697,7 +697,8 @@ service_memory = "2g"
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
 # retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human
-# ci_poll_interval_s = 60
+# ci_poll_interval_s = 60    # the longest wait between polls of the forge (CI, undraft, mergeability, merge)
+# ci_poll_min_s = 10         # the first wait on one of those; it doubles each time up to ci_poll_interval_s
 # ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI" — after a delivery, and again
 #                            # at landing for a head no poll has seen (a resume, a merge-gate approve, an update-branch).
 #                            # Calibrated to GitHub Actions' check-run registration latency; raise it for CI that
