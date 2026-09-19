@@ -1750,6 +1750,17 @@ class PhaseRunner:
             "- a repository checkout (`repo`, as `owner/name`, one configured for this "
             "host): " + ("allowed" if profile.repo else "not allowed")
         )
+        # `[budgets] max_parallel_tasks` above 1 runs independent tasks at
+        # once in ONE workspace. `depends_on` is the planner's own word and
+        # certifies nothing about files, so the planner is told what it
+        # must keep apart rather than trusted to guess.
+        lanes = profile.budgets.max_parallel_tasks or self.config.budgets.max_parallel_tasks
+        if lanes > 1:
+            lines.append(
+                f"- up to {lanes} tasks run at the same time in one shared workspace: give "
+                "each task its own output files, and never have two tasks edit the same "
+                "file (make one depend on the other instead)"
+            )
         return "\n".join(lines)
 
     @staticmethod
