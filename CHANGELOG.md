@@ -656,6 +656,16 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A conversation that mentions an agent can no longer operate the
+  daemon.** Such a turn may only reply, but it lost only the five tools that
+  start managed work and kept every other host tool, including
+  `sbx_control`, which runs operator commands with full authority. Any
+  member who could post a conversation could have an agent retry, requeue,
+  cancel, merge, release, pause or restart the daemon, change its config
+  with `set_config`, or close and comment on issues. A turn that may only
+  reply now keeps the read tools alone, the same allowlist a reviewer gets,
+  and a call to anything else is refused as an unknown tool.
+
 - **A chat bridge turn waiting behind another no longer holds a concierge
   worker, so chat cannot deadlock or starve other channels.** A turn took its
   place in its session's lane and was handed to the pool in two separate

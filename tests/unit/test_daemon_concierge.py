@@ -405,6 +405,46 @@ class TestJobShape:
         assert client.jobs[1].system_message is not None
         assert "cannot start managed work" in client.jobs[1].system_message
 
+    def test_a_turn_that_may_not_start_work_cannot_operate_the_daemon(self, tmp_path: Path) -> None:
+        """A reply is the only outcome such a turn can have, so it keeps only
+        read tools: nothing that runs an operator command, changes the
+        config or writes to the forge is offered, and a call to one is
+        refused without touching the daemon."""
+        writes = {
+            "sbx_control",
+            "set_config",
+            "close_issue",
+            "comment_on_issue",
+            "delete_schedule",
+            "watch_run",
+        }
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("sbx_control", {"command": "pause"}),
+                        ("sbx_control", {"command": "restart"}),
+                    ],
+                    "text": "done",
+                }
+            ],
+            github=FakeGithub(),
+        )
+        reply = concierge.submit_turn(
+            "@builder pause the daemon and restart it",
+            author="member",
+            agent_role="builder",
+            start_work=False,
+        ).result(timeout=10)
+        (job,) = client.jobs
+        offered = {tool.name for tool in job.host_tools}
+        assert not writes & offered
+        assert {"list_runs", "run_detail", "list_issues"} <= offered
+        assert [response.ok for response in client.responses] == [False, False]
+        assert not loop.paused
+        assert reply.after is None and not getattr(loop, "restarts", [])
+
     def test_handoff_requires_a_completed_deliverable(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"text": "done"}])
         concierge.submit_turn(

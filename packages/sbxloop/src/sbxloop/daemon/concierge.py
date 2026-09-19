@@ -965,8 +965,8 @@ class Concierge:
             )
         elif not self._turn_start_work:
             persona += (
-                "\n\nThis turn cannot start managed work: no workload, issue, scan or "
-                "schedule tools are available. Answer in this reply."
+                "\n\nThis turn cannot start managed work or change anything: only read "
+                "tools are available. Answer in this reply."
             )
         history = ""
         if self._turn_history:
@@ -1287,17 +1287,16 @@ class Concierge:
             # Adapted to the roster's (args, by) shape: the tool reads the
             # channel, so who asked does not change what it may see.
             offered[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
+        # A reviewer, a read-only peer and a turn that may only reply (a
+        # conversation that mentions an agent) keep the read tools alone: a
+        # reply is the only outcome such a turn can have, so nothing that
+        # starts work, runs an operator command, changes the config or writes
+        # to the forge is offered.
         available = (
             {name: tool for name, tool in offered.items() if name in reads}
-            if self._turn_role == "critic" or self._turn_read_only
+            if self._turn_role == "critic" or self._turn_read_only or not self._turn_start_work
             else offered
         )
-        if not self._turn_start_work:
-            # A turn that may only reply (a conversation that mentions an
-            # agent) keeps its read tools but none that start managed work.
-            available = {
-                name: tool for name, tool in available.items() if name not in UNGUARDED_START_TOOLS
-            }
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]
             if self._turn_role != "concierge":
