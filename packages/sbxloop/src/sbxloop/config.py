@@ -1719,9 +1719,12 @@ class LandingConfig(_ConfigModel):
     by a re-delivery onto the same branch, so a round costs real turns; a
     run past either budget ends ``failed`` with the PR still a draft.
 
-    CI is polled every ``ci_poll_interval_s`` for at most ``ci_timeout_s``
-    per wait; the wait is not charged to ``[budgets] max_wall_clock_s``,
-    which bounds agent work. ``ci_settle_s`` is how long "no check runs
+    CI is polled for at most ``ci_timeout_s`` per wait, starting every
+    ``ci_poll_min_s`` and doubling up to ``ci_poll_interval_s`` while the
+    same thing is waited on (a check that finishes in a minute is seen in
+    seconds; a slow one costs one call a minute); the wait is not charged
+    to ``[budgets] max_wall_clock_s``, which bounds agent work.
+    ``ci_settle_s`` is how long "no check runs
     yet" must persist before it counts as "this repository has no CI":
     Actions registers its check runs a few seconds after a push, and
     merging in that gap would merge before CI started.
@@ -1761,6 +1764,10 @@ class LandingConfig(_ConfigModel):
     # exhausted run straight to a human (`ctl grant-rounds` still works).
     retry_rounds: int = Field(default=2, ge=0)
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
+    # The first wait on a forge-side change; each wait on the same thing
+    # doubles until ci_poll_interval_s (field, 2026-09-19: a green MR spent
+    # three minutes in 60s polls between its CI and its merge).
+    ci_poll_min_s: float = Field(default=10.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)
     # The wait for a human review (#675): how often the parked PR is read

@@ -664,6 +664,14 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Changed
 
+- **Forge polls start short and back off.** Field (db, 2026-09-19): a merge
+  request whose CI went green in two seconds spent three more minutes in
+  60s polls (a settle read, the undraft, the mergeability read, the merge)
+  before it merged, each answered by the forge in seconds. The wait between
+  polls now starts at `[landing] ci_poll_min_s` (10s) and doubles while the
+  same thing is waited on, up to `ci_poll_interval_s` as before; waiting on
+  something else starts over. A slow CI still costs one call a minute.
+
 - **A workload planner is told when its tasks run at the same time.** With
   `max_parallel_tasks` above 1 (in `[budgets]` or a profile's own
   `[workloads.budgets]`), independent tasks share one workspace at once, and

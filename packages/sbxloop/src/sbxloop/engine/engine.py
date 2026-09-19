@@ -397,6 +397,11 @@ class LoopEngine:
         # Seconds this run spent waiting on GitHub (CI, landing). Excluded
         # from the agent wall-clock budget: that bounds work, not waiting.
         self._waited_s = 0.0
+        # What the last forge poll waited on and how many times in a row:
+        # the wait starts short and doubles while the same thing is waited
+        # on, and starts over when the wait is for something else.
+        self._poll_waiting: str | None = None
+        self._poll_streak = 0
         # Latest sandbox.resources sample per sandbox role, fed by the bus;
         # consulted for the disk guardrail and the harvest-truncation note.
         self._last_resources: dict[str, dict[str, object]] = {}
@@ -4512,6 +4517,21 @@ class LoopEngine:
             )
         return p.login
 
+    def _poll_wait_s(self, waiting: str) -> float:
+        """How long the next wait on ``waiting`` is: ``ci_poll_min_s`` the
+        first time, doubling on each further wait for the same thing, never
+        past ``ci_poll_interval_s``. A wait for something else starts over,
+        so an undraft or a mergeability read after a green CI is seen in
+        seconds rather than a full interval later."""
+        landing = self.config.landing
+        if waiting != self._poll_waiting:
+            self._poll_waiting, self._poll_streak = waiting, 0
+        wait_s = min(
+            landing.ci_poll_interval_s, landing.ci_poll_min_s * float(2**self._poll_streak)
+        )
+        self._poll_streak += 1
+        return float(wait_s)
+
     def _tick(self, p: Pipeline, waiting: str) -> None:
         """One wait interval between GitHub polls: honour cancellation,
         answer chat, keep the run visibly alive, then sleep — cut short by
@@ -4528,7 +4548,7 @@ class LoopEngine:
         )
         self.store.touch_run(run_id)
         started = self.clock()
-        self._wake.wait(self.config.landing.ci_poll_interval_s)
+        self._wake.wait(self._poll_wait_s(waiting))
         self._wake.clear()
         self._waited_s += max(0.0, self.clock() - started)
         self._check_cancelled_and_clock(run_id, p.deadline)
