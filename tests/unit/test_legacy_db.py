@@ -27,6 +27,7 @@ from tests.fakes.legacy_db import (
     insert_phase_row,
     insert_row,
     insert_run_row,
+    raw_daemon_message_ids,
     raw_daemon_rows,
 )
 
@@ -84,6 +85,55 @@ class TestDaemonShapes:
             assert store.upsert_new(item("4", item_id="gh:o/a:issue:4", repo="o/a"), 1.0)
             assert store.upsert_new(item("4", item_id="gh:o/b:issue:4", repo="o/b"), 1.0)
             store.close()
+
+    def test_pre_message_link_chat_rows_are_backfilled_from_their_key(self, tmp_path: Path) -> None:
+        """Revision 0032's contract: a chat ask recorded before the item
+        carried its message id is linked to its conversation by the
+        backfill, so the projection joins on an indexed column and never
+        falls back to matching the key's prefix. Work keyed by an issue,
+        a schedule or an inbox file names no message and stays NULL."""
+        path = daemon_db(tmp_path, "pre_message_link")
+        rows = {
+            "chat:msg_a1": ("msg_a1", "workload"),
+            "chat:msg_a1:2": ("msg_a1:2", "workload"),
+            "chat:msg_b2:entrygraph:9f": ("msg_b2:entrygraph:9f", "tool"),
+            "gh:issue:7": ("7", "code"),
+            # A schedule's tick is a workload keyed by the minute it was
+            # due, not by a message; its key must not be read as one.
+            "sched:daily:2026-09-05T07:00Z": ("2026-09-05T07:00Z", "workload"),
+        }
+        for index, (item_id, (source_key, kind)) in enumerate(rows.items()):
+            insert_row(
+                path,
+                "daemon_work_items",
+                item_id=item_id,
+                source_key=source_key,
+                title=f"Item {index}",
+                body="",
+                url="",
+                state="queued",
+                created_at=1.0,
+                updated_at=1.0,
+                run_kind=kind,
+            )
+        store = DaemonStore(path)
+        try:
+            assert raw_daemon_message_ids(path) == {
+                "chat:msg_a1": "msg_a1",
+                "chat:msg_a1:2": "msg_a1",
+                "chat:msg_b2:entrygraph:9f": "msg_b2",
+                "gh:issue:7": None,
+                "sched:daily:2026-09-05T07:00Z": None,
+            }
+            # Every row still reads, and a reopen changes nothing.
+            assert len(store.items()) == len(rows)
+        finally:
+            store.close()
+        again = DaemonStore(path)
+        try:
+            assert len(again.items()) == len(rows)
+        finally:
+            again.close()
 
     def test_pre_local_bridge_chat_state_survives(self, tmp_path: Path) -> None:
         """Threads, watches and the gate prompt written by a one-bridge

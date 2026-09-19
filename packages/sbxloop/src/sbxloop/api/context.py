@@ -1223,18 +1223,21 @@ class ApiContext:
 
     def _channel_work(self, channel_id: str) -> tuple[list[str], list[str]]:
         """The runs the channel's work items are executing, and the ids of
-        the items it queued that have not started."""
+        the items it queued that have not started.
+
+        Asked of the store as one narrow query. Listing every item the
+        daemon has ever held to find one channel's live few ran under the
+        store's single lock, sorted on an unindexed column and hydrated
+        every body along the way.
+        """
         if self.loop is None:
             return [], []
         try:
-            items = self.loop.dstore.items(["running", "queued"])
+            running, queued = self.loop.dstore.channel_live_work(channel_id)
+            return list(running), list(queued)
         except Exception:
             log.warning("collaboration.channel_runs_unreadable", exc_info=True)
             return [], []
-        mine = [item for item in items if getattr(item, "channel_id", None) == channel_id]
-        running = [item.run_id for item in mine if item.state == "running" and item.run_id]
-        queued = [item.item_id for item in mine if item.state == "queued"]
-        return running, queued
 
     def _agent_memory(
         self,
