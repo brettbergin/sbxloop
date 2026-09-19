@@ -675,6 +675,23 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **The chat UI's polling no longer serialises behind reads that grow with a
+  channel's history.** Over five days one daemon served 14,593
+  `GET /v1/channels/{id}/work` at 186 ms mean (915 ms worst) and 14,591
+  `GET .../turns` at 109 ms, peaking at 207 requests a minute from a single
+  browser tab; every one of them runs under the store's one process-wide
+  lock, against the daemon's own writes. Work is now linked to the message
+  that asked for it through an indexed `message_id` on the item row (schema
+  revision 0032, backfilled from `source_key`) instead of a prefix match no
+  index could serve; the items and runs behind a channel's links are read in
+  one query each rather than one per link; the scan for code links is bounded
+  to the same window the messages page carries; a turn's history and a
+  messages page read their authors in one query instead of one per author;
+  the chronology's projection answers "nothing to copy" from a read, so N
+  open tabs no longer cost N write-lock acquisitions a second; and stopping a
+  channel asks the store for that channel's live work rather than listing
+  every item the daemon has ever held.
+
 - **A queued ask no longer waits for the poll interval, or behind the forge
   poll.** Field (db, 2026-09-19): a chat ask sat 17-137s between the
   concierge's `start_workload` and `run.dispatch`, because nothing woke the
