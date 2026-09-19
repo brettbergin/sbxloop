@@ -29,6 +29,22 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **Warm sandbox sets: `[daemon] warm_pairs`.** Field (db, 2026-09-19): a
+  run spent 57 to 94 seconds between dispatch and its first model call
+  booting microVMs and installing the worker, every run. The daemon now
+  keeps that many sets ready (agent box plus forge box, booted, workers
+  installed) under run ids nobody has used yet, and a fresh run takes one:
+  provisioning finds its sandboxes in the inventory and skips the create and
+  the install ladder, the way a provider recovery reuses a surviving pair.
+  Nothing about a run's names, paths or cleanup changes. A set is keyed by a
+  fingerprint of what shaped it (version, template, backend, toolchains,
+  resources, forge, secret strategy); one from another configuration, older
+  than `warm_ttl_s`, or missing a sandbox is retired rather than handed out.
+  The registry (`state/daemon/warm-sets.json`) survives restarts, `status`
+  reports `warm`, and `sbxloop sandbox prune` leaves warm sets alone. Off by
+  default. The daemon's forge box also probes a baked template now instead
+  of running the install ladder on every provision.
+
 - **A resident worker per sandbox: `worker_transport = "resident"`.** Every
   `sbx exec` and `sbx cp` costs about a second of round trip through the
   sandbox backend whatever it runs (field, db 2026-09-19: `exec true` 1.15s,

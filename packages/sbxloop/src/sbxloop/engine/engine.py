@@ -474,8 +474,12 @@ class LoopEngine:
         profile: str | None = None,
         expects_mount: bool | None = None,
         assignment: AgentAssignment | None = None,
+        warm: bool = False,
     ) -> RunResult:
         """Drive a fresh run all the way through.
+
+        ``warm`` says ``run_id`` names a warm sandbox set (#47): its
+        sandboxes are already provisioned and provisioning reuses them.
 
         ``tasks`` pre-seeds the task graph and so skips DECOMPOSE — for work
         that is *already* decomposed. A normal run passes nothing.
@@ -573,7 +577,7 @@ class LoopEngine:
                 workspace_source="data-dir",
             )
             self._prior = PriorArtifacts(branch=None, pr_number=None)
-            return self._drive(run_id, outcome, expects_mount=expects_mount)
+            return self._drive(run_id, outcome, expects_mount=expects_mount, warm=warm)
         workspace = self.config.workspace_for_repo(self.config.github.repo)
         self.bus.emit(
             HostEventTypes.RUN_START,
@@ -585,7 +589,7 @@ class LoopEngine:
             or self.config.workspace_source(self.config.github.repo),
         )
         self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
-        return self._drive(run_id, outcome, expects_mount=expects_mount)
+        return self._drive(run_id, outcome, expects_mount=expects_mount, warm=warm)
 
     def _select_repo(self, repo: str | None) -> None:
         """Pin this engine's GitHub config to the run's repository.
@@ -931,6 +935,7 @@ class LoopEngine:
         workspace: Path | None = None,
         stage: str | None = None,
         expects_mount: bool | None = None,
+        warm: bool = False,
     ) -> RunResult:
         kind = self.store.get_run(run_id).kind
         with self._assignment_stamps(run_id, kind):
@@ -940,6 +945,7 @@ class LoopEngine:
                 workspace=workspace,
                 stage=stage,
                 expects_mount=expects_mount,
+                warm=warm,
             )
 
     def _drive_run(
@@ -950,6 +956,7 @@ class LoopEngine:
         workspace: Path | None = None,
         stage: str | None = None,
         expects_mount: bool | None = None,
+        warm: bool = False,
     ) -> RunResult:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
@@ -972,6 +979,8 @@ class LoopEngine:
         provider_recovery = ProviderRecovery(self.store, self.config.agent.backend)
         recovering_provider = provider_recovery.pending(run_id)
         credentials, kind = run_row.credentials, run_row.kind
+        # A warm set (#47) is reused the way a provider recovery reuses a
+        # surviving pair: the boxes are in the inventory under this run id.
         pair = provisioner.ensure_pair(
             run_id,
             workspace,
@@ -980,7 +989,7 @@ class LoopEngine:
             credentials=credentials,
             kind=kind,
             continue_branch=self._continue_branch(),
-            **({"reuse_sandboxes": True} if recovering_provider else {}),
+            **({"reuse_sandboxes": True} if recovering_provider or warm else {}),
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)

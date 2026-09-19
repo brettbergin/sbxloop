@@ -139,6 +139,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
+from sbxloop.sbx.warm import Warmer
 
 log = get_logger(__name__)
 
@@ -463,6 +464,19 @@ class DaemonLoop:
         self._source_failures = 0
         self._source_next_poll = 0.0
         self._last_gc: float | None = None
+        # Warm sandbox sets (#47): kept ready by a thread of their own when
+        # `[daemon] warm_pairs` asks for them; a fresh dispatch takes one.
+        self._warmer: Warmer | None = (
+            Warmer(
+                config,
+                self.sbx,
+                worker_python=self.worker_python,
+                install_workers=self.install_workers is not False,
+            )
+            if config.daemon.warm_pairs > 0 and self.sbx is not None
+            else None
+        )
+        self._warm_thread: threading.Thread | None = None
         # Schedules live in the store (#818); a `[[schedules]]` entry still
         # in sbxloop.toml is imported once, at first sight (the first tick
         # or schedule command, so its grid anchors where it always did),
@@ -1583,6 +1597,11 @@ class DaemonLoop:
             # Every run in flight, oldest first.
             "runs": [{**h.snapshot(), "repo": h.item.repo} for h in handles],
             "max_concurrent_runs": self.config.daemon.max_concurrent_runs,
+            "warm": (
+                {"ready": len(self._warmer.ready()), "target": self._warmer.target}
+                if self._warmer is not None
+                else None
+            ),
             "queued": len(self.dstore.queued()),
             "runs_today": self.dstore.runs_started_since(day_start),
             "runs_today_resets_at": day_end,
@@ -1657,6 +1676,7 @@ class DaemonLoop:
         )
         self._release_request_rejection_hold()
         self._report_restart()
+        self._start_warmer()
         ticks = 0
         try:
             while not self._stop.is_set():
@@ -1704,6 +1724,47 @@ class DaemonLoop:
         ticks now rather than at the next poll interval. Cheap and
         idempotent; a wake with nothing to run costs one empty tick."""
         self._wake.set()
+
+    # -- warm sandbox sets (#47) ------------------------------------------------
+
+    def _start_warmer(self) -> None:
+        warmer = self._warmer
+        if warmer is None or self._warm_thread is not None:
+            return
+        self._warm_thread = threading.Thread(
+            target=warmer.run_forever,
+            args=(self._stop,),
+            kwargs={"paused": lambda: self.paused, "run_finished": self._warm_run_finished},
+            name="sbxloop-warmer",
+            daemon=True,
+        )
+        self._warm_thread.start()
+        log.info("warm.started", target=warmer.target, ttl_s=warmer.ttl_s)
+
+    def _claim_warm(self, item: WorkItem) -> str | None:
+        """A warm set's run id for a fresh run of ``item``, or None: no pool,
+        nothing ready, or a tool run (its recipe stages the workspace the
+        sandbox must mount, which no warm set has)."""
+        if self._warmer is None or item.recipe is not None or item.kind == "tool":
+            return None
+        try:
+            return self._warmer.claim()
+        except Exception:
+            log.warning("warm.claim_failed", item=item.item_id, exc_info=True)
+            return None
+
+    def _warm_run(self, run_id: str) -> bool:
+        """Whether ``run_id`` was taken from the warm pool."""
+        return self._warmer is not None and self._warmer.is_claimed(run_id)
+
+    def _warm_run_finished(self, run_id: str) -> bool | None:
+        """For the warmer's sweep: whether a claimed set's run has ended;
+        None when no run of that id exists (yet)."""
+        try:
+            run = self.store.get_run(run_id)
+        except StateError:
+            return None
+        return run.state in TERMINAL_RUN_STATES
 
     def drain(self) -> tuple[tuple[str, TickOutcome], ...]:
         """Wait for every run in flight to end and settle each one; what
@@ -2718,7 +2779,9 @@ class DaemonLoop:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
         now = self.clock()
-        run_id = resume_run_id or new_run_id()
+        # A fresh run takes a warm set's id when one is ready (#47), so its
+        # provisioning finds the sandboxes already booted and installed.
+        run_id = resume_run_id or self._claim_warm(item) or new_run_id()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self._assign(self.dstore.get(item.item_id) or item, now)
@@ -4665,6 +4728,7 @@ class DaemonLoop:
         return engine.start(
             self.outcome_text(item),
             run_id=run_id,
+            warm=self._warm_run(run_id),
             repo=self._item_repo(item),
             prior_branch=prior.branch if prior else None,
             prior_pr=prior.pr_number if prior else None,

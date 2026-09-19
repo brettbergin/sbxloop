@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import re
 import time
+from collections.abc import Collection
 
 from pydantic import BaseModel, ConfigDict
 
@@ -81,12 +82,15 @@ def classify_sandboxes(
     min_age_s: float = DEFAULT_MIN_AGE_S,
     include_kept: bool = False,
     now: float | None = None,
+    warm_run_ids: Collection[str] = (),
 ) -> list[SandboxVerdict]:
     """Classify every ``sbxloop-*`` sandbox against the state DB.
 
     Non-sbxloop sandboxes are never considered. Names that carry the prefix
-    but do not match the ``sbxloop-<run>-<role>`` scheme (future taxonomies:
-    warm-pool standby, etc.) are reported but never marked orphaned.
+    but do not match the ``sbxloop-<run>-<role>`` scheme are reported but
+    never marked orphaned. ``warm_run_ids`` are the daemon's warm sets
+    (#47): sandboxes standing by under a run id no run has taken yet, which
+    the state DB cannot know about and prune must leave alone.
     """
     now = time.time() if now is None else now
     verdicts: list[SandboxVerdict] = []
@@ -94,7 +98,14 @@ def classify_sandboxes(
         if not info.name.startswith("sbxloop-"):
             continue
         verdicts.append(
-            _classify_one(info.name, store, min_age_s=min_age_s, include_kept=include_kept, now=now)
+            _classify_one(
+                info.name,
+                store,
+                min_age_s=min_age_s,
+                include_kept=include_kept,
+                now=now,
+                warm_run_ids=warm_run_ids,
+            )
         )
     return verdicts
 
@@ -106,6 +117,7 @@ def _classify_one(
     min_age_s: float,
     include_kept: bool,
     now: float,
+    warm_run_ids: Collection[str] = (),
 ) -> SandboxVerdict:
     if name.startswith(DAEMON_OWNED_PREFIXES):
         return SandboxVerdict(
@@ -121,6 +133,14 @@ def _classify_one(
         )
     run_id, suffix = match.group("run"), match.group("role")
     role = "github" if suffix in VCS_KINDS else suffix
+    if run_id in warm_run_ids:
+        return SandboxVerdict(
+            name=name,
+            run_id=run_id,
+            role=role,
+            reason="warm sandbox set standing by for the next run (`[daemon] warm_pairs`); "
+            "not touched — the daemon retires it itself",
+        )
 
     try:
         run = store.get_run(run_id)
@@ -248,6 +268,7 @@ def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole, config: Config
     remove_run_sandbox_secrets(cli, name, role, config)
 
 
-def count_orphans(cli: SbxCLI, store: StateStore) -> int:
+def count_orphans(cli: SbxCLI, store: StateStore, warm_run_ids: Collection[str] = ()) -> int:
     """Orphan-candidate count with default thresholds (doctor's view)."""
-    return sum(1 for v in classify_sandboxes(cli.ls(), store) if v.orphan)
+    verdicts = classify_sandboxes(cli.ls(), store, warm_run_ids=warm_run_ids)
+    return sum(1 for v in verdicts if v.orphan)

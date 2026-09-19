@@ -812,6 +812,8 @@ service_memory = "2g"
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
+# warm_pairs = 0                  # sandbox sets kept booted and installed ahead of dispatch (0-4)
+# warm_ttl_s = 21600              # a ready warm set older than this is removed and replaced
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # daily_token_budget = 2000000   # input+output tokens per day across runs and chat turns; unset: no budget
 # max_attempts_per_item = 2
