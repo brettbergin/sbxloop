@@ -1613,8 +1613,15 @@ def sandbox_prune(
     store = _store(config)
     cli = SbxCLI(app_name=config.app_name or None)
     try:
+        from sbxloop.sbx.warm import registry_for
+
         verdicts = classify_sandboxes(
-            cli.ls(), store, min_age_s=min_age * 3600.0, include_kept=include_kept
+            cli.ls(),
+            store,
+            min_age_s=min_age * 3600.0,
+            include_kept=include_kept,
+            # The daemon's warm sets (#47) have no run row yet; not orphans.
+            warm_run_ids=registry_for(config).run_ids(),
         )
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")

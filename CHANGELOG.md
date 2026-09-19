@@ -29,6 +29,22 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Added
 
+- **Warm sandbox sets: `[daemon] warm_pairs`.** Field (db, 2026-09-19): a
+  run spent 57 to 94 seconds between dispatch and its first model call
+  booting microVMs and installing the worker, every run. The daemon now
+  keeps that many sets ready (agent box plus forge box, booted, workers
+  installed) under run ids nobody has used yet, and a fresh run takes one:
+  provisioning finds its sandboxes in the inventory and skips the create and
+  the install ladder, the way a provider recovery reuses a surviving pair.
+  Nothing about a run's names, paths or cleanup changes. A set is keyed by a
+  fingerprint of what shaped it (version, template, backend, toolchains,
+  resources, forge, secret strategy); one from another configuration, older
+  than `warm_ttl_s`, or missing a sandbox is retired rather than handed out.
+  The registry (`state/daemon/warm-sets.json`) survives restarts, `status`
+  reports `warm`, and `sbxloop sandbox prune` leaves warm sets alone. Off by
+  default. The daemon's forge box also probes a baked template now instead
+  of running the install ladder on every provision.
+
 - **A resident worker per sandbox: `worker_transport = "resident"`.** Every
   `sbx exec` and `sbx cp` costs about a second of round trip through the
   sandbox backend whatever it runs (field, db 2026-09-19: `exec true` 1.15s,
@@ -681,6 +697,23 @@ a code run's checkout, is `404` like any other id from elsewhere.
   or a stream's access re-check. The single local user sees no change.
 
 ### Fixed
+
+- **The chat UI's polling no longer serialises behind reads that grow with a
+  channel's history.** Over five days one daemon served 14,593
+  `GET /v1/channels/{id}/work` at 186 ms mean (915 ms worst) and 14,591
+  `GET .../turns` at 109 ms, peaking at 207 requests a minute from a single
+  browser tab; every one of them runs under the store's one process-wide
+  lock, against the daemon's own writes. Work is now linked to the message
+  that asked for it through an indexed `message_id` on the item row (schema
+  revision 0032, backfilled from `source_key`) instead of a prefix match no
+  index could serve; the items and runs behind a channel's links are read in
+  one query each rather than one per link; the scan for code links is bounded
+  to the same window the messages page carries; a turn's history and a
+  messages page read their authors in one query instead of one per author;
+  the chronology's projection answers "nothing to copy" from a read, so N
+  open tabs no longer cost N write-lock acquisitions a second; and stopping a
+  channel asks the store for that channel's live work rather than listing
+  every item the daemon has ever held.
 
 - **A queued ask no longer waits for the poll interval, or behind the forge
   poll.** Field (db, 2026-09-19): a chat ask sat 17-137s between the
