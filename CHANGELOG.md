@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+**A saved agent is changed only by the person who saved it, or a workspace
+owner or admin.** `PATCH /v1/agents/{slug}` and
+`POST /v1/agents/{slug}/archive` asked only for `collaboration:write`,
+which every member holds, so any member could rewrite another person's
+agent (and be the persona behind its next mention) or archive it, which
+the API cannot undo. Both now answer `403 agent_forbidden` to anyone but
+the creator, an owner or an admin, and a saved agent is recorded against
+the person, not the client they saved it from. A stored agent whose spec
+no longer validates (a later release tightened a rule) used to answer 500
+to every edit and archive; it now answers `422 invalid_agent` on `PATCH`
+and can still be archived.
+
 **A workload task that cannot know its hosts in advance can ask for any
 host.** A research plan whose task follows links it has not seen yet declared
 `needs.hosts = ["*"]`, the model refused it, and the retry guessed bare

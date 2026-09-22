@@ -14,9 +14,17 @@ from typing import Any
 import pytest
 
 from sbxloop.agents.definition import AgentDefinition, AgentSpec
-from sbxloop.agents.registry import AgentRegistryReadOnly, ConfigAgentRegistry, default_registry
+from sbxloop.agents.registry import (
+    AgentInvalid,
+    AgentRegistryReadOnly,
+    ConfigAgentRegistry,
+    DbAgentRegistry,
+    default_registry,
+)
 from sbxloop.agents.tools import TOOL_CATALOG
 from sbxloop.config import DEFAULT_CONFIG_LOCKED, Config
+from sbxloop.daemon.store import DaemonStore
+from sbxloop.db.collaboration_models import AgentRow
 
 ANGIE_TEXT = """
 
@@ -414,6 +422,60 @@ class TestConfigAgents:
         stored = Config()
         current = _config([{"slug": "scout", "name": "Scout"}])
         assert LoopEngine._config_drift(stored, current) == []
+
+
+class TestStoredAgents:
+    """A person's own agents, kept in the daemon's database."""
+
+    @staticmethod
+    def _registry(tmp_path: Path) -> DbAgentRegistry:
+        config = _config([], home=str(tmp_path / "state"))
+        return DbAgentRegistry(config, DaemonStore(tmp_path / "state.db"))
+
+    @staticmethod
+    def _spoil(registry: DbAgentRegistry, slug: str) -> None:
+        """Leave ``slug``'s stored spec the way a later release that
+        tightened a validator would find it: readable JSON that no longer
+        validates."""
+        with registry._dstore.transaction() as session:
+            row = session.get(AgentRow, slug)
+            assert row is not None
+            row.spec_json = row.spec_json.replace('"#123abc"', '"red"')
+        assert registry.get(slug) is None
+
+    def test_an_agent_whose_stored_spec_no_longer_validates_is_still_archived(
+        self, tmp_path: Path
+    ) -> None:
+        registry = self._registry(tmp_path)
+        registry.create(AgentSpec(slug="scout", name="Scout", color="#123ABC"), by="u1")
+        self._spoil(registry, "scout")
+
+        archived = registry.archive("scout", by="u1")
+
+        assert archived.archived is True
+        assert archived.revision == 2
+        with registry._dstore.read() as session:
+            row = session.get(AgentRow, "scout")
+            assert row is not None
+            assert row.state == "archived"
+            assert int(row.revision) == 2
+
+    def test_an_agent_whose_stored_spec_no_longer_validates_refuses_an_edit(
+        self, tmp_path: Path
+    ) -> None:
+        registry = self._registry(tmp_path)
+        registry.create(AgentSpec(slug="scout", name="Scout", color="#123ABC"), by="u1")
+        self._spoil(registry, "scout")
+
+        with pytest.raises(AgentInvalid) as refused:
+            registry.update("scout", {"name": "Scout Two"}, expected_revision=1, by="u1")
+
+        assert any("color" in problem for problem in refused.value.problems)
+        with registry._dstore.read() as session:
+            row = session.get(AgentRow, "scout")
+            assert row is not None
+            assert int(row.revision) == 1
+            assert '"red"' in row.spec_json
 
 
 class TestToolCatalog:
