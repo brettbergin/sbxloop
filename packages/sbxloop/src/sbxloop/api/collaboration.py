@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy import case, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sbxloop.agents.posts import POST_KINDS, TERMINAL_POST_KINDS, PostKind
@@ -59,6 +59,7 @@ from sbxloop.db.collaboration_models import (
 )
 from sbxloop.db.daemon_models import WorkItemRow
 from sbxloop.db.event_scope import channel_for_run, turn_for_item
+from sbxloop.db.job_scope import external_metadata
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -162,6 +163,8 @@ class Channel:
     #: Messages past the reader's last read sequence; None for a reader
     #: with no membership to track it against (a plain API client).
     unread_count: int | None = None
+    #: Stable presentation identity and the baseline for imported messages.
+    external_work: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,7 +456,10 @@ def invite_token_hash(raw_token: str) -> str:
 
 
 def _channel(
-    row: ChannelRow, my_role: ChannelRole | None = None, unread_count: int | None = None
+    row: ChannelRow,
+    my_role: ChannelRole | None = None,
+    unread_count: int | None = None,
+    external_work: dict[str, Any] | None = None,
 ) -> Channel:
     return Channel(
         id=str(row.id),
@@ -470,6 +476,7 @@ def _channel(
         silenced_until=None if row.silenced_until is None else float(row.silenced_until),
         my_role=my_role,
         unread_count=unread_count,
+        external_work=external_work,
     )
 
 
@@ -628,26 +635,45 @@ def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRol
     return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
 
 
-def _unread(session: Any, channel_id: str, member: Member | None) -> int | None:
+def _read_baseline(external_work: dict[str, Any] | None) -> int:
+    return 0 if external_work is None else int(external_work["read_baseline"])
+
+
+def _unread(
+    session: Any,
+    channel_id: str,
+    member: Member | None,
+    external_work: dict[str, Any] | None = None,
+) -> int | None:
     """Messages after the member's last read sequence. ``None`` when there
-    is no membership to measure against, so a plain API client and a
-    workspace member who has not joined read the same as before."""
+    is no membership to measure against, except for external jobs whose
+    durable import baseline applies even before someone joins."""
     if member is None:
         return None
     row = session.get(ChannelMemberRow, (channel_id, member.user.id))
-    if row is None:
+    if row is None and external_work is None:
         return None
-    return int(
-        session.scalar(
-            select(func.count())
-            .select_from(MessageRow)
-            .where(
-                MessageRow.channel_id == channel_id,
-                MessageRow.sequence > int(row.last_read_sequence or 0),
-            )
-        )
-        or 0
+    sequence = max(
+        _read_baseline(external_work), 0 if row is None else int(row.last_read_sequence or 0)
     )
+    statement = (
+        select(func.count())
+        .select_from(MessageRow)
+        .where(MessageRow.channel_id == channel_id, MessageRow.sequence > sequence)
+    )
+    # Replay can append history to an existing private conversation, or
+    # after live progress. Exclude those entries individually in every
+    # channel: raising the baseline would also read intervening live
+    # messages. Ordinary messages have no historical provenance.
+    historical = case(
+        (
+            func.json_valid(MessageRow.origin_json) == 1,
+            func.json_extract(MessageRow.origin_json, "$.historical"),
+        ),
+        else_=None,
+    )
+    statement = statement.where(func.coalesce(historical, 0) != 1)
+    return int(session.scalar(statement) or 0)
 
 
 def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
@@ -2073,8 +2099,12 @@ class CollaborationStore:
                 )
             except CollaborationError:
                 return None
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def list_channels(
@@ -2107,14 +2137,17 @@ class CollaborationStore:
                 .offset(offset)
                 .limit(limit)
             ).all()
-            channels = [
-                _channel(
-                    row,
-                    None if role is None else ("owner" if role == "owner" else "member"),
-                    _unread(session, str(row.id), member),
+            channels = []
+            for row, role in rows:
+                metadata = external_metadata(session, str(row.id))
+                channels.append(
+                    _channel(
+                        row,
+                        None if role is None else ("owner" if role == "owner" else "member"),
+                        _unread(session, str(row.id), member, metadata),
+                        metadata,
+                    )
                 )
-                for row, role in rows
-            ]
             return channels, total
 
     def update_channel(
@@ -2145,8 +2178,12 @@ class CollaborationStore:
             row.revision += 1
             session.flush()
             _event(session, "collaboration.channel.updated", now, data={"channel_id": channel_id})
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
@@ -2665,8 +2702,12 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "silenced_until": row.silenced_until},
             )
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def set_read_sequence(
@@ -2684,7 +2725,8 @@ class CollaborationStore:
             newest = session.scalar(
                 select(func.max(MessageRow.sequence)).where(MessageRow.channel_id == channel_id)
             )
-            capped = min(int(sequence), int(newest or 0))
+            baseline = _read_baseline(external_metadata(session, channel_id))
+            capped = min(max(int(sequence), baseline), int(newest or 0))
             entry.last_read_sequence = max(int(entry.last_read_sequence or 0), capped)
             _event(
                 session,
