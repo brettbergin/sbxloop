@@ -448,6 +448,69 @@ class Repository(ApiModel):
     trigger_label: str
     workload_label: str
     health: RepoHealth | None = None
+    #: Where the registration came from (``config``: imported from
+    #: sbxloop.toml; ``api``), who made it and when.
+    source: str | None = None
+    created_by: str | None = None
+    created_at: str | None = None
+    #: The registration's enabled state differs from what this daemon
+    #: process polls: polling follows at the next start.
+    restart_required: bool = False
+
+
+class RepositoryCreate(ApiModel):
+    """A registration: ``owner/name`` (``group/subgroup/project`` on
+    GitLab), the forge it lives on (``[vcs] kind`` when unset), whether it
+    is polled and run, and the branch it delivers to (the repository's
+    default when unset)."""
+
+    repository: str = Field(min_length=3, max_length=200)
+    forge: Literal["github", "gitlab", "gitea"] | None = None
+    enabled: bool = True
+    deliver_base: str | None = Field(default=None, max_length=200)
+
+
+class RepositoryUpdate(ApiModel):
+    """A change to a registration: only the fields sent change;
+    ``deliver_base: null`` clears it."""
+
+    enabled: bool | None = None
+    deliver_base: str | None = Field(default=None, max_length=200)
+
+
+class DiscoveryCredential(ApiModel):
+    """The credential a discovery listed with: a personal token (``pat``,
+    with the account it belongs to) or a GitHub App installation (``app``;
+    the installation, not a person, so no login)."""
+
+    mode: Literal["pat", "app"]
+    login: str | None = None
+
+
+class AvailableRepository(ApiModel):
+    """A repository the host's forge credential can see: what a
+    person picks from when registering one. ``configured`` says whether
+    it is declared to this daemon already."""
+
+    repository: str
+    forge: str
+    owner: str
+    name: str
+    private: bool = False
+    archived: bool = False
+    default_branch: str | None = None
+    url: str | None = None
+    configured: bool = False
+
+
+class RepositoryDiscovery(ApiModel):
+    workspace_id: str = WORKSPACE_ID
+    forge: str
+    credential: DiscoveryCredential
+    data: list[AvailableRepository]
+    #: True when the forge holds more than the listing walked; the rest is
+    #: not in ``data``.
+    truncated: bool = False
 
 
 class Profile(ApiModel):
@@ -824,7 +887,9 @@ class RestartRequest(ApiModel):
 
 
 class RepositoryResult(ApiModel):
-    repository: Repository
+    #: The repository as it stands after the command; None once removed.
+    repository: Repository | None = None
+    message: str = ""
     operation: OperationOut
 
 

@@ -547,6 +547,60 @@ until it has an execution backend. GitHub App credentials remain host-managed;
 the catalog identifies that auth method, and its check directs the operator to
 `sbxloop doctor` rather than claiming a PAT check verified the App installation.
 
+### Repository discovery
+
+When capability discovery includes `repositories.discover`, a workspace owner
+can ask `GET /v1/repositories/available` which repositories the host's forge
+credential can see, so a client offers a list to pick from instead of a box
+to spell `owner/name` into. `forge` defaults to `[vcs] kind`. The answer is
+`{forge, credential: {mode, login}, data: [...], truncated}`: `mode` is `pat`
+(a personal token, with the account it belongs to) or `app` (a GitHub App
+installation; its own repository list, no login), and every entry carries
+`repository`, `owner`, `name`, `private`, `archived`, `default_branch`,
+`url` and `configured` (already declared to this daemon). The listing is read
+from the forge now, on the host, with the same credential snapshot the
+connection check uses (`GH_TOKEN` / `GITHUB_TOKEN`, else the App; the
+`[vcs] token_env` variable for GitLab); it walks at most two thousand entries
+and says `truncated` past that. Nothing is written. Without a credential the
+route answers `409 discovery_unavailable` naming what to set; a forge that
+refuses the credential is `502 provider_error` with the status and never the
+body; an unreachable one is `502 provider_unreachable`. The route is the list to
+choose from; registering one is the next section.
+
+### Repositories
+
+Where a repository is registered is the daemon's database, advertised as
+`repositories.manage`. The file's `[[vcs.repos]]` entries are imported at
+first sight (once; a removed registration keeps its row, so the file's copy of
+that name is not imported again), and from then on `daemon:manage` clients
+change the registration live:
+
+| Route                          | Body                                              | Result                                                      |
+| ------------------------------ | ------------------------------------------------- | ----------------------------------------------------------- |
+| `POST /v1/repositories`        | `{repository, forge?, enabled?, deliver_base?}`   | `201 {repository, message, operation}`; `repo.add` recorded |
+| `PATCH /v1/repositories/{id}`  | `{enabled?, deliver_base?}`, only the fields sent | `200`, the repository as it stands; `repo.update` recorded  |
+| `DELETE /v1/repositories/{id}` | none                                              | `200 {repository: null, message, operation}`; `repo.remove` |
+
+`repository` is `owner/name` (`group/subgroup/project` on GitLab); `forge`
+defaults to `[vcs] kind`; `deliver_base: null` on a `PATCH` clears it. A name
+registered already (case-insensitively), one that is not a repository on its
+forge, or an unknown forge is `422 invalid_argument`; an unknown id is `404`.
+Every entry of `GET /v1/repositories` now carries `source` (`config` for an
+imported entry, `api`), `created_by`, `created_at` and `restart_required`.
+
+A registration takes effect in what the daemon *admits* at once: intake,
+the engine's narrowing, the concierge and this catalog all answer for it.
+What the daemon *polls* was built at start, so a registration that changes
+the enabled set says `restart_required` (and the reply's `message` says
+so); `POST /v1/daemon/restart` applies it. The file keeps a repository's
+other settings — labels, templates, workspace, sandbox packages, model
+overrides — folded under the registration of the same name; a new entry in
+the file is registered at the next start, and the file's `enabled` /
+`deliver_base` are only the initial values (`sbxloop doctor` names an entry
+the file still spells differently). The socket takes the same commands:
+`repository.add` (params), `repository.update` and `repository.remove`
+(target `repo_…`).
+
 ### Workspace people
 
 A workspace holds owners, admins and members. These routes are advertised as
@@ -936,6 +990,10 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
 | `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
 | `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `GET`    | `/v1/repositories/available`                 | owner role             | What the host's forge credential can see, to pick one to register     |
+| `POST`   | `/v1/repositories`                           | `daemon:manage`        | Register a repository; polled from the next start                     |
+| `PATCH`  | `/v1/repositories/{id}`                      | `daemon:manage`        | Enable, disable or re-base a registered repository                    |
+| `DELETE` | `/v1/repositories/{id}`                      | `daemon:manage`        | Forget a registration; queued and running work is untouched           |
 | `GET`    | `/v1/daemon/holds`                           | `runs:read`            | Standing holds and whose they are                                     |
 | `POST`   | `/v1/daemon/holds`                           | `daemon:manage`        | Take a hold attributed to this client                                 |
 | `DELETE` | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
@@ -1166,10 +1224,11 @@ from a developer machine.
 
 ## What is not offered
 
-By design, on this API: general configuration writes, repository registration,
-backup and restore, garbage collection, sandbox deletion, and starting a
-daemon that is not running. Each stays on the host's own CLI until it has
-its own attribution, conflict and active-run story. A tool run takes no
+By design, on this API: general configuration writes, backup and restore,
+garbage collection, sandbox deletion, and starting a daemon that is not
+running. Each stays on the host's own CLI until it has its own attribution,
+conflict and active-run story. Repository registration has one (see
+Repositories above); a repository's other settings are still the file's. A tool run takes no
 steering, no round grants and no gate: a fixed recipe has nothing to steer.
 
 ## Readiness criteria for a hosted service

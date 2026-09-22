@@ -18,7 +18,7 @@ message, but never parses it.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, Literal, TypeVar
 
@@ -53,6 +53,7 @@ from sbxloop.daemon.controls.results import (
     QueueOutcome,
     ReleaseOutcome,
     RepoResumeOutcome,
+    RepositoryOutcome,
     RestartOutcome,
     ResumeOutcome,
     ReviewResumeOutcome,
@@ -783,6 +784,90 @@ class ControlService:
             return RepoResumeOutcome(repo=str(health.get("repo", repo)), health=dict(health))
 
         spec = self._spec("repo.resume", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def add_repository(
+        self,
+        principal: Principal,
+        *,
+        repo: str,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        source: str,
+        idempotency: tuple[str, str] | None = None,
+    ) -> RepositoryOutcome:
+        """Register a repository, live, as one recorded operation."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.add_repository(
+                    repo,
+                    kind=kind,
+                    enabled=enabled,
+                    deliver_base=deliver_base,
+                    by=principal.attribution(),
+                    source=source,
+                )
+            except ValueError as exc:
+                raise ControlError("invalid_argument", str(exc)) from exc
+            return RepositoryOutcome(verb="add", repo=name, message=message)
+
+        spec = self._spec(
+            "repo.add",
+            principal,
+            "repo",
+            repo,
+            idempotency=idempotency,
+            source=source,
+            kind=kind,
+            enabled=enabled,
+            deliver_base=deliver_base,
+        )
+        return self._record(spec, apply)
+
+    def update_repository(
+        self,
+        principal: Principal,
+        repo: str,
+        changes: Mapping[str, Any],
+        *,
+        idempotency: tuple[str, str] | None = None,
+    ) -> RepositoryOutcome:
+        """Change a registration's ``enabled`` / ``deliver_base``, live."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.update_repository(
+                    repo, changes, by=principal.attribution()
+                )
+            except KeyError as exc:
+                raise ControlError("unknown_target", _message(exc)) from exc
+            except ValueError as exc:
+                raise ControlError("invalid_argument", str(exc)) from exc
+            return RepositoryOutcome(verb="update", repo=name, message=message)
+
+        spec = self._spec(
+            "repo.update", principal, "repo", repo, idempotency=idempotency, **changes
+        )
+        return self._record(spec, apply)
+
+    def remove_repository(
+        self, principal: Principal, repo: str, *, idempotency: tuple[str, str] | None = None
+    ) -> RepositoryOutcome:
+        """Forget a registration; work already queued or running is untouched."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.remove_repository(repo, by=principal.attribution())
+            except KeyError as exc:
+                raise ControlError("unknown_target", _message(exc)) from exc
+            return RepositoryOutcome(verb="remove", repo=name, message=message)
+
+        spec = self._spec("repo.remove", principal, "repo", repo, idempotency=idempotency)
         return self._record(spec, apply)
 
     def reset_breaker(

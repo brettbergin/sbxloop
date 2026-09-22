@@ -1717,14 +1717,27 @@ class PhaseRunner:
             + (f" — {profile.description}" if profile.description else "")
             + ":"
         ]
-        lines.append(
-            "- hosts: "
-            + (
-                ", ".join(f"`{p}`" for p in profile.egress)
-                if profile.egress
-                else "none beyond the always-reachable package registries"
+        if "*" in profile.egress and self.config.policy.deny:
+            # `*` would open the box past the deny list; the granter refuses it.
+            lines.append(
+                "- hosts: any named domain or `*.domain` wildcard; `*` is refused while "
+                "`[policy] deny` is set, so name each host the task will reach"
             )
-        )
+        elif "*" in profile.egress:
+            lines.append(
+                "- hosts: any — declare `*` for a task that cannot know its hosts in advance, "
+                "otherwise name each domain; a wildcard needs a named domain "
+                "(`*.example.com`), and a bare suffix such as `*.com` is refused"
+            )
+        else:
+            lines.append(
+                "- hosts: "
+                + (
+                    ", ".join(f"`{p}`" for p in profile.egress)
+                    if profile.egress
+                    else "none beyond the always-reachable package registries"
+                )
+            )
         if profile.credentials:
             named = []
             for name in profile.credentials:

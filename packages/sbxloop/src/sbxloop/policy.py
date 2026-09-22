@@ -144,9 +144,10 @@ WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = (
 def valid_pattern(pattern: str, *, operator: bool = False) -> bool:
     """Whether ``pattern`` is a well-formed domain pattern.
 
-    ``operator=True`` additionally permits the bare ``"*"`` — meaningful as
-    an operator bound ("grant anything the plan asks for") but rejected in
-    plan declarations, which must name what they need.
+    ``operator=True`` additionally permits the bare ``"*"``: as an operator
+    bound it grants anything the plan asks for, and in a workload task's
+    ``needs`` it asks for every host, which only a ``"*"`` bound grants. A
+    code run's declared egress still names what it needs.
     """
     if pattern == "*":
         return operator
@@ -188,6 +189,13 @@ def baseline_allows(domains: Iterable[str], deny: Iterable[str]) -> list[str]:
 
 def egress_rejection(domain: str, allow: list[str], deny: list[str]) -> str | None:
     """Why ``domain`` may not be granted, or None when it is in bounds."""
+    if domain == "*" and deny:
+        # The sandbox policy is grant-only: a box granted every host cannot
+        # keep a denied one out, so any deny pattern refuses `*` outright.
+        return (
+            f"a sandbox granted every host cannot keep out [policy] deny pattern {deny[0]!r}; "
+            "name the hosts instead"
+        )
     for pattern in deny:
         if pattern_covers(pattern, domain):
             return f"matches [policy] deny pattern {pattern!r}"
@@ -287,7 +295,8 @@ class EgressGranter:
             if domain in self._granted:
                 continue
             try:
-                self.cli.policy_allow(domain, sandbox=self.sandbox)
+                # sbx spells "every host" `**`; its `*` is not a wildcard.
+                self.cli.policy_allow("**" if domain == "*" else domain, sandbox=self.sandbox)
             except SbxError:
                 self.bus.emit(
                     HostEventTypes.POLICY_DENY,

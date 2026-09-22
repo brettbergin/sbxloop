@@ -895,6 +895,73 @@
         "title": "AuthorOut",
         "type": "object"
       },
+      "AvailableRepository": {
+        "additionalProperties": false,
+        "description": "A repository the host's forge credential can see: what a\nperson picks from when registering one. ``configured`` says whether\nit is declared to this daemon already.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "private": {
+            "default": false,
+            "title": "Private",
+            "type": "boolean"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "repository",
+          "forge",
+          "owner",
+          "name"
+        ],
+        "title": "AvailableRepository",
+        "type": "object"
+      },
       "BridgeOut": {
         "additionalProperties": false,
         "description": "A chat service this release can bridge, and whether it is set up.",
@@ -2213,6 +2280,36 @@
           "detail"
         ],
         "title": "DetailOut",
+        "type": "object"
+      },
+      "DiscoveryCredential": {
+        "additionalProperties": false,
+        "description": "The credential a discovery listed with: a personal token (``pat``,\nwith the account it belongs to) or a GitHub App installation (``app``;\nthe installation, not a person, so no login).",
+        "properties": {
+          "login": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login"
+          },
+          "mode": {
+            "enum": [
+              "pat",
+              "app"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "DiscoveryCredential",
         "type": "object"
       },
       "EventOut": {
@@ -5117,6 +5214,28 @@
       "Repository": {
         "additionalProperties": false,
         "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
           "deliver_base": {
             "anyOf": [
               {
@@ -5155,6 +5274,22 @@
             "title": "Repository",
             "type": "string"
           },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
           "trigger_label": {
             "title": "Trigger Label",
             "type": "string"
@@ -5179,21 +5314,149 @@
         "title": "Repository",
         "type": "object"
       },
+      "RepositoryCreate": {
+        "additionalProperties": false,
+        "description": "A registration: ``owner/name`` (``group/subgroup/project`` on\nGitLab), the forge it lives on (``[vcs] kind`` when unset), whether it\nis polled and run, and the branch it delivers to (the repository's\ndefault when unset).",
+        "properties": {
+          "deliver_base": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deliver Base"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "forge": {
+            "anyOf": [
+              {
+                "enum": [
+                  "github",
+                  "gitlab",
+                  "gitea"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forge"
+          },
+          "repository": {
+            "maxLength": 200,
+            "minLength": 3,
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "RepositoryCreate",
+        "type": "object"
+      },
+      "RepositoryDiscovery": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/DiscoveryCredential"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AvailableRepository"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "default": "local",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "forge",
+          "credential",
+          "data"
+        ],
+        "title": "RepositoryDiscovery",
+        "type": "object"
+      },
       "RepositoryResult": {
         "additionalProperties": false,
         "properties": {
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
           "operation": {
             "$ref": "#/components/schemas/OperationOut"
           },
           "repository": {
-            "$ref": "#/components/schemas/Repository"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Repository"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
-          "repository",
           "operation"
         ],
         "title": "RepositoryResult",
+        "type": "object"
+      },
+      "RepositoryUpdate": {
+        "additionalProperties": false,
+        "description": "A change to a registration: only the fields sent change;\n``deliver_base: null`` clears it.",
+        "properties": {
+          "deliver_base": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deliver Base"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          }
+        },
+        "title": "RepositoryUpdate",
         "type": "object"
       },
       "RestartRequest": {
@@ -11896,6 +12159,195 @@
         "summary": "List Repositories",
         "tags": [
           "catalog"
+        ]
+      },
+      "post": {
+        "description": "Register a repository: admitted for work now, polled from the next\ndaemon start (the answer says so). A name registered already, one that\nis not a repository on its forge, or an unknown forge is refused.",
+        "operationId": "create_repository_v1_repositories_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositoryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Repository",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/repositories/available": {
+      "get": {
+        "description": "The repositories the host's forge credential can see, each marked\nwith whether it is configured here already: what an owner picks from\nwhen registering one. Read from the forge now, on the host, with the\nsame credential snapshot the connection check uses; ``forge`` defaults\nto ``[vcs] kind``.",
+        "operationId": "available_repositories_v1_repositories_available_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "forge",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "github",
+                    "gitlab",
+                    "gitea"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Forge"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryDiscovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Available Repositories",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/v1/repositories/{repository_id}": {
+      "delete": {
+        "description": "Forget a registration: no longer admitted for work; work already\nqueued or running for it is untouched, and polling stops at the next\ndaemon start.",
+        "operationId": "remove_repository_v1_repositories__repository_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Repository",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "description": "Change whether a registered repository is enabled, or the branch it\ndelivers to; only the fields sent change, live.",
+        "operationId": "update_repository_v1_repositories__repository_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositoryUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Repository",
+        "tags": [
+          "admin"
         ]
       }
     },

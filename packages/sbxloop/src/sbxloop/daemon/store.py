@@ -73,6 +73,7 @@ from sbxloop.db.daemon_models import (
     MergeGateRow,
     PendingClarificationRow,
     PriorAttemptRow,
+    RepositoryRow,
     RequesterRow,
     ReviewHoldRow,
     RunResumeRow,
@@ -604,6 +605,36 @@ class StoredSchedule(NamedTuple):
     source: str  # "config" (imported from sbxloop.toml), "chat", "ctl", …
     created_by: str | None
     created_at: float | None
+
+
+class StoredRepository(NamedTuple):
+    """A registered repository as the store holds it: the registration
+    plus its provenance. ``removed_at`` is set on a registration that was
+    removed and whose row stays so the file's copy is not imported again."""
+
+    repo: str
+    kind: str | None
+    enabled: bool
+    deliver_base: str | None
+    source: str  # "config" (imported from sbxloop.toml) or "api"
+    created_by: str | None
+    created_at: float
+    updated_at: float
+    removed_at: float | None = None
+
+
+def _row_to_repository(row: RepositoryRow) -> StoredRepository:
+    return StoredRepository(
+        repo=str(row.repo),
+        kind=row.kind,
+        enabled=bool(row.enabled),
+        deliver_base=row.deliver_base,
+        source=str(row.source),
+        created_by=row.created_by,
+        created_at=float(row.created_at),
+        updated_at=float(row.updated_at),
+        removed_at=row.removed_at,
+    )
 
 
 def _row_to_gate(row: MergeGateRow) -> MergeGate:
@@ -3015,6 +3046,101 @@ class DaemonStore:
                 )
             )
             return True
+
+    # -- the registered repositories ------------------------------------------------
+
+    def repositories(self, *, include_removed: bool = False) -> list[StoredRepository]:
+        """Every registered repository in registration order; the removed
+        ones too when asked (they keep their row, see :class:`StoredRepository`)."""
+        with self._read() as session:
+            # Registration order: by time, then by the row's own order for
+            # registrations made within one clock tick.
+            query = select(RepositoryRow).order_by(RepositoryRow.created_at, text("rowid"))
+            if not include_removed:
+                query = query.where(RepositoryRow.removed_at.is_(None))
+            return [_row_to_repository(row) for row in session.scalars(query)]
+
+    def repository(self, repo: str) -> StoredRepository | None:
+        """The registration of ``repo`` (a forge name is case-insensitive),
+        None when there is none or it was removed."""
+        with self._read() as session:
+            row = session.scalars(
+                select(RepositoryRow).where(
+                    func.lower(RepositoryRow.repo) == repo.casefold(),
+                    RepositoryRow.removed_at.is_(None),
+                )
+            ).first()
+            return None if row is None else _row_to_repository(row)
+
+    def add_repository(
+        self,
+        repo: str,
+        *,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        source: str,
+        by: str | None,
+        now: float,
+        revive: bool,
+    ) -> bool:
+        """Register ``repo``. A name registered already (case-insensitively)
+        is left as it is (False). A removed registration of that name is
+        taken over when ``revive`` (the API registering it again) and
+        blocks otherwise (the file's copy, imported once and not again)."""
+        # The check and the write are one transaction: two callers adding
+        # the same name must not both see "not registered".
+        with self._lock, begin_immediate(self._engine) as conn:
+            row = conn.execute(
+                select(RepositoryRow.repo, RepositoryRow.removed_at).where(
+                    func.lower(RepositoryRow.repo) == repo.casefold()
+                )
+            ).first()
+            if row is not None and (row.removed_at is None or not revive):
+                return False
+            values: dict[str, Any] = {
+                "kind": kind,
+                "enabled": 1 if enabled else 0,
+                "deliver_base": deliver_base,
+                "source": source,
+                "created_by": by,
+                "created_at": now,
+                "updated_at": now,
+                "removed_at": None,
+            }
+            if row is None:
+                conn.execute(insert(RepositoryRow).values(repo=repo, **values))
+            else:
+                conn.execute(
+                    update(RepositoryRow)
+                    .where(RepositoryRow.repo == row.repo)
+                    .values(repo=repo, **values)
+                )
+            return True
+
+    def update_repository(self, repo: str, *, now: float, **values: Any) -> bool:
+        """Change a registration's fields in place; False when ``repo`` is
+        not registered (or was removed)."""
+        if "enabled" in values:
+            values["enabled"] = 1 if values["enabled"] else 0
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(RepositoryRow.repo == repo, RepositoryRow.removed_at.is_(None))
+                .values(updated_at=now, **values)
+            )
+            return _rowcount(result) == 1
+
+    def remove_repository(self, repo: str, *, now: float) -> bool:
+        """Mark a registration removed, keeping its row; False when there
+        was none."""
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(RepositoryRow.repo == repo, RepositoryRow.removed_at.is_(None))
+                .values(removed_at=now, updated_at=now)
+            )
+            return _rowcount(result) == 1
 
     def remove_schedule(self, name: str) -> bool:
         """Forget a schedule, state and all: a schedule re-added under the

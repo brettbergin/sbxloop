@@ -554,6 +554,12 @@ service_memory = "2g"
 # daemon-wide and are shared across all of them. `sbxloop run --repo
 # owner/repo` picks one per run. The older spelling, [[vcs.repos]] (or
 # a single `repo` under [github]), still loads and is read as this list.
+# Registration — which repositories, `enabled`, `kind`, `deliver_base` — is
+# imported into the daemon's database at first sight and changed there
+# (`POST`/`PATCH`/`DELETE /v1/repositories`, or a client such as Angie); an
+# entry here keeps the repository's other settings, a new entry is
+# registered at the next start, and after the import the registration wins
+# over the file's `enabled` / `deliver_base`.
 # [[vcs.repos]]
 # Run-agent resource overrides; omitted values inherit [sandbox].
 # cpus = 6

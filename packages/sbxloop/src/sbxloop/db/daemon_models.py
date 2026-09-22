@@ -454,6 +454,30 @@ class ScheduleRowModel(Base):
     created_at: Mapped[float | None] = mapped_column(REAL)
 
 
+class RepositoryRow(Base):
+    """One registered repository: where a repository is declared to the
+    daemon, now that the file's ``[[vcs.repos]]`` entries are imported
+    once and registrations change live.
+
+    ``removed_at`` keeps a removed registration's row, so the file's copy
+    of that name is not imported again at the next start.
+    """
+
+    __tablename__ = "daemon_repositories"
+
+    repo: Mapped[str] = mapped_column(Text, primary_key=True)
+    # The forge it lives on; NULL inherits `[vcs] kind`.
+    kind: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("1"))
+    deliver_base: Mapped[str | None] = mapped_column(Text)
+    # "config" (imported from sbxloop.toml) or "api".
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    removed_at: Mapped[float | None] = mapped_column(REAL)
+
+
 class WorkspaceUsageRow(Base):
     """One usage sample charged to the workspace budget pool: a run's
     ``agent.usage`` event or a chat turn's reported usage.
