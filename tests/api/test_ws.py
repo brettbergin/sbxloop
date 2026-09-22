@@ -12,6 +12,9 @@ from starlette.websockets import WebSocketDisconnect
 
 from sbxloop.api import ws as ws_module
 from tests.api.conftest import Api, build
+from tests.api.test_channel_access import _channel, _invite
+from tests.api.test_collaboration import bearer, register
+from tests.api.test_event_visibility import _touch
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +127,52 @@ class TestSubscription:
             with pytest.raises(WebSocketDisconnect) as closed:
                 ws.receive_text()
             assert closed.value.code == 4401
+
+    def test_a_removed_member_is_closed_out(
+        self, api: Api, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A socket opened by a workspace member closes with
+        ``access_revoked`` once the member is removed; it never carries
+        events the member could not see (nor the unfiltered view a plain
+        client gets)."""
+        monkeypatch.setattr(ws_module, "ACCESS_RECHECK_S", 0.0)
+        owner = register(api)
+        guest = _invite(api, "member", "guest")
+        guest_id = api.client.get("/v1/users/me", headers=bearer(guest)).json()["id"]
+        private = _channel(api, bearer(owner))
+        with api.client.websocket_connect("/v1/ws", headers=bearer(guest)) as ws:
+            hello = _recv(ws, kind="hello")
+            ws.send_text(json.dumps({"type": "subscribe", "after": hello["watermark"]}))
+            _recv(ws, kind="subscribed")
+            removed = api.client.delete(f"/v1/workspace/members/{guest_id}", headers=bearer(owner))
+            assert removed.status_code == 204, removed.text
+            _touch(api, bearer(owner), private)
+            api.ctx.hub.notify()
+            while True:
+                frame = json.loads(ws.receive_text())
+                if frame["type"] == "closing":
+                    break
+                assert frame["type"] == "event", frame
+                assert frame["event"]["data"].get("channel_id") != private, frame
+            assert frame["reason"] == "access_revoked"
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_text()
+            assert closed.value.code == 4403
+
+    def test_a_plain_client_outlives_the_access_re_check(
+        self, api: Api, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ws_module, "ACCESS_RECHECK_S", 0.0)
+        with api.client.websocket_connect("/v1/ws", headers=api.bearer()) as ws:
+            hello = _recv(ws, kind="hello")
+            ws.send_text(json.dumps({"type": "subscribe", "after": hello["watermark"]}))
+            _recv(ws, kind="subscribed")
+            api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 1})
+            api.ctx.hub.notify()
+            assert _recv(ws, kind="event")["event"]["type"] == "daemon.notice"
+            api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 2})
+            api.ctx.hub.notify()
+            assert _recv(ws, kind="event")["event"]["data"] == {"n": 2}
 
     def test_connections_are_bounded(self, tmp_path: Path) -> None:
         api = build(tmp_path, max_stream_clients=1)
