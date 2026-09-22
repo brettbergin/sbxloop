@@ -3939,8 +3939,13 @@ class CollaborationStore:
                     # The membership behind the map still has to hold, as
                     # it did when the bridge mapped them.
                     author = _member_in(session, row.author_id)
-                    live = channel is not None and channel.state == "active" and message is not None
-                    if live and author is not None and author.user.active:
+                    if (
+                        channel is not None
+                        and channel.state == "active"
+                        and message is not None
+                        and author is not None
+                        and author.user.active
+                    ):
                         queued.append(
                             (message.sequence, _turn(session, row), author.user, message.content)
                         )
