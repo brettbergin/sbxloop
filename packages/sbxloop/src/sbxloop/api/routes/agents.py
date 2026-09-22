@@ -357,6 +357,7 @@ async def update_memory(
 ) -> MemoryOut:
     agent = await ctx.call(_agent_slug, ctx, slug)
     author = await ctx.call(_author, ctx, auth)
+    readable = await ctx.call(_reader, ctx, auth)
     try:
         memory = await ctx.call(
             ctx.memory.update,
@@ -366,6 +367,7 @@ async def update_memory(
             expected_revision=body.expected_revision,
             author=author,
             agent=agent,
+            readable=readable,
         )
     except AgentMemoryError as exc:
         raise _memory_problem(exc) from exc
@@ -382,8 +384,9 @@ async def delete_memory(
 ) -> None:
     agent = await ctx.call(_agent_slug, ctx, slug)
     author = await ctx.call(_author, ctx, auth)
+    readable = await ctx.call(_reader, ctx, auth)
     try:
-        await ctx.call(ctx.memory.forget, agent, memory_id, author=author)
+        await ctx.call(ctx.memory.forget, agent, memory_id, author=author, readable=readable)
     except AgentMemoryError as exc:
         raise _memory_problem(exc) from exc
     ctx.hub.notify()

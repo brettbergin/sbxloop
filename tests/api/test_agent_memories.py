@@ -347,9 +347,7 @@ def test_a_member_cannot_edit_or_delete_a_memory_they_cannot_read(api: Any) -> N
     memory_id = str(created.json()["id"])
 
     def live() -> list[tuple[str, str, bool, int]]:
-        response = api.client.get(
-            memories_url(), headers=owner, params={"include_private": "true"}
-        )
+        response = api.client.get(memories_url(), headers=owner, params={"include_private": "true"})
         assert response.status_code == 200, response.text
         return [
             (item["id"], item["content"], item["pinned"], item["revision"])
@@ -357,9 +355,10 @@ def test_a_member_cannot_edit_or_delete_a_memory_they_cannot_read(api: Any) -> N
         ]
 
     # The id leaked to a member the channel never let in; the memory did not.
-    assert api.client.get(
-        memories_url(), headers=outsider, params={"include_private": "true"}
-    ).json() == []
+    assert (
+        api.client.get(memories_url(), headers=outsider, params={"include_private": "true"}).json()
+        == []
+    )
 
     patched = api.client.patch(
         f"{memories_url()}/{memory_id}",
@@ -378,11 +377,14 @@ def test_a_member_cannot_edit_or_delete_a_memory_they_cannot_read(api: Any) -> N
     unknown = api.client.delete(f"{memories_url()}/mem_0000000000000000", headers=outsider)
     assert unknown.status_code == 404
     assert unknown.json()["code"] == deleted.json()["code"]
-    assert api.client.patch(
-        f"{memories_url()}/mem_0000000000000000",
-        headers=outsider,
-        json={"content": "moved to friday", "pinned": True, "expected_revision": 1},
-    ).json()["code"] == patched.json()["code"]
+    assert (
+        api.client.patch(
+            f"{memories_url()}/mem_0000000000000000",
+            headers=outsider,
+            json={"content": "moved to friday", "pinned": True, "expected_revision": 1},
+        ).json()["code"]
+        == patched.json()["code"]
+    )
 
     assert live() == [(memory_id, "the launch date is a secret", False, 1)]
 
