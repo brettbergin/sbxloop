@@ -93,6 +93,7 @@ from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.daemon.usagepool import UsagePool, fairness_key
+from sbxloop.db.event_scope import channel_for_item, channel_for_run
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
@@ -1006,6 +1007,23 @@ class DaemonLoop:
 
     # -- mentions ------------------------------------------------------------------
 
+    def _conversation_channels(self, handles: Sequence[RunHandle]) -> dict[str, str | None]:
+        """Resolve live presentation after releasing the run lock.
+
+        External work can acquire its conversation after dispatch. Looking
+        up the durable association keeps controls current without rewriting
+        the handle's admission, assignment, or scheduling fairness lane.
+        """
+        if not handles:
+            return {}
+        with self.dstore.read() as session:
+            return {
+                handle.run_id: channel_for_run(session, handle.run_id)
+                or handle.item.channel_id
+                or channel_for_item(session, handle.item.item_id)
+                for handle in handles
+            }
+
     def live_runs_for_agent(self, channel_id: str, agent_slug: str) -> list[MentionTarget]:
         """Every run in flight for ``channel_id`` that ``agent_slug`` works
         on, with the tasks bound to that agent which are still in flight.
@@ -1016,8 +1034,9 @@ class DaemonLoop:
         targets: list[MentionTarget] = []
         with self._current_lock:
             handles = list(self._runs.values())
+        channels = self._conversation_channels(handles)
         for handle in handles:
-            if (handle.item.channel_id or "") != channel_id:
+            if channels.get(handle.run_id) != channel_id:
                 continue
             if not is_planned_assignment(handle.item.assignment_json):
                 continue
@@ -1055,11 +1074,9 @@ class DaemonLoop:
     def live_runs_in_channel(self, channel_id: str) -> list[str]:
         """Every run in flight that answers to ``channel_id``."""
         with self._current_lock:
-            return [
-                handle.run_id
-                for handle in self._runs.values()
-                if (handle.item.channel_id or "") == channel_id
-            ]
+            handles = list(self._runs.values())
+        channels = self._conversation_channels(handles)
+        return [handle.run_id for handle in handles if channels.get(handle.run_id) == channel_id]
 
     def stop_channel(
         self,

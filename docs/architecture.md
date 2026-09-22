@@ -2247,6 +2247,30 @@ never guessed `succeeded`, and a timeout is never evidence.
 
 ### The remote API listener
 
+External job conversations are a durable read-side projection in
+`api/external_work.py`. Migration `0034` adds job identities, item aliases,
+immutable attempt/channel bindings and a dirty queue. Source-table triggers
+enqueue changed records; a resumable initial scan imports active work and
+the last 30 days of terminal history. The API projector reconciles the queue
+without requiring a connected browser. Presentation associations never
+rewrite admission channels or execution records. Run-scoped access,
+chronology, artifacts and live steering consult the attempt binding; the
+additive `/jobs` route exposes attempts without inventing item or turn IDs.
+
+Imported messages carry historical provenance and read baselines. Per-run
+event cursors, transition identities and transactional message insertion
+make restarts and concurrent projection idempotent. System-created channels
+are workspace-visible, while existing conversation permissions and deleted
+channel tombstones remain authoritative.
+
+Migration `0034` is additive for execution data, but an older package's
+Alembic loader cannot resolve that revision. A package-only rollback cannot
+open the migrated database. The pre-upgrade deployment backup must be
+restored with the daemon stopped before restarting that older package;
+preserve the failed database first because restoration loses later writes.
+The current deployment workflow creates the backup but does not restore it
+automatically. A failed rollback therefore needs operator recovery.
+
 The operator's and integrator's reference is [docs/api.md](api.md); the
 contract of record is the OpenAPI document the listener publishes, kept
 byte-for-byte at [docs/openapi.json](openapi.json) by

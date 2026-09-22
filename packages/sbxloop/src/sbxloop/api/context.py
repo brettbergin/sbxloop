@@ -554,10 +554,13 @@ class ApiContext:
 
     def project_work(self, channel_id: str | None = None) -> list[Any]:
         """Deliver recorded work; never dispatch or replay an agent tool."""
+        from sbxloop.api.external_work import reconcile
         from sbxloop.api.work_delivery import project_work
 
         if not self.ready.is_set() or self.stopping.is_set():
             return []
+        if channel_id is None:
+            reconcile(self)
         return project_work(self, channel_id)
 
     def recover_collaboration(self) -> None:
