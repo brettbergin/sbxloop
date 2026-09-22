@@ -20,6 +20,7 @@ classifier verdicts and the configured caps, never from the code under test.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Future
 from typing import Any
 
@@ -471,4 +472,237 @@ def test_an_ambient_turn_a_person_provoked_counts_against_the_rate_caps(
         assert ambient[0]["author_id"] == person
         suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
         assert [e["data"]["reason"] for e in suppressed] == ["channel_rate"]
+    api.ctx.close()
+
+
+def _until(condition: Any, what: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert condition(), what
+
+
+class Holding(ClassifyingConcierge):
+    """Holds one call open until the test releases it: the first answer
+    asked of ``slug``, or, with ``classifier``, the first relevance question
+    asked about it. Everything else is answered as scripted."""
+
+    def __init__(
+        self,
+        slug: str,
+        *,
+        classifier: bool = False,
+        verdicts: dict[str, str] | None = None,
+        replies: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(verdicts, replies)
+        self.slug = slug
+        self.classifier = classifier
+        self.held: Future[ConciergeReply] = Future()
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+        key = str(kwargs.get("session_key") or "")
+        relevance = ":ambient:" in key
+        if (
+            key.rsplit(":", 1)[-1] == self.slug
+            and relevance == self.classifier
+            and not self.held.done()
+        ):
+            if relevance:
+                self.classified.append(self.slug)
+            self.calls.append({"text": text, **kwargs})
+            return self.held
+        return super().submit_turn(text, **kwargs)
+
+
+def test_a_stop_that_lands_during_classification_keeps_the_listener_quiet(
+    tmp_path: Any,
+) -> None:
+    """Stop is the person's kill switch. A listener whose relevance call was
+    already in flight when the channel was stopped and silenced does not get
+    a turn out of it, whatever the classifier then answers."""
+    api = _api(tmp_path)
+    with api.client:
+        concierge = Holding("baker", classifier=True)
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        accepted = api.client.post(
+            f"/v1/channels/{channel}/turns",
+            json={"content": "the bread is rising"},
+            headers=headers,
+        )
+        assert accepted.status_code == 202, accepted.text
+        turn = accepted.json()["turn"]
+        try:
+            _until(lambda: concierge.classified == ["baker"], "the classifier was never asked")
+            stopped = api.client.post(f"/v1/channels/{channel}/stop", headers=headers)
+            assert stopped.status_code == 200, stopped.text
+            assert stopped.json()["silenced_until"] is not None
+        finally:
+            if not concierge.held.done():
+                concierge.held.set_result(ConciergeReply("RELEVANT"))
+        settled(api.client, headers, channel, turn["id"])
+        assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+
+        turns = _turns(api, headers, channel)
+        assert [(t["trigger"], t["status"]) for t in turns] == [("human", "cancelled")]
+        assert concierge.answered("baker") == []
+        assert [e for e in _events(api, headers, channel) if e["type"].endswith("queued")] == []
+    api.ctx.close()
+
+
+def test_a_cancelled_turns_late_reply_draws_no_unprompted_answer(tmp_path: Any) -> None:
+    """A person cancels the turn while the addressed agent is still
+    answering. The reply that lands afterwards is kept, but it is not an
+    invitation: no listener is classified on it and none gets a turn."""
+    api = _api(tmp_path, ambient_window_messages=1)
+    with api.client:
+        concierge = Holding("helper", verdicts={"baker": "RELEVANT"})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        _agent(api, "helper", [])
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        accepted = api.client.post(
+            f"/v1/channels/{channel}/turns",
+            json={"content": "@helper what do I need this weekend"},
+            headers=headers,
+        )
+        assert accepted.status_code == 202, accepted.text
+        turn = accepted.json()["turn"]
+        try:
+            _until(lambda: bool(concierge.answered("helper")), "helper was never asked")
+            cancelled = api.client.post(
+                f"/v1/channels/{channel}/turns/{turn['id']}/cancel", headers=headers
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelling"
+        finally:
+            if not concierge.held.done():
+                concierge.held.set_result(ConciergeReply("you will need flour for the bread"))
+        settled(api.client, headers, channel, turn["id"])
+        assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+
+        turns = _turns(api, headers, channel)
+        assert [(t["trigger"], t["status"]) for t in turns] == [("human", "cancelled")]
+        assert concierge.classified == []
+        assert concierge.answered("baker") == []
+        assert [e for e in _events(api, headers, channel) if e["type"].endswith("queued")] == []
+    api.ctx.close()
+
+
+def test_an_unprompted_answer_to_a_guest_is_recorded_as_the_agents_own(tmp_path: Any) -> None:
+    """A guest on a linked surface has no account. The turn a listener
+    takes on the guest's message is recorded as the listener's own turn,
+    never as a person whose id happens to be the agent's slug."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        owner_id = api.client.get("/v1/users/me", headers=headers).json()["id"]
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+        store = api.ctx.collaboration
+        link = store.create_channel_link(
+            None,
+            channel,
+            backend="slack",
+            surface_id="C1",
+            thread_id=None,
+            allow_guests=True,
+            created_by=owner_id,
+            now=api.clock(),
+        )
+
+        turn, message = api.ctx.accept_bridge_turn(
+            link,
+            content="the bread is rising",
+            author_user_id=None,
+            display_name="stranger",
+            external_message_id="m1",
+        )
+        settled(api.client, headers, channel, turn.id)
+        assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+
+        assert api.ctx.concierge.classified == ["baker"]
+        ambient = [t for t in _turns(api, headers, channel) if t["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        assert ambient[0]["targets"] == ["baker"]
+        assert ambient[0]["input_message_id"] == message.id
+        recorded = store.get_turn(None, channel, ambient[0]["id"])
+        assert recorded is not None and recorded.author is not None
+        assert (recorded.author.kind, recorded.author.id) == ("agent", "baker")
+        assert ambient[0]["author_id"] == "baker"
+        assert ambient[0]["status"] == "completed"
+        messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+        assert "baker" in [m["agent_slug"] for m in messages]
+    api.ctx.close()
+
+
+def test_only_the_new_message_is_matched_against_interests(tmp_path: Any) -> None:
+    """One mention of an interest a few messages ago is not a reason to
+    classify every later message: the prefilter reads the message that
+    just arrived, and an unrelated one costs nothing."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "PASS"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+        _say(api, headers, channel, "what time is the meeting tomorrow")
+
+        assert api.ctx.concierge.classified == ["baker"]
+    api.ctx.close()
+
+
+def test_the_person_is_answered_before_any_listener_is_classified(tmp_path: Any) -> None:
+    """The agents the person addressed answer first. Deciding whether a
+    listener has something to add happens after them, so a slow relevance
+    call never holds up the person's own turn; the listener still answers
+    the person's message."""
+    api = _api(tmp_path)
+    with api.client:
+        concierge = Holding("baker", classifier=True, replies={"helper": "flour, mostly"})
+        api.ctx.concierge = concierge
+        headers = bearer(register(api))
+        _agent(api, "helper", [])
+        _agent(api, "baker", ["weekend"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        accepted = api.client.post(
+            f"/v1/channels/{channel}/turns",
+            json={"content": "@helper what do I need this weekend"},
+            headers=headers,
+        )
+        assert accepted.status_code == 202, accepted.text
+        turn = accepted.json()["turn"]
+        try:
+            _until(lambda: concierge.classified == ["baker"], "the classifier was never asked")
+            # The relevance question is still open; the person has been answered.
+            assert len(concierge.answered("helper")) == 1
+            messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+            assert "flour, mostly" in [m["content"] for m in messages]
+        finally:
+            if not concierge.held.done():
+                concierge.held.set_result(ConciergeReply("RELEVANT"))
+        settled(api.client, headers, channel, turn["id"])
+        assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+
+        ambient = [t for t in _turns(api, headers, channel) if t["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        assert ambient[0]["targets"] == ["baker"]
+        assert ambient[0]["parent_turn_id"] == turn["id"]
+        assert ambient[0]["input_message_id"] == turn["input_message_id"]
+        assert len(concierge.answered("baker")) == 1
     api.ctx.close()

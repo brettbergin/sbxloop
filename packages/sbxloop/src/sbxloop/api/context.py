@@ -757,16 +757,10 @@ class ApiContext:
         # roles they declare.
         turn_roles = work_roles(self.agents, turn.targets or ())
         listeners = self._ambient_selector(turn, user)
-        if turn.trigger == "human":
-            # A person's message is looked at once, by the turn it started.
-            # A follow-up turn answers a message its parent already looked
-            # at, so it offers listeners only the replies it posts itself.
-            self._consider_ambient(
-                listeners,
-                turn,
-                store.get_message(turn.channel_id, turn.input_message_id),
-                answering=tuple(slug for slug in (turn.targets or ()) if slug),
-            )
+        # The agents this turn's replies addressed: a listener among them is
+        # answered through the mention alone, so it is not also offered the
+        # person's message once the addressed agents have answered.
+        addressed: list[str] = []
         for role, slug in _recorded_assignees(turn).items():
             turn_roles.setdefault(role, slug)
         index = 0
@@ -991,6 +985,7 @@ class ApiContext:
                         )
                         # An agent the reply names is answered through the
                         # mention alone, whether or not it was admitted.
+                        addressed.extend((*mentioned, *addressed_slugs(delivered.content)))
                         self._consider_ambient(
                             listeners,
                             turn,
@@ -1007,6 +1002,20 @@ class ApiContext:
                 store.participant_failed(turn.id, index, errors[-1], self.clock())
             self.hub.notify()
             index += 1
+        if turn.trigger == "human":
+            # A person's message is looked at once, by the turn it started,
+            # and only after the agents the person addressed have answered:
+            # deciding whether a listener has something to add is a model
+            # call per listener, and it never holds up the person's own
+            # turn. A follow-up turn answers a message its parent already
+            # looked at, so it offers listeners only the replies it posts
+            # itself.
+            self._consider_ambient(
+                listeners,
+                turn,
+                store.get_message(turn.channel_id, turn.input_message_id),
+                answering=(*(slug for slug in (turn.targets or ()) if slug), *addressed),
+            )
         store.finish_turn(
             turn.id,
             error="; ".join(errors) if errors else None,
@@ -1149,6 +1158,14 @@ class ApiContext:
         if selector is None or message is None:
             return
         try:
+            # A turn a person stopped or cancelled does not get to start
+            # anything, through a listener no more than through a mention:
+            # the reply was already in flight, the unprompted answer need
+            # not be. The store refuses the turn again at acceptance, for a
+            # stop that lands while the relevance call is still out.
+            live = self.collaboration.get_turn(None, turn.channel_id, turn.id)
+            if live is None or live.status not in {"accepted", "running"}:
+                return
             selector.consider(
                 turn.channel_id,
                 message,
@@ -1216,7 +1233,8 @@ class ApiContext:
         whichever thread accepted it. ``author_kind`` is who the turn answers:
         the agent whose reply named this one, or the person whose message an
         ambient agent volunteered on. The turn is still the agent's to take
-        either way.
+        either way. The store refuses the turn when the channel has been
+        silenced or the parent turn cancelled since the decision was made.
         """
         with self._turn_admission:
             follow_up = self.collaboration.accept_agent_turn(

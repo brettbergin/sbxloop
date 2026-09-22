@@ -17,6 +17,47 @@ linked message could not be accepted, the bridge posted the raw exception
 text (SQL fragments, file paths) back to the surface; it now repeats only
 a refusal worded for people and otherwise says to check the daemon logs.
 
+**A listening agent stays quiet once its channel is stopped, joins no
+roster it was refused, answers a guest as itself, and never delays the
+person it listens to.** Four follow-ups to ambient speaking and agent
+mentions. A stop, or a cancel of the turn, that landed while a listener's
+relevance call was still out did not stop it: the silence was checked
+before the call and the turn was accepted afterwards, and a cancelled
+turn's in-flight reply could still draw listeners in. The store now refuses
+an agent-started turn inside its own transaction when the channel is
+silenced or the parent turn is no longer live, and a stopped or cancelled
+turn offers nothing to listeners at all. A reply that named an agent added
+it to the channel's roster before the guardrails decided whether it could
+speak, and a roster failure dropped the mentions after it; an agent is now
+joined only once admitted, and a roster failure drops that mention alone. A
+listener's turn on a message from a guest on a linked surface was recorded
+as a person whose id was the agent's slug, which a restart then settled as
+interrupted; it is now the listener's own turn (`author_kind: "agent"`) and
+a restart runs it for the guest's stand-in, as it runs the guest's own
+turn. The interest prefilter matched the whole `ambient_window_messages`
+window, so one mention of an interest made every later message cost a
+classifier call, and the calls ran before the agents the person addressed
+answered; the prefilter now reads the new message alone (the classifier
+still reads the window) and classification runs after the addressed agents
+have answered, so it never holds up the person's turn.
+
+**Leaving the workspace ends every standing a member had.** Removing or
+deactivating a member deleted their workspace row and nothing else: they
+stayed in every channel, so a later invite handed back every private channel
+they had been in, a channel could lose its last active owner because a
+departed owner still counted as one, and `GET /v1/channels/{id}/members`
+kept listing them. Their invites outlived them too: an admin removed from
+the workspace, or an owner demoted, left invites behind that still admitted
+new members at the invite's full role. Now removal and deactivation take the
+user out of every channel in the same transaction (the longest-standing
+member still in the workspace takes over a channel they were the last owner
+of; a channel nobody else was in is left without a member), the last-owner
+rules count only members still active in the workspace, the unused invites
+the user created are withdrawn (a demotion withdraws those above the new
+role), each as a `workspace.invite.revoked` event with a `reason`, and an
+invite whose creator is no longer an active member admits nobody while one
+above its creator's current role grants that role instead.
+
 **A member removed from the workspace receives nothing further on an open
 event stream.** The SSE stream and the WebSocket re-check their token every
 minute and re-read the member behind it; a removed member's access token
@@ -28,6 +69,16 @@ that member: when the re-check finds the member gone, or the client no
 longer holds `runs:read`, it closes with `access_revoked` (`stream.closed`
 on SSE, `closing` and close code 4403 on the socket). A stream opened by a
 plain API client is unchanged.
+**Labelling an issue for a run from a channel grants that channel the
+runs that follow, never the runs that already existed.** A code item
+no channel asked for (an operator ran it from the host) resolved to the
+first turn anywhere that ever filed or labelled its issue, and a poll
+that re-queued the issue after a later label gave the whole item, every
+earlier run included, to the labelling channel: a member could label an
+existing issue from their own channel and read the files and events of
+runs filed from channels they cannot open. A turn now claims an item only
+when it precedes the item's creation, and a run answers to the channel
+that had asked for the issue by the time the run started.
 
 **A run's reply in its channel is credited only to an agent on that run.**
 A steer names the agent it is for, and the engine took that name at its word

@@ -239,7 +239,7 @@ def _set_visibility(api: Any, channel_id: str, visibility: str) -> None:
 
 def _invite(api: Any, role: str, username: str) -> dict[str, str]:
     store = api.ctx.collaboration
-    owner = store.list_members()[0]
+    owner = next(m for m in store.list_members() if m.role == "owner")
     _, raw = store.create_invite(role, None, created_by=owner.user.id, ttl_s=60, now=api.clock())
     response = api.client.post(
         "/v1/auth/local/register",
