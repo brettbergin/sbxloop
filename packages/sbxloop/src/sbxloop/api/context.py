@@ -554,10 +554,13 @@ class ApiContext:
 
     def project_work(self, channel_id: str | None = None) -> list[Any]:
         """Deliver recorded work; never dispatch or replay an agent tool."""
+        from sbxloop.api.external_work import reconcile
         from sbxloop.api.work_delivery import project_work
 
         if not self.ready.is_set() or self.stopping.is_set():
             return []
+        if channel_id is None:
+            reconcile(self)
         return project_work(self, channel_id)
 
     def recover_collaboration(self) -> None:
@@ -899,6 +902,11 @@ class ApiContext:
                     prompt,
                     author=author,
                     author_id=author_id,
+                    # An operator command or config write the turn's tools
+                    # run answers to the person's role (#1274), as a stop
+                    # or a steer from chat does. A turn another agent
+                    # started carries nobody's authority.
+                    principal=principal if source_agent is None else None,
                     via="local",
                     message_id=turn.input_message_id
                     if index == 0

@@ -8,12 +8,15 @@ A :class:`Principal` separates the two. The attribution string is derived
 *from* the principal for the source-facing sentence the loop already
 writes; a principal is never built from a caller-supplied attribution.
 
-The surfaces that exist today (the ``ctl`` queue on the host, a chat
-channel the operator restricted, the local console, the concierge) are
-trusted completely, as they always were: :meth:`Principal.trusted` gives
-them every capability and keeps their attribution byte-for-byte. A
-principal with fewer capabilities can only come from an authenticated
-surface that knows what it granted.
+The surfaces the operator owns (the ``ctl`` queue on the host, a chat
+channel the operator restricted, the local console) are trusted
+completely, as they always were: :meth:`Principal.trusted` gives them
+every capability and keeps their attribution byte-for-byte. A principal
+with fewer capabilities can only come from an authenticated surface that
+knows what it granted: the API builds one from the person's workspace
+role, and a concierge turn carries it, so a tool that runs an operator
+command or writes the config on that turn answers to the person who
+asked, never to the daemon operator.
 """
 
 from __future__ import annotations

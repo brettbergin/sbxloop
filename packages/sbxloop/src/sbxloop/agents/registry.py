@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AgentExists",
+    "AgentForbidden",
     "AgentInvalid",
     "AgentNotFound",
     "AgentReadOnly",
@@ -82,6 +83,11 @@ class AgentArchived(SbxloopError):
     """The stored agent was archived and is no longer edited."""
 
 
+class AgentForbidden(SbxloopError):
+    """The caller is neither the person who saved the agent nor a workspace
+    owner or admin, so may not change or archive it."""
+
+
 class AgentRevisionConflict(SbxloopError):
     """The agent changed since the revision the caller acted on."""
 
@@ -116,10 +122,21 @@ class AgentRegistry(Protocol):
     def create(self, spec: AgentSpec, by: str) -> AgentDefinition: ...
 
     def update(
-        self, slug: str, patch: Mapping[str, Any], expected_revision: int, by: str
-    ) -> AgentDefinition: ...
+        self,
+        slug: str,
+        patch: Mapping[str, Any],
+        expected_revision: int,
+        by: str,
+        *,
+        manager: bool = False,
+    ) -> AgentDefinition:
+        """Edit the agent ``by`` saved. A ``manager`` (a workspace owner or
+        admin) may edit anyone's; otherwise another person's agent answers
+        :class:`AgentForbidden`."""
 
-    def archive(self, slug: str, by: str) -> AgentDefinition: ...
+    def archive(self, slug: str, by: str, *, manager: bool = False) -> AgentDefinition:
+        """Retire the agent ``by`` saved (or, for a ``manager``, anyone's).
+        A stored spec that no longer validates does not stop the archive."""
 
     def validate(self, spec: AgentSpec) -> builtins.list[str]:
         """Everything wrong with ``spec`` beside the agents already known;
@@ -230,11 +247,17 @@ class ConfigAgentRegistry:
         raise AgentRegistryReadOnly("agents come from the built-ins and sbxloop.toml here")
 
     def update(
-        self, slug: str, patch: Mapping[str, Any], expected_revision: int, by: str
+        self,
+        slug: str,
+        patch: Mapping[str, Any],
+        expected_revision: int,
+        by: str,
+        *,
+        manager: bool = False,
     ) -> AgentDefinition:
         raise AgentRegistryReadOnly(f"agent {slug!r} is defined by sbxloop or sbxloop.toml")
 
-    def archive(self, slug: str, by: str) -> AgentDefinition:
+    def archive(self, slug: str, by: str, *, manager: bool = False) -> AgentDefinition:
         raise AgentRegistryReadOnly(f"agent {slug!r} is defined by sbxloop or sbxloop.toml")
 
     def validate(self, spec: AgentSpec) -> builtins.list[str]:
@@ -442,8 +465,27 @@ class DbAgentRegistry:
             self._event(session, "agent.created", spec.slug, now, by)
         return AgentDefinition(spec, "user", revision=1)
 
+    @staticmethod
+    def _refuse_foreign(row: AgentRow, by: str, manager: bool) -> None:
+        """Only the person who saved an agent, or a workspace owner or
+        admin, changes it. A row saved with no creator belongs to nobody in
+        particular, so a manager alone may touch it."""
+        if manager:
+            return
+        if row.created_by is None or row.created_by != by:
+            raise AgentForbidden(
+                f"agent {row.slug!r} was saved by someone else; only its creator, "
+                "a workspace owner or an admin may change or archive it"
+            )
+
     def update(
-        self, slug: str, patch: Mapping[str, Any], expected_revision: int, by: str
+        self,
+        slug: str,
+        patch: Mapping[str, Any],
+        expected_revision: int,
+        by: str,
+        *,
+        manager: bool = False,
     ) -> AgentDefinition:
         key = slug.strip().casefold()
         self._refuse_configured(key)
@@ -455,11 +497,23 @@ class DbAgentRegistry:
             row = session.get(AgentRow, key)
             if row is None:
                 raise AgentNotFound(f"agent {key!r} not found")
+            self._refuse_foreign(row, by, manager)
             if row.state != "active":
                 raise AgentArchived(f"agent {key!r} is archived")
             if int(row.revision) != expected_revision:
                 raise AgentRevisionConflict(key, expected_revision, int(row.revision))
-            current = AgentSpec.model_validate_json(row.spec_json)
+            try:
+                current = AgentSpec.model_validate_json(row.spec_json)
+            except ValidationError as exc:
+                # Saved under an older rule the spec no longer meets: there
+                # is nothing to edit against, but the agent can be archived.
+                raise AgentInvalid(
+                    [
+                        f"agent {key!r}: the stored spec no longer validates and cannot "
+                        "be edited; archive it and save it again",
+                        *_validation_messages(exc),
+                    ]
+                ) from exc
             try:
                 spec = AgentSpec.model_validate({**current.model_dump(), **values, "slug": key})
             except ValidationError as exc:
@@ -478,7 +532,7 @@ class DbAgentRegistry:
             self._event(session, "agent.updated", key, now, by)
         return AgentDefinition(spec, "user", revision=revision)
 
-    def archive(self, slug: str, by: str) -> AgentDefinition:
+    def archive(self, slug: str, by: str, *, manager: bool = False) -> AgentDefinition:
         key = slug.strip().casefold()
         self._refuse_configured(key)
         now = self._clock()
@@ -486,11 +540,20 @@ class DbAgentRegistry:
             row = session.get(AgentRow, key)
             if row is None:
                 raise AgentNotFound(f"agent {key!r} not found")
-            spec = AgentSpec.model_validate_json(row.spec_json)
+            self._refuse_foreign(row, by, manager)
             if row.state != "archived":
                 row.state = "archived"
                 row.updated_at = now
                 row.revision = int(row.revision) + 1
                 self._event(session, "agent.archived", key, now, by)
             revision = int(row.revision)
+            spec_json = str(row.spec_json)
+        # The archive never depends on the spec: a row saved under an older
+        # rule it no longer meets is retired all the same, and described by
+        # what is still certain about it.
+        try:
+            spec = AgentSpec.model_validate_json(spec_json)
+        except ValidationError:
+            log.warning("agents.stored_spec_unreadable", slug=key)
+            spec = AgentSpec.model_construct(slug=key)
         return AgentDefinition(spec, "user", revision=revision, archived=True)

@@ -30,6 +30,7 @@ from tests.api.test_channel_access import _invite
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
 from tests.api.test_control import in_flight, run_public
+from tests.unit.test_daemon_concierge import make
 from tests.unit.test_daemon_loop import gh_item
 
 
@@ -89,10 +90,13 @@ def _cancels(api: Api) -> list[str]:
     return cancelled
 
 
-def _turn(api: Api, headers: dict[str, str], channel: str, content: str) -> dict[str, Any]:
-    accepted = api.client.post(
-        f"/v1/channels/{channel}/turns", headers=headers, json={"content": content}
-    )
+def _turn(
+    api: Api, headers: dict[str, str], channel: str, content: str, *, intent: str | None = None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"content": content}
+    if intent is not None:
+        body["intent"] = intent
+    accepted = api.client.post(f"/v1/channels/{channel}/turns", headers=headers, json=body)
     assert accepted.status_code == 202, accepted.text
     return settled(api.client, headers, channel, accepted.json()["turn"]["id"])
 
@@ -359,6 +363,60 @@ class TestStopFromChat:
         assert listed.status_code == 200, listed.text
         (record,) = listed.json()["data"]
         assert record["actor"]["id"] == guest_id
+
+
+class TestOperatorVerbsFromAStartWorkTurn:
+    """`sbx_control` on a turn that may start work answers to the person who
+    asked (#1274), through the principal a stop from chat already uses: the
+    turn carries their workspace role, and the control service refuses an
+    operator's verb a member does not hold. Nothing runs as the daemon
+    operator because the concierge asked for it."""
+
+    @staticmethod
+    def _pausing_concierge(tmp_path: Path) -> tuple[Any, Any, Any]:
+        """A real concierge whose scripted model answers the turn with one
+        `sbx_control("pause")` call."""
+        concierge, client, _, loop, _ = make(
+            tmp_path / "concierge",
+            [{"calls": [("sbx_control", {"command": "pause"})], "text": "asked to pause"}],
+        )
+        return concierge, client, loop
+
+    def test_a_members_start_work_turn_cannot_pause_the_daemon(
+        self, api: Api, tmp_path: Path
+    ) -> None:
+        concierge, client, loop = self._pausing_concierge(tmp_path)
+        api.ctx.concierge = concierge
+        owner = bearer(register(api))
+        guest = bearer(_invite(api, "member", "guest"))
+        channel = _channel(api, owner, visibility="workspace")
+        try:
+            done = _turn(api, guest, channel, "pause the daemon, then restart it", intent="code")
+            assert done["status"] == "completed", done
+            # A start-work turn still offers the tool; the verb is what is refused.
+            assert "sbx_control" in {tool.name for tool in client.jobs[0].host_tools}
+            (resp,) = client.responses
+            assert resp.text.startswith("(command not accepted) pause refused:"), resp.text
+            assert "lacks daemon:manage" in resp.text
+            assert loop.paused is False and loop.hold_calls == []
+        finally:
+            concierge.close()
+
+    def test_an_owners_start_work_turn_pauses_it_in_their_name(
+        self, api: Api, tmp_path: Path
+    ) -> None:
+        concierge, client, loop = self._pausing_concierge(tmp_path)
+        api.ctx.concierge = concierge
+        owner = bearer(register(api))
+        channel = _channel(api, owner)
+        try:
+            done = _turn(api, owner, channel, "pause the daemon", intent="code")
+            assert done["status"] == "completed", done
+            (resp,) = client.responses
+            assert resp.ok and "paused" in resp.text, resp.text
+            assert loop.hold_calls == [("pause", "operator", "Local Owner (via concierge)")]
+        finally:
+            concierge.close()
 
 
 def test_the_steering_route_passes_the_task_and_agent_to_the_run(api: Api) -> None:

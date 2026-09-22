@@ -67,6 +67,7 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message, strip_mentions
 from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
+from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.discord_format import (
     UNKNOWN_BACKEND,
     UNKNOWN_MODEL,
@@ -1344,6 +1345,11 @@ class ChatBridge(ABC):
                     text,
                     author=author,
                     author_id=msg.author_id,
+                    # The control channel is the operator's (restricted by
+                    # them, on a bridge with no authority model of its own),
+                    # so a turn from it acts with every capability, as
+                    # `!sbx` does: said explicitly, never assumed (#1274).
+                    principal=Principal.trusted(author, self.backend),
                     on_tool=on_tool,
                     via=self.backend,
                     # ...and the message id keys a workload the turn starts

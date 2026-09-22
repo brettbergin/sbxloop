@@ -147,7 +147,12 @@ stays archived).
 | `PATCH` | `/v1/agents/{slug}`         | `expected_revision` and changed fields | 200, the agent at the next revision |
 | `POST`  | `/v1/agents/{slug}/archive` | none                                   | 200, the agent with `enabled` false |
 
-All three need `collaboration:write`. A saved agent never takes a slug or an
+All three need `collaboration:write`. An agent belongs to the person who
+saved it: `PATCH` and archive are theirs and a workspace owner's or
+admin's, and anyone else answers 403 `agent_forbidden`. A saved agent
+whose stored spec no longer validates (a later release tightened a rule)
+is left out of listings, answers 422 `invalid_agent` on `PATCH`, and can
+still be archived. A saved agent never takes a slug or an
 alias a built-in, configured or other saved agent already has, and a body
 naming a key the spec does not have (a host list, an egress rule) is
 refused: egress stays the operator's `[policy]`. A spec that names an
@@ -257,6 +262,47 @@ The association is durable turn data, independent of event retention; unrelated
 repositories with the same issue number do not match. No source polling or
 runner behavior changes.
 
+### Conversations for externally started work
+
+`collaboration.external_work` advertises automatic conversations for jobs
+known to the connected daemon, including issue labels, schedules, chat
+bridges, API admissions and standalone persisted runs. A job without an
+existing conversation gets a workspace-visible channel. An existing
+association keeps its channel and access rules. Repeated attempts at the
+same issue share a conversation; separate schedule occurrences do not.
+The association is presentation data: it does not change the item's
+admission channel, assignment, scheduling, accounting or source delivery.
+
+Clients with this feature use `GET /v1/channels/{id}/jobs`, a list of
+attempt snapshots. Each has a stable `work_id`, optional real `item_id`,
+`run_id` and `turn_id`, state, source, revision, available actions and
+artifacts. A run with no admitted item has no item controls. The response
+also includes work awaiting Code issue admission. The existing `/work`
+contract is unchanged and remains the fallback for older daemons.
+An attempt whose execution record was removed remains listed with
+`unavailable: true`, its recorded metadata, and no controls or artifacts.
+Item list/detail responses provide a nullable `channel_id` only when the
+viewer can read that conversation.
+
+System-created channel summaries include `external_work` metadata for
+sidebar status and source links without loading each transcript. Opening,
+progress and result messages identify the system as their author and carry
+`source_work_id`, an optional `source_run_id`, and `historical`; they do not
+invent a human turn. Channel chat and live-run steering use the ordinary
+permission checks. Events and artifacts resolve through the attempt's own
+channel, so admitting a later attempt to a private channel does not move
+an earlier attempt's history or expose the later attempt there.
+
+The initial import includes unfinished work and terminal work from the
+last 30 days. Imported messages are quiet history and do not add unread
+counts. New jobs and activity remain unread until read. The scoped event
+`collaboration.external_work.attention` carries `channel_id`, `work_id`,
+optional `run_id`, a durable `attention_id`, `kind` (`work`, `failure` or
+`action_required`), `title`, `body` and `historical: false`; clients apply
+their channel preferences and browser-notification opt-in. Reconciliation
+and event replay do not resend the same transition. Deleting a generated
+channel hides it without recreating it on the next reconciliation.
+
 ### Admitting work for named agents
 
 `POST /v1/items` takes three optional fields on an `issue` or `workload`
@@ -291,9 +337,10 @@ Angie as the lead. An item that names its channel is delivered there even when
 its key names no message in it (as part of the channel's latest turn when it
 was admitted), and never to a channel other than its own; that holds for an
 issue (`code`) admission too, whether or not any turn in the channel named the
-issue. A channel that has had no turn yet has nowhere to put a result, so the
-delivery is skipped and the daemon log says why
-(`api.work_delivery_skipped`). A work result is credited to the item's lead
+issue. With `collaboration.external_work`, a channel that has had no turn
+yet receives system-authored progress and results through the job projection.
+Older daemons skip that delivery and log `api.work_delivery_skipped`.
+A turn-associated work result is credited to the item's lead
 when it has one, and to the participant that asked otherwise.
 
 A finished workload or tool run's files are catalogued before its work result
@@ -1137,7 +1184,7 @@ request's `X-Request-Id`, and the fields a client needs to act:
 | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                  |
 | 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                     |
-| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                                         |
+| 403    | `forbidden` (with `capability`), `agent_forbidden`, `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                      |
 | 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                                             |
 | 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict` |
 | 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                          |

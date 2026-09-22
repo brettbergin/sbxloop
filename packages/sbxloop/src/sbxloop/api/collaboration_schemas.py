@@ -359,6 +359,25 @@ class ChannelUpdate(ApiModel):
     visibility: ChannelVisibility | None = None
 
 
+class ExternalWorkSourceOut(ApiModel):
+    """Known admission provenance; an absent source link is not invented."""
+
+    kind: str
+    repository: str | None = None
+    url: str | None = None
+
+
+class ExternalWorkOut(ApiModel):
+    """Durable job identity and import baseline for a job conversation."""
+
+    work_id: str
+    source: ExternalWorkSourceOut
+    system_created: bool
+    historical: bool
+    read_baseline: int = Field(default=0, ge=0)
+    state: str | None = None
+
+
 class ChannelOut(ApiModel):
     id: str
     workspace_id: str
@@ -372,10 +391,12 @@ class ChannelOut(ApiModel):
     created_by: str | None = None
     silenced_until: float | None = None
     #: Messages past the reader's last read sequence. Null for a caller
-    #: with no channel membership to measure against.
+    #: with no channel membership to measure against, except automatically
+    #: created job conversations whose import baseline applies to all viewers.
     unread_count: int | None = None
     #: The caller's role in the channel; ``null`` when not a member.
     my_role: ChannelRoleName | None = None
+    external_work: ExternalWorkOut | None = None
 
 
 class ChannelPage(ApiModel):
@@ -446,6 +467,32 @@ class ChannelArtifactPage(ApiModel):
     """Every file a channel's messages carry."""
 
     data: list[ArtifactRefOut]
+
+
+class ChannelJobOut(ApiModel):
+    """Additive all-jobs view, including real runs without a work item."""
+
+    work_id: str
+    channel_id: str
+    item_id: str | None = None
+    turn_id: str | None = None
+    agent_slug: str | None = None
+    title: str
+    kind: str
+    state: str
+    run_id: str | None = None
+    stage: str | None = None
+    item_revision: int = 0
+    run_revision: int | None = None
+    item_actions: list[str] = Field(default_factory=list)
+    run_actions: list[str] = Field(default_factory=list)
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    source: ExternalWorkSourceOut
+    created_at: str
+    updated_at: str
+    historical: bool = False
+    #: The durable attempt remains visible after its execution record is gone.
+    unavailable: bool = False
 
 
 class AuthorOut(ApiModel):
@@ -550,6 +597,12 @@ class MessageOut(ApiModel):
     origin: MessageOriginOut | None = None
     #: Set on the ``agent_update`` messages a run posts; null otherwise.
     post_kind: PostKindName | None = None
+    #: A real run identity, including posts with no originating item or turn.
+    source_run_id: str | None = None
+    #: Stable job identity anchors queued work before its first run exists.
+    source_work_id: str | None = None
+    #: Imported history remains silent when a client first discovers it.
+    historical: bool = False
 
 
 class ReactionSet(ApiModel):

@@ -117,7 +117,15 @@ def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
     assert visible is not None  # nosec B101 - a member always narrows
     conditions.append(
         or_(
-            ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
+            ApiEventRow.channel_id.in_(
+                select(ChannelRow.id).where(visible, ChannelRow.deleted_at.is_(None))
+            ),
+            # Former readers still need the tombstone to remove the chat
+            # from their list, but its run history no longer grants access.
+            and_(
+                ApiEventRow.type == "collaboration.channel.deleted",
+                ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
+            ),
             and_(ApiEventRow.channel_id.is_(None), ApiEventRow.run_id.is_(None)),
         )
     )
