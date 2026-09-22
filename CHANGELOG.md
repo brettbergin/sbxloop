@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**A member cannot give their own agent the power to start work, nor a
+daily cap above the operator's.** `POST /v1/agents` and
+`PATCH /v1/agents/{slug}` accepted `can_start` and `max_runs_per_day` from
+anyone holding `collaboration:write`, and an agent's own `max_runs_per_day`
+replaced `[agent_team] max_agent_runs_per_day` outright, so a member could
+save an agent that queues runs and files issues on its own under a cap of
+their choosing. Granting `can_start` (setting it on a new agent, or adding a
+kind to a saved one) now needs a workspace owner or admin (a plain API
+client: `daemon:manage`) and answers 403 `agent_forbidden` for anyone else;
+the agent's owner may still narrow or clear it, and `[[agents]]` in
+`sbxloop.toml` are unaffected. The team knob is now a ceiling: an agent's
+effective daily cap is the lower of its own `max_runs_per_day` and
+`max_agent_runs_per_day`, and the refusal names whichever bit.
+
 **Merging two collaboration accounts takes nothing from a deactivated
 account, never re-admits somebody who was removed, and records who ran
 it.** `sbxloop users merge` kept the stronger of the two workspace roles

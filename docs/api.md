@@ -151,7 +151,18 @@ stays archived).
 
 All three need `collaboration:write`. An agent belongs to the person who
 saved it: `PATCH` and archive are theirs and a workspace owner's or
-admin's, and anyone else answers 403 `agent_forbidden`. A saved agent
+admin's, and anyone else answers 403 `agent_forbidden`. Letting an agent
+start work on its own is the operator's to grant: a `POST` whose
+`can_start` is not empty, or a `PATCH` whose `can_start` adds a kind the
+agent does not already have, needs a workspace owner or admin (for a plain
+API client, `daemon:manage`) and answers 403 `agent_forbidden` for anyone
+else, with nothing saved; the agent's owner may still narrow or clear
+`can_start`, or send it back unchanged. `max_runs_per_day` is saved as
+given, and `[agent_team] max_agent_runs_per_day` stays the ceiling where
+runs start: the agent's effective daily cap is the lower of the two, so a
+member lowers their agent's cap but never raises it above the operator's.
+Agents declared in `sbxloop.toml` are not subject to either rule; they are
+read-only here. A saved agent
 whose stored spec no longer validates (a later release tightened a rule)
 is left out of listings, answers 422 `invalid_agent` on `PATCH`, and can
 still be archived. A saved agent never takes a slug or an

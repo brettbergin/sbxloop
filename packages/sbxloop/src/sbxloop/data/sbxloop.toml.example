@@ -379,7 +379,7 @@ service_memory = "2g"
 # credentials = ["weather"]  # [[credentials]] names it may be granted
 # interests = ["weather", "forecast"]  # topics it may speak up about unprompted
 # can_start = ["workload"]  # run kinds it may start itself: "code", "workload" (needs a role)
-# max_runs_per_day = 4  # cap on the runs it starts itself; unset: no own cap
+# max_runs_per_day = 4  # cap on the runs it starts itself, never above [agent_team] max_agent_runs_per_day; unset: that ceiling
 # aliases = ["weatherbot"]  # other @-names for it, never another agent's
 # enabled = true  # false hides it and routes nothing to it
 
@@ -403,7 +403,7 @@ service_memory = "2g"
 # count every start, an issue filed without queueing included, from the
 # moment it is made rather than from when a poll discovers it.
 # max_chain_depth = 2              # how deep a chain of agent-started work may go
-# max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+# max_agent_runs_per_day = 4       # per-agent daily ceiling; `[[agents]] max_runs_per_day` may lower it
 #
 # What a run says in the channel that asked for it. Each post is made
 # under the name of the agent that did the work: the plan by the planner,

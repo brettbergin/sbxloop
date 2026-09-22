@@ -3009,8 +3009,9 @@ class AgentTeamConfig(_ConfigModel):
     refused, and how much work one agent may start in a day.
 
     ``max_chain_depth = 0`` stops agent-started work entirely without
-    editing every agent; ``max_agent_runs_per_day`` is the default an
-    ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+    editing every agent; ``max_agent_runs_per_day`` is the ceiling on every
+    agent's daily starts, which an ``[[agents]]`` entry's own
+    ``max_runs_per_day`` may lower but never raise.
 
     ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
     replies, the delivery and any notice; ``"quiet"`` posts only what ends
@@ -3022,7 +3023,8 @@ class AgentTeamConfig(_ConfigModel):
     # Work a person asked for is depth 0; the run an agent starts from it
     # is depth 1. An agent working at this depth may start nothing.
     max_chain_depth: int = Field(default=2, ge=0)
-    # The daily cap for an agent whose spec names none.
+    # The ceiling on every agent's daily starts; a spec's own cap may
+    # lower it, never raise it.
     max_agent_runs_per_day: int = Field(default=4, ge=0)
     # What a run posts in the channel that asked for it.
     chronicle: Literal["normal", "quiet", "off"] = "normal"

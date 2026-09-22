@@ -491,8 +491,9 @@ def work_tools(
        configured *and* enabled -- the refusal names what is configured;
     3. ``parent_depth`` must be below ``[agent_team] max_chain_depth`` --
        this is what ends a chain of agents starting each other's work;
-    4. the agent must be under its daily cap (``max_runs_per_day`` on its
-       spec, else ``[agent_team] max_agent_runs_per_day``) -- one agent
+    4. the agent must be under its daily cap: the lower of ``max_runs_per_day``
+       on its spec and ``[agent_team] max_agent_runs_per_day``, the
+       operator's ceiling a spec may lower but never raise -- one agent
        cannot spend the whole workspace;
     5. the workspace pool must admit another run;
     6. the ask must not be one this agent already started under this
@@ -535,15 +536,20 @@ def work_tools(
                 f"[agent_team] max_chain_depth is {limits.max_chain_depth}: say what "
                 "should happen instead of starting more work"
             )
-        cap = agent.spec.max_runs_per_day
-        knob = "your max_runs_per_day"
-        if cap is None:
-            cap, knob = limits.max_agent_runs_per_day, "[agent_team] max_agent_runs_per_day"
+        # The team knob is a ceiling: a spec's own cap lowers it, never
+        # raises it, so a cap a member chose through the API cannot buy
+        # more starts than the operator allowed.
+        own, team = agent.spec.max_runs_per_day, limits.max_agent_runs_per_day
+        cap, knob, note = team, "[agent_team] max_agent_runs_per_day", ""
+        if own is not None and own <= team:
+            cap, knob = own, "your max_runs_per_day"
+        elif own is not None:
+            note = f" (your max_runs_per_day of {own} cannot raise it)"
         started = host.runs_started_today(slug)
         if started >= cap:
             raise ToolRejectedError(
-                f"you have started {started} today and {knob} is {cap}: nothing more "
-                "starts until the day rolls over"
+                f"you have started {started} today and {knob} is {cap}{note}: nothing "
+                "more starts until the day rolls over"
             )
         refusal = host.budget_refusal() if budget else None
         if refusal is not None:
