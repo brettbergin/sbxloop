@@ -110,6 +110,20 @@ async def run_events(
     return await ctx.call(read)
 
 
+_CLOSED_ACCESS_REVOKED = 'event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'
+
+
+def stream_still_allowed(fresh: Authenticated, *, opened_as_member: bool) -> bool:
+    """Whether a live stream may go on after its token was re-resolved
+    to ``fresh``. The principal must still hold ``runs:read`` (a client's
+    grants can be taken away under a token that still verifies), and a
+    stream that opened for a workspace member closes rather than widen to
+    a plain client's unfiltered view once that member is gone."""
+    if not fresh.principal.can("runs:read"):
+        return False
+    return not (opened_as_member and fresh.member is None)
+
+
 def _frame(event: EventOut) -> str:
     body = json.dumps(event.model_dump(mode="json"), separators=(",", ":"), default=str)
     return f"id: {event.id}\nevent: {event.type}\ndata: {body}\n\n"
@@ -127,10 +141,13 @@ async def sse_frames(
     """The stream body: events after the cursor as they land, a comment
     ping while nothing does, and the stream ends when the daemon stops or
     the token no longer stands. A member is sent only what they may see,
-    re-judged as their membership changes."""
+    re-judged as their membership changes; a stream a member opened ends
+    (``access_revoked``) once they are removed from the workspace or lose
+    ``runs:read``, never widening to a plain client's view."""
     cursor = after
     token = auth.token
     viewer = auth.member
+    opened_as_member = auth.member is not None
     last_check = ctx.clock()
     last_ping = asyncio.get_running_loop().time()
     while not ctx.stopping.is_set():
@@ -157,10 +174,14 @@ async def sse_frames(
         if now - last_check >= ACCESS_RECHECK_S:
             last_check = now
             try:
-                viewer = (await ctx.call(resolve_token, ctx, token)).member
+                fresh = await ctx.call(resolve_token, ctx, token)
             except Problem:
-                yield 'event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'
+                yield _CLOSED_ACCESS_REVOKED
                 return
+            if not stream_still_allowed(fresh, opened_as_member=opened_as_member):
+                yield _CLOSED_ACCESS_REVOKED
+                return
+            viewer = fresh.member
         if asyncio.get_running_loop().time() - last_ping >= PING_EVERY_S:
             last_ping = asyncio.get_running_loop().time()
             yield ": ping\n\n"
@@ -235,4 +256,4 @@ def _resolve_start(views: Views, start: int) -> None:
         )
 
 
-__all__ = ["not_found", "router", "sse_frames"]
+__all__ = ["not_found", "router", "sse_frames", "stream_still_allowed"]

@@ -24,6 +24,18 @@ answered; the prefilter now reads the new message alone (the classifier
 still reads the window) and classification runs after the addressed agents
 have answered, so it never holds up the person's turn.
 
+**A member removed from the workspace receives nothing further on an open
+event stream.** The SSE stream and the WebSocket re-check their token every
+minute and re-read the member behind it; a removed member's access token
+still verifies but names no member, and the stream treated "no member" as a
+plain API client and dropped every visibility condition, so until the token
+expired the removed person received every event in the workspace, private
+channels included. A stream or socket opened by a member is now pinned to
+that member: when the re-check finds the member gone, or the client no
+longer holds `runs:read`, it closes with `access_revoked` (`stream.closed`
+on SSE, `closing` and close code 4403 on the socket). A stream opened by a
+plain API client is unchanged.
+
 **An OIDC sign-in trusts a provider email only when the provider has checked
 it, and a member's typed-in address can no longer steer a colleague's first
 sign-in.** Any member could set their email to an address nobody held yet;
