@@ -32,7 +32,7 @@ import signal
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -50,7 +50,15 @@ from sbxloop.agents.chronicle import RunChronicle
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.posts import ChannelPoster, RunArtifacts
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
-from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
+from sbxloop.config import (
+    VCS_KINDS,
+    Config,
+    GithubConfig,
+    RepoConfig,
+    SandboxConfig,
+    ScheduleConfig,
+    VcsKind,
+)
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
     GENERATION_KEY,
@@ -80,6 +88,7 @@ from sbxloop.daemon.model import (
     is_planned_assignment,
     requested_roles,
 )
+from sbxloop.daemon.repositories import RepositoryRegistry
 from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
@@ -380,6 +389,7 @@ class DaemonLoop:
         worker_python: str | None = None,
         install_workers: bool | None = None,
         poster: ChannelPoster | None = None,
+        repositories: RepositoryRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -485,6 +495,15 @@ class DaemonLoop:
         # The import is reached from the loop thread (a tick) and from a
         # concierge command alike; one of them does it.
         self._schedules_lock = threading.Lock()
+        # Where a repository is registered: the daemon's database. The
+        # start-up that built the sources shares its registry (the file's
+        # entries it imported are narrated once, at recovery); a loop built
+        # on its own gets one of its own.
+        self.repositories = repositories or RepositoryRegistry(config, dstore, clock=clock)
+        # What this process polls: the enabled repositories at start, which
+        # the sources were built from. A registration that changes this set
+        # takes effect at the next start, and says so.
+        self.polled_repos: frozenset[str] = frozenset()
         # The workspace budget pool: the daily run cap and token budget
         # every dispatch is admitted against, and what runs spend.
         self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
@@ -1676,6 +1695,9 @@ class DaemonLoop:
         )
         self._release_request_rejection_hold()
         self._report_restart()
+        # After the restart's own line, so a restart still reads as
+        # "started, restarted by ..." and the import follows it.
+        self.narrate_repository_import()
         self._start_warmer()
         ticks = 0
         try:
@@ -2498,6 +2520,125 @@ class DaemonLoop:
             profile=spec.profile,
         )
         return f"schedule {spec.name} updated: {spec.cadence_text}, profile `{spec.profile}`."
+
+    # -- the registered repositories ------------------------------------------------
+
+    def _activate_repositories(self) -> None:
+        """Apply the registry (importing the file's entries at first sight)
+        and remember what this process polls: the enabled set now, which
+        is what the sources were built from. The import is narrated when
+        the daemon starts (:meth:`narrate_repository_import`), beside
+        ``daemon.started``, not here: recovery writes no chronology of its
+        own."""
+        self.repositories.activate()
+        self.polled_repos = frozenset(r.repo.casefold() for r in self.config.enabled_repos())
+
+    def narrate_repository_import(self) -> None:
+        """Tell the humans, once, which of the file's entries this process
+        imported into the registry, and where registration lives now."""
+        imported = self.repositories.activate()
+        if not imported:
+            return
+        self._notice(
+            "daemon.repositories_imported",
+            f"📦 repositories: imported {', '.join(imported)} from sbxloop.toml — "
+            "registration lives in the daemon's database now (`POST`/`PATCH`/"
+            "`DELETE /v1/repositories` change it live); a `[[vcs.repos]]` entry still "
+            "carries the repository's other settings, and a new entry in the file is "
+            "registered at the next start",
+            repositories=imported,
+        )
+
+    def repository_restart_required(self, entry: RepoConfig) -> bool:
+        """Whether the registration's enabled state differs from what this
+        process polls, so polling follows at the next start."""
+        return (entry.repo.casefold() in self.polled_repos) != entry.enabled
+
+    def add_repository(
+        self,
+        repo: str,
+        *,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        by: str | None,
+        source: str,
+    ) -> tuple[str, str]:
+        """Register a repository: admitted for work now, polled from the
+        next start. Returns the name as registered and the line to answer
+        with; ``ValueError`` says why not."""
+        forge = kind if kind in VCS_KINDS else self.config.vcs.kind
+        row = self.repositories.add(
+            repo,
+            kind=cast(VcsKind | None, kind),
+            enabled=enabled,
+            deliver_base=deliver_base,
+            by=by,
+            source=source,
+        )
+        who = by or "operator"
+        polling = (
+            "polled from the next daemon start (restart to begin)"
+            if enabled
+            else "disabled: not polled, not run, until enabled"
+        )
+        self._notice(
+            "daemon.repository_added",
+            f"📦 repository {row.repo} ({forge}) registered by {who}; {polling}",
+            repo=row.repo,
+            forge=forge,
+            by=by,
+            source=source,
+            enabled=enabled,
+        )
+        return row.repo, f"repository {row.repo} registered; {polling}."
+
+    def update_repository(
+        self, repo: str, changes: Mapping[str, Any], *, by: str | None
+    ) -> tuple[str, str]:
+        """Change a registration's ``enabled`` / ``deliver_base``, live.
+        ``KeyError`` names an unknown repository, ``ValueError`` a refused
+        change."""
+        row = self.repositories.update(repo, changes, by=by)
+        who = by or "operator"
+        what = ", ".join(f"{key} = {value!r}" for key, value in changes.items()) or "nothing"
+        entry = self.config.find_repo(row.repo)
+        follows = (
+            "; polling follows at the next daemon start"
+            if entry is not None and self.repository_restart_required(entry)
+            else ""
+        )
+        self._notice(
+            "daemon.repository_updated",
+            f"📦 repository {row.repo} changed by {who}: {what}{follows}",
+            repo=row.repo,
+            by=by,
+            changes=dict(changes),
+        )
+        return row.repo, f"repository {row.repo} updated: {what}{follows}."
+
+    def remove_repository(self, repo: str, *, by: str | None) -> tuple[str, str]:
+        """Forget a registration: no longer admitted for work; work already
+        queued or running for it is untouched. ``KeyError`` names an
+        unknown repository."""
+        row = self.repositories.remove(repo, by=by)
+        who = by or "operator"
+        stops = (
+            "; polling stops at the next daemon start"
+            if row.repo.casefold() in self.polled_repos
+            else ""
+        )
+        self._notice(
+            "daemon.repository_removed",
+            f"📦 repository {row.repo} removed by {who}{stops}",
+            repo=row.repo,
+            by=by,
+        )
+        return (
+            row.repo,
+            f"repository {row.repo} removed; work already queued or running for it is "
+            f"untouched{stops}.",
+        )
 
     def _fire_schedules(self, now: float) -> int:
         """Queue every schedule tick that has come due since the last one
@@ -4958,6 +5099,7 @@ class DaemonLoop:
         self.generation = new_generation_id()
         self.dstore.set_value(GENERATION_KEY, self.generation)
         self.dstore.set_value(GENERATION_STARTED_KEY, repr(self.clock()))
+        self._activate_repositories()
         with self._holds_lock:
             restored = self.dstore.holds()
             self._holds = {h.name for h in restored}

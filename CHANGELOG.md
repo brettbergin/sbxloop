@@ -22,6 +22,21 @@ pick from instead of a box to spell `owner/name` into. No credential answers
 `409 discovery_unavailable` naming what to set; a refusal is `502` with the
 status and never the forge's body. Nothing is written.
 
+**Where a repository is registered is the daemon's database.** The file's
+`[[vcs.repos]]` entries are imported at first sight, once, the way schedules
+are (#818), and from then on `POST /v1/repositories` registers a repository
+(`repository`, `forge`, `enabled`, `deliver_base`), `PATCH /v1/repositories/{id}` enables, disables or re-bases one and `DELETE /v1/repositories/{id}` forgets one — each a recorded operation
+(`repo.add` / `repo.update` / `repo.remove`, on the socket too), advertised
+as `repositories.manage`. A registration is admitted for work at once; what
+the daemon polls was built at start, so a change to the enabled set answers
+`restart_required` and says so. The file's entry keeps the repository's other
+settings, folded under the registration of the same name; a new entry in the
+file is registered at the next start, its `enabled` / `deliver_base` are the
+initial values only, a removed registration is not imported again, and
+`sbxloop doctor` reads the registry and names an entry the file still spells
+differently. `GET /v1/repositories` carries each entry's `source`,
+`created_by`, `created_at` and `restart_required`.
+
 **The docs say where a repository is declared.** Third part of #2255: the
 deployment guide, the console guide, the architecture map and the user guide
 describe `[[vcs.repos]]` as the one place a repository is declared, name the

@@ -2431,10 +2431,14 @@ stream can reconnect to the next generation, and the operation closes with
 the effect — acceptance is the durable fact, the exit is observed through
 readiness, and the restart reuses the loop's supervisor check and marker
 unchanged. Schedules and a suspended repository's resume go through the
-same service verbs ctl and chat use, each an operation. Not published, by
-design: configuration writes, repository registration, backup and restore,
-garbage collection and sandbox deletion — each needs its own attribution,
-conflict and active-run story before it has a remote adapter.
+same service verbs ctl and chat use, each an operation. So does a
+repository's registration: the daemon's database holds it (the file's
+`[[vcs.repos]]` entries imported once, at first sight, like schedules), the
+API adds, changes and removes registrations live, and what the daemon polls
+follows at the next start. Not published, by design: configuration writes,
+backup and restore, garbage collection and sandbox deletion — each needs its
+own attribution, conflict and active-run story before it has a remote
+adapter.
 
 ### Repositories
 
