@@ -1847,6 +1847,7 @@ source = { editable = "packages/sbxloop" }
 dependencies = [
     { name = "alembic" },
     { name = "gitpython" },
+    { name = "httpx" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -1895,6 +1896,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
     { name = "gitpython", specifier = ">=3.1.62" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.147.0" },
     { name = "packaging", specifier = ">=26.3" },
     { name = "pydantic", specifier = ">=2.7" },
