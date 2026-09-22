@@ -12,6 +12,7 @@ from typing import Any
 
 from tests.api.test_channel_access import _channel, _people, _user_id
 from tests.api.test_collaboration import FakeConcierge, bearer, register
+from tests.api.test_collaboration_recovery import settled
 
 
 def _link(api: Any, headers: dict[str, str], channel_id: str, **body: Any) -> dict[str, Any]:
@@ -339,3 +340,74 @@ def test_a_guest_turn_recovered_after_a_restart_runs_for_the_guest(api: Any) -> 
     user = recovered[turn.id]
     assert user.id != owner_id
     assert user.username == "stranger"
+
+
+def test_a_linked_message_addresses_the_agents_it_mentions(api: Any) -> None:
+    # A message on a linked surface addresses agents the way a native one
+    # does: "@software-dev review this" targets software-dev, joins it to
+    # the channel, and it is software-dev that answers.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    owner_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel_id,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=False,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    turn, _message = api.ctx.accept_bridge_turn(
+        link,
+        content="@software-dev review this",
+        author_user_id=owner_id,
+        display_name=None,
+        external_message_id="m1",
+    )
+    assert turn.targets == ("software-dev",)
+    assert [p["agent_slug"] for p in turn.participants] == ["software-dev"]
+    joined = store.list_participants(owner_id, channel_id)
+    assert [participant.agent_slug for participant in joined] == ["software-dev"]
+    assert settled(api.client, owner, channel_id, turn.id)["status"] == "completed"
+    messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=owner).json()
+    assert [m["agent_slug"] for m in messages if m["role"] == "assistant"] == ["software-dev"]
+
+
+def test_a_mapped_turn_recovered_after_a_restart_runs_for_its_author(api: Any) -> None:
+    # The link is the authorization: a member the private channel does not
+    # admit is answered live when they post on its linked surface, so a
+    # restart before the turn started must recover it for them, not drop it.
+    api.ctx.concierge = FakeConcierge()
+    owner, member, _admin = _people(api)
+    owner_id = _user_id(api, owner)
+    member_id = _user_id(api, member)
+    channel_id = _channel(api, owner, "private")
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=member).status_code == 404
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel_id,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=False,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    turn, _message = store.accept_linked_turn(
+        link,
+        content="hello",
+        author_user_id=member_id,
+        display_name=None,
+        external_message_id="m1",
+        now=api.clock(),
+    )
+    recovered = {queued.id: user for queued, user, _content in store.recover_turns(api.clock())}
+    assert turn.id in recovered
+    assert recovered[turn.id].id == member_id
+    kept = store.get_turn(None, channel_id, turn.id)
+    assert kept is not None and kept.status == "accepted"
