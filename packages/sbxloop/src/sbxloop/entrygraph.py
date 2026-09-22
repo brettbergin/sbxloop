@@ -190,9 +190,8 @@ def tool_config(config: Config, target: str) -> Config:
         # The checkout is cut by the command itself, inside the sandbox;
         # nothing of it is a result.
         exclude.append(checkout)
-    return config.model_copy(
+    return config.with_github(github).model_copy(
         update={
-            "github": github,
             "sandbox": sandbox,
             "registries": [],
             "artifacts": config.artifacts.model_copy(

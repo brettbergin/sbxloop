@@ -151,8 +151,13 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
         "mcp",
         "credentials",
         "registries",
-        "vcs",
+        "vcs.kind",
+        "vcs.api_url",
+        "vcs.token_env",
+        "vcs.repos.kind",
+        "vcs.repos.token_env",
         "agents",
+        "github.repos.kind",
         "github.repos.token_env",
         "telemetry.dsn_env",
     ]
@@ -1149,8 +1154,13 @@ class TestSandboxEnv:
         [
             ('[sandbox]\nsecret_env = ["NPM_TOKEN"]\n', r"\[sandbox\]"),
             (
+                '[[vcs.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
+                r"\[\[vcs.repos\]\]",
+            ),
+            # The legacy spelling is named by the entry's current name (#1283).
+            (
                 '[[github.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
-                r"\[\[github.repos\]\]",
+                r"\[\[vcs.repos\]\]",
             ),
             # Even empty: the key itself is the mistake to name.
             ("[sandbox]\nsecret_env = []\n", r"\[sandbox\]"),
@@ -1231,7 +1241,7 @@ class TestAptPackagesAndSetupCommands:
         (tmp_path / "sbxloop.toml").write_text(
             '[[github.repos]]\nrepo = "o/web"\napt_packages = ["$(evil)"]\n'
         )
-        with pytest.raises(ConfigError, match=r"github.repos\[\].apt_packages"):
+        with pytest.raises(ConfigError, match=r"vcs.repos\[\].apt_packages"):
             load_config(cwd=tmp_path, env={})
 
 

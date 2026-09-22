@@ -4379,7 +4379,12 @@ class DaemonLoop:
                 "deliver_closes": issue if item.kind == "code" else None,
             }
         )
-        update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
+        update: dict[str, Any] = {
+            "github": gh,
+            # The declared list follows the section's view (#1283).
+            "vcs": self.config.vcs.model_copy(update={"repos": list(gh.repos)}),
+            "keep_on_failure": False,
+        }
         if item.kind == "workload" and issue is not None:
             # The workload's issue sink answers on the issue that asked
             # (#760) rather than filing a new one.

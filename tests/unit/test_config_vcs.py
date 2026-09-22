@@ -67,7 +67,7 @@ class TestKind:
     def test_an_unknown_kind_fails_closed_naming_the_accepted_ones(self) -> None:
         with pytest.raises(ValueError, match=r"vcs\.kind must be one of github, gitlab, gitea"):
             cfg(vcs={"kind": "bitbucket"})
-        with pytest.raises(ValueError, match=r"github\.repos\[\]\.kind must be one of"):
+        with pytest.raises(ValueError, match=r"vcs\.repos\[\]\.kind must be one of"):
             cfg(github={"repos": [{"repo": "o/r", "kind": "sourcehut"}]})
 
     def test_a_repository_may_name_its_own_forge(self) -> None:
@@ -84,9 +84,12 @@ class TestKind:
         config = cfg(github={"repos": [{"repo": "o/a", "kind": "gitea", "enabled": False}]})
         assert config.vcs_kinds() == ("github",)
 
-    def test_the_section_is_locked_from_the_concierge(self) -> None:
-        assert "vcs" in DEFAULT_CONFIG_LOCKED
-        assert "vcs" in cfg().concierge.config_locked
+    def test_the_forge_is_locked_from_the_concierge(self) -> None:
+        # The forge, its root and its credential name; the repositories
+        # declared under it are a separate matter (test_config_vcs_repos).
+        for key in ("vcs.kind", "vcs.api_url", "vcs.token_env"):
+            assert key in DEFAULT_CONFIG_LOCKED
+            assert key in cfg().concierge.config_locked
 
 
 class TestApiUrl:

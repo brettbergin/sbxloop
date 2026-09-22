@@ -96,14 +96,14 @@ def test_plain_http_refuses_unless_allowed_on_purpose() -> None:
 
 def test_a_repository_override_is_held_to_the_same_rules() -> None:
     base = {"agent": {"backend": "openai", "openai": {"base_url": "https://models.example/v1"}}}
-    with pytest.raises(ValidationError, match=r"\[github.repos.openai\] \(o/r\).*plain http"):
+    with pytest.raises(ValidationError, match=r"\[vcs.repos.openai\] \(o/r\).*plain http"):
         Config.model_validate(
             {
                 **base,
                 "github": {"repos": [{"repo": "o/r", "openai": {"base_url": "http://p:8000/v1"}}]},
             }
         )
-    with pytest.raises(ValidationError, match=r"github\.repos\[\]\.openai\.base_url"):
+    with pytest.raises(ValidationError, match=r"vcs\.repos\[\]\.openai\.base_url"):
         Config.model_validate(
             {**base, "github": {"repos": [{"repo": "o/r", "openai": {"base_url": "nope"}}]}}
         )
