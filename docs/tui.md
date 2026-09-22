@@ -446,7 +446,7 @@ edits say when that file still wins.
   console was started in: that is where the daemon runs, so this is the
   configuration the loop actually gets, and it is the same root an edit is
   validated against — a save shows up here at once. Arrays of tables are
-  walked, so the second repository is `github.repos[1].deliver_base` rather
+  walked, so the second repository is `vcs.repos[1].deliver_base` rather
   than one blob you have to find in a file, and a leaf inherits the layer
   that supplied the array it lives in. Lists of scalars (`policy.allow`)
   stay one key: the useful edit there is the whole list.
@@ -474,7 +474,7 @@ edits say when that file still wins.
   every edit.
 
 - **Adding a key.** `a` takes a dotted path the resolved view has no row
-  for — `sandbox.env.RAILS_ENV`, `github.repos[2].repo` — and opens the
+  for — `sandbox.env.RAILS_ENV`, `vcs.repos[2].repo` — and opens the
   same dialog. An index one past the end appends an entry; an index beyond
   that is refused by name.
 

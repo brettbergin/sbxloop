@@ -377,7 +377,7 @@ and drivers have the same authority as other agent code. This preserves
 host-initiated transport and mediation between the credential and agent
 planes; no new listener or box-to-box channel is introduced.
 The VCS sandbox exists only when the repository integration is configured
-(`[github] repo = "owner/repo"`, or at least one `[[vcs.repos]]` entry);
+(at least one `[[vcs.repos]]` entry, or the legacy `[github] repo`);
 without it, the internally named `pair.github` is `None`, a forge token
 is not required, and the run has no VCS capability at all. When several
 repositories are configured, the VCS sandbox is scoped to the one the
@@ -431,7 +431,7 @@ both) and the `run.published` event carries every staged file's host path as
 `paths` (#799): the bridge attaches those under `max_attachment_bytes` to the
 result message (`ChatBridge._split_files`, `discord.File` uploads) and names the
 rest — too large, missing, or a backend with no upload — by path, so a file a
-task produced always reaches the person or is at least named. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `pr` (`_publish_pr`) hands the task's data-directory
+task produced always reaches the person or is at least named. `issue` files one issue in the run's repository under `[workload] result_label` (`ensure_label` first). `pr` (`_publish_pr`) hands the task's data-directory
 checkout (`needs.repo`; `_grant_needs` refuses a pr task without one) to
 `deliver_workspace` — the same call `_stage_deliver` makes, on the run's branch
 with `_naming_for` (the repo-parametrised half of `_naming`) — labels the pull
@@ -892,7 +892,7 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   last check on the tree exactly as it will be delivered. `verify_mode`
   governs this stage the same way: `advisory` records a red gate without a
   fix round, `ci-only` skips it. A run with no
-  `[github] repo` (and no `[[vcs.repos]]`) ends `completed` here, its
+  repository declared (no `[[vcs.repos]]` entry) ends `completed` here, its
   work in the workspace.
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
   prefix, the PR title and the commit message are `[github]` templates)
@@ -1193,7 +1193,7 @@ the prompt: identical on every turn of every stage, it caches, where the
 same text in a phase prompt is re-sent with each turn (goal 3, "spend
 scales with turns"). The briefing is domain-neutral by test — no language,
 no toolchain, no incident — and the pull-request framing appears only when
-`[github] repo` makes delivery real.
+a declared repository makes delivery real.
 
 Procedures the agent needs *sometimes* are skills, not prompt text.
 `sbxloop.skills` ships a tree of `<name>/SKILL.md` files — YAML frontmatter

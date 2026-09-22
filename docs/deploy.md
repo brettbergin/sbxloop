@@ -359,14 +359,15 @@ history instead.
 
 One daemon tends every repository declared in `sbxloop.toml`, so a second
 project does **not** need a second unit, home or control channel.
-Declare them as `[[github.repos]]` entries — each with its own
-`deliver_base`, `trigger_label`, extra `labels`, `enabled` switch and
-optional `token_env` — and export any per-repo token from the home's
-`secrets.env` alongside `GH_TOKEN`. The legacy `[github] repo = "owner/name"`
-still loads unchanged and is normalised into a one-entry list; migrating is
-moving that key (and its `deliver_base` / `create_repo` / `create_public`)
-into one `[[github.repos]]` entry. The two forms may not be mixed, and a
-duplicated repository or a malformed slug fails config loading. Work items
+Declare them as `[[vcs.repos]]` entries, whatever forge they live on — each
+with its own `deliver_base`, `trigger_label`, extra `labels`, `enabled`
+switch and optional `token_env` — and export any per-repo token from the
+home's `secrets.env` alongside `GH_TOKEN`. The legacy spellings, `[[github.repos]]`
+and the single `[github] repo = "owner/name"`, still load unchanged and are
+folded into the same list; `sbxloop config migrate` rewrites either in place
+with every comment kept and the previous file backed up. A file that declares
+repositories under both spellings, a duplicated repository or a malformed
+slug fails config loading. Work items
 queued by the pre-migration single-repo daemon carry no repository. At startup
 the daemon attributes what it can from each row's issue URL; of the rest, only
 items still sitting untouched in the queue are discarded and rediscovered,
@@ -379,7 +380,7 @@ reason instead of being dropped, and the daemon logs
 each item id and issue URL, so you can clear the in-progress label and re-add
 `sbxloop:run` by hand for anything that was in flight across the upgrade.
 
-Everything under `[[github.repos]]` is per repository; the `[daemon]`
+Everything under `[[vcs.repos]]` is per repository; the `[daemon]`
 guardrails — the daily run cap, the per-item attempt and resume caps, the
 consecutive-failure circuit breaker, and the concurrency cap — stay
 **daemon-wide** and are shared across all of them. Polling health is the
