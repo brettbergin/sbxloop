@@ -340,9 +340,24 @@ class RunChronicle:
             return binding.slug
         return self.assignment.lead if self.assignment else ANGIE_SLUG
 
-    def _agent_for(self, phase: str, data: dict[str, Any] | None = None) -> str:
+    def _stamped(self, data: dict[str, Any] | None) -> str | None:
+        """The agent an event names, when that agent is on this run.
+
+        An event's stamp is the author of its post, and a steer can name
+        any slug (a trusted agent on another run, or a made-up one), so a
+        stamp the run's team does not have is not an author: the post falls
+        back to the agent the run's own assignment gives the phase.
+        """
         stamped = (data or {}).get("agent_slug")
-        if isinstance(stamped, str) and stamped:
+        if not isinstance(stamped, str) or not stamped:
+            return None
+        if self.assignment is None or stamped not in self.assignment.agents:
+            return None
+        return stamped
+
+    def _agent_for(self, phase: str, data: dict[str, Any] | None = None) -> str:
+        stamped = self._stamped(data)
+        if stamped is not None:
             return stamped
         binding = self.assignment.binding_for(phase) if self.assignment else None
         if binding is not None:
@@ -352,8 +367,8 @@ class RunChronicle:
         return BUILTIN_FOR_ROLE.get(ROLE_BY_PHASE.get(phase, ""), ANGIE_SLUG)
 
     def _task_agent(self, data: dict[str, Any], task_id: str) -> str:
-        stamped = data.get("agent_slug")
-        if isinstance(stamped, str) and stamped:
+        stamped = self._stamped(data)
+        if stamped is not None:
             return stamped
         phase = _WORKING_PHASE.get(self.item.kind)
         if phase is None:
