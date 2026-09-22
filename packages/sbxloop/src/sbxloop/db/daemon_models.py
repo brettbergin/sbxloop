@@ -124,7 +124,10 @@ class DaemonRunRow(Base):
     """The ledger: one row per run the daemon started, and how it ended."""
 
     __tablename__ = "daemon_runs"
-    __table_args__ = (Index("idx_daemon_runs_started", "started_at"),)
+    __table_args__ = (
+        Index("idx_daemon_runs_started", "started_at"),
+        Index("idx_daemon_runs_item_started", "item_id", "started_at", "run_id"),
+    )
 
     run_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
     item_id: Mapped[str] = mapped_column(Text, nullable=False)

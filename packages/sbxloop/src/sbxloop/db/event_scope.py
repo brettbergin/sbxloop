@@ -5,8 +5,10 @@ turn that asks for a workload or tool run records the asking message's id
 as the item's ``source_key``; a turn that files an issue for a code run
 records the repository and issue on its participant. The same
 exact identities :mod:`sbxloop.api.work_delivery` delivers results by
-decide which channel's members may see the run's events. Nothing is
-inferred from prose: a run no channel asked for belongs to none.
+decide which channel's members may see the run's events. External work can
+also have a durable presentation association without changing admission.
+Nothing is inferred from prose, and a run's recorded association stays
+with that attempt even when a later admission names another channel.
 """
 
 from __future__ import annotations
@@ -18,10 +20,11 @@ from sqlalchemy import select
 
 from sbxloop.db.collaboration_models import MessageRow, TurnRow
 from sbxloop.db.daemon_models import DaemonRunRow, WorkItemRow
+from sbxloop.db.job_scope import presentation_channel_for_item, presentation_channel_for_run
 from sbxloop.ghids import chat_source_message_id
 
 
-def channel_for_item(session: Any, item_id: str) -> str | None:
+def admission_channel_for_item(session: Any, item_id: str) -> str | None:
     """The channel that asked for the item, if a channel did."""
     item: WorkItemRow | None = session.get(WorkItemRow, item_id)
     if item is None:
@@ -42,6 +45,13 @@ def channel_for_item(session: Any, item_id: str) -> str | None:
         return None
     filed = _filing_turn(session, item)
     return None if filed is None else filed[0]
+
+
+def channel_for_item(session: Any, item_id: str) -> str | None:
+    """The conversation for an item's admission or durable presentation."""
+    return admission_channel_for_item(session, item_id) or presentation_channel_for_item(
+        session, item_id
+    )
 
 
 def _filing_turn(session: Any, item: WorkItemRow) -> tuple[str, str] | None:
@@ -107,7 +117,10 @@ def turn_for_item(session: Any, item_id: str, channel_id: str) -> str | None:
 
 
 def channel_for_run(session: Any, run_id: str) -> str | None:
-    """The channel that asked for the run's item, if a channel did."""
+    """The immutable attempt binding, else the item's existing association."""
+    bound = presentation_channel_for_run(session, run_id)
+    if bound is not None:
+        return bound
     item_id = session.scalar(select(DaemonRunRow.item_id).where(DaemonRunRow.run_id == run_id))
     if item_id is None:
         item_id = session.scalar(
@@ -138,4 +151,10 @@ def event_channel(
     return None
 
 
-__all__ = ["channel_for_item", "channel_for_run", "event_channel", "turn_for_item"]
+__all__ = [
+    "admission_channel_for_item",
+    "channel_for_item",
+    "channel_for_run",
+    "event_channel",
+    "turn_for_item",
+]

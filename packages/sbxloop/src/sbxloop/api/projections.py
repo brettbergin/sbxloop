@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
+
+from sbxloop.api.channel_access import ChannelAccess
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import (
@@ -51,10 +54,15 @@ from sbxloop.daemon.model import (
     requested_roles,
 )
 from sbxloop.daemon.store import MergeGate, dispatch_eligible_at
+from sbxloop.db.collaboration_models import ChannelRow
+from sbxloop.db.event_scope import channel_for_item
 from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.errors import SbxloopError
 from sbxloop.ghids import is_api_id, is_chat_id, is_schedule_id, try_parse_gh_id
 from sbxloop.recipes import RECIPES
+
+if TYPE_CHECKING:
+    from sbxloop.api.collaboration import Member
 
 ITEM_ACTIONS: tuple[str, ...] = ("retry", "requeue", "abandon")
 RUN_ACTIONS: tuple[str, ...] = (
@@ -216,6 +224,28 @@ class Views:
 
     def item(self, item: WorkItem) -> Item:
         return self.items([item])[0]
+
+    def visible_item_channels(
+        self, items: Sequence[WorkItem], member: Member | None
+    ) -> dict[str, str]:
+        """Resolve a page's conversation links without leaking private chats."""
+        if not items:
+            return {}
+        with self.dstore.read() as session:
+            linked = {item.item_id: channel_for_item(session, item.item_id) for item in items}
+            query = select(ChannelRow.id).where(
+                ChannelRow.id.in_({channel for channel in linked.values() if channel}),
+                ChannelRow.deleted_at.is_(None),
+            )
+            visible = ChannelAccess.visible_condition(member)
+            if visible is not None:
+                query = query.where(visible)
+            allowed = set(session.scalars(query))
+            return {
+                item_id: channel
+                for item_id, channel in linked.items()
+                if channel is not None and channel in allowed
+            }
 
     def _item(self, item: WorkItem, public_id: str, repo_ids: dict[str, str]) -> Item:
         run = self.run_record(item.run_id) if item.run_id else None
