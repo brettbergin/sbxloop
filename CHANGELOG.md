@@ -1,5 +1,29 @@
 ## [Unreleased]
 
+**A listening agent stays quiet once its channel is stopped, joins no
+roster it was refused, answers a guest as itself, and never delays the
+person it listens to.** Four follow-ups to ambient speaking and agent
+mentions. A stop, or a cancel of the turn, that landed while a listener's
+relevance call was still out did not stop it: the silence was checked
+before the call and the turn was accepted afterwards, and a cancelled
+turn's in-flight reply could still draw listeners in. The store now refuses
+an agent-started turn inside its own transaction when the channel is
+silenced or the parent turn is no longer live, and a stopped or cancelled
+turn offers nothing to listeners at all. A reply that named an agent added
+it to the channel's roster before the guardrails decided whether it could
+speak, and a roster failure dropped the mentions after it; an agent is now
+joined only once admitted, and a roster failure drops that mention alone. A
+listener's turn on a message from a guest on a linked surface was recorded
+as a person whose id was the agent's slug, which a restart then settled as
+interrupted; it is now the listener's own turn (`author_kind: "agent"`) and
+a restart runs it for the guest's stand-in, as it runs the guest's own
+turn. The interest prefilter matched the whole `ambient_window_messages`
+window, so one mention of an interest made every later message cost a
+classifier call, and the calls ran before the agents the person addressed
+answered; the prefilter now reads the new message alone (the classifier
+still reads the window) and classification runs after the addressed agents
+have answered, so it never holds up the person's turn.
+
 **An OIDC sign-in trusts a provider email only when the provider has checked
 it, and a member's typed-in address can no longer steer a colleague's first
 sign-in.** Any member could set their email to an address nobody held yet;

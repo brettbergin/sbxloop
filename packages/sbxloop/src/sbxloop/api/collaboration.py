@@ -2878,16 +2878,27 @@ class CollaborationStore:
         chain_depth: int,
         now: float,
     ) -> Turn | None:
-        """Accept a turn one agent started by addressing another.
+        """Accept a turn one agent started by addressing another, or by
+        volunteering on a message nobody sent it.
 
-        No new message is appended: the agent's own reply, named by
-        ``source_message_id``, is the turn's input. ``None`` when the
-        channel is gone.
+        No new message is appended: the message named by
+        ``source_message_id`` is the turn's input. ``None`` when the channel
+        is gone or silenced, or when ``parent_turn_id`` names a turn that is
+        no longer live: those are decided here, inside the transaction, and
+        not only by the guardrails earlier, because a stop or a cancel that
+        lands while the follow-up is still being decided (a relevance call
+        in flight) has to win over it.
         """
         with self.dstore.immediate_transaction() as session:
             channel = session.get(ChannelRow, channel_id)
             if channel is None or channel.state != "active":
                 return None
+            if channel.silenced_until is not None and float(channel.silenced_until) > now:
+                return None
+            if parent_turn_id is not None:
+                parent = session.get(TurnRow, parent_turn_id)
+                if parent is None or parent.status not in {"accepted", "running"}:
+                    return None
             turn_id = "trn_" + _token(16)
             session.execute(
                 insert(TurnRow).values(
@@ -3891,10 +3902,20 @@ class CollaborationStore:
                 message = session.get(MessageRow, row.input_message_id)
                 stored_origin = message.origin_json if message is not None else None
                 origin = json.loads(stored_origin) if stored_origin else None
-                if row.author_kind == "human" and row.author_id is None and origin:
-                    # A guest on a linked surface: the turn runs for the same
-                    # stand-in it would have run for live, never for the
-                    # channel's owner, whose identity would answer a stranger.
+                guest_input = bool(origin) and (
+                    (row.author_kind == "human" and row.author_id is None)
+                    or (
+                        message is not None
+                        and message.author_kind == "human"
+                        and message.author_id is None
+                    )
+                )
+                if guest_input:
+                    # A guest on a linked surface, or an agent's own turn on
+                    # the guest's message (a listener that volunteered): the
+                    # turn runs for the same stand-in it would have run for
+                    # live, never for the channel's owner, whose identity
+                    # would answer a stranger.
                     if channel and channel.state == "active" and message:
                         queued.append(
                             (
