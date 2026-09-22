@@ -932,6 +932,18 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A failed rollback no longer hides the provisioning failure it was
+  cleaning up after.** When the worker install failed after `sbx create`
+  and the rollback `sbx rm` then failed too (the hung-box timeout), the
+  rollback warning was reported first and the telemetry dedupe marked the
+  install error along with it, because the timeout carried that error as
+  its implicit context. The ERROR `provision_failed` report that wrapped
+  the install error with the `sbx login` hint was then dropped as a
+  duplicate, and GlitchTip showed one WARNING titled by the cleanup. A
+  report now marks only its own exception, the causes it was raised
+  `from` and an exception group's members; an error it merely
+  interrupted stays unreported until something reports it.
+
 - **An issue the concierge files or labels is polled for at once.** Field
   (db, 2026-09-19): a code task asked for in chat was filed as a labelled
   issue in 11s and then sat 55s until the next forge poll found it. The
