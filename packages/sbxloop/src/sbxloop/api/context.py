@@ -53,6 +53,7 @@ from sbxloop.api.collaboration import (
     LocalUser,
     Message,
     Turn,
+    Viewer,
     guest_user,
 )
 from sbxloop.api.guardrails import Guardrails
@@ -88,6 +89,9 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+#: How long a channel stop keeps the channel quiet before it lifts on its
+#: own; a person who wants it quiet for longer says so with `silence`.
+STOP_SILENCE_S = 3600.0
 #: The session prefix the history compaction job runs under. One session
 #: per channel, reset before every call: an SDK session is resumed message
 #: after message, so a shared one would carry a private channel's
@@ -253,6 +257,52 @@ def _channel_stop_principal(principal: Principal | None) -> Principal:
             capabilities=frozenset({"runs:control"}),
         )
     return dataclasses.replace(principal, capabilities=frozenset({"runs:control"}))
+
+
+#: What a stop leaves behind, for the person deciding what to do next.
+_STAYS = (
+    "Work already done stays where it is; `resume-run` would continue, `retry` would start over."
+)
+
+
+def _names(ids: Sequence[str]) -> str:
+    return ", ".join(f"`{one}`" for one in ids)
+
+
+def _silence_words(seconds: float) -> str:
+    """``3600`` as "an hour", ``5400`` as "90 minutes"."""
+    minutes = max(1, round(seconds / 60))
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return "an hour" if hours == 1 else f"{hours} hours"
+    return f"{minutes} minutes"
+
+
+def _stop_reply(outcome: Mapping[str, Any]) -> str:
+    """What a ``/stop`` typed in the channel answers: each thing the stop
+    cancelled, by name, and that the channel is quiet, so nothing the
+    stop did happens invisibly."""
+    runs = list(outcome.get("cancelled_runs") or ())
+    items = list(outcome.get("cancelled_items") or ())
+    turns = list(outcome.get("cancelled_turns") or ())
+    said: list[str] = []
+    if runs:
+        said.append(f"Stopping {_names(runs)}.")
+    if items:
+        said.append(f"Abandoned queued {_names(items)}.")
+    if turns:
+        count = len(turns)
+        plural = "" if count == 1 else "s"
+        said.append(f"Cancelled {count} waiting turn{plural}.")
+    if not said:
+        said.append("Nothing was running or queued here.")
+    said.append(
+        f"This channel is quiet for {_silence_words(STOP_SILENCE_S)}; "
+        "resuming the channel lifts it."
+    )
+    if runs:
+        said.append(_STAYS)
+    return " ".join(said)
 
 
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
@@ -1311,8 +1361,40 @@ class ApiContext:
         self.hub.notify()
         return True
 
+    def stop_channel(
+        self,
+        channel_id: str,
+        viewer: Viewer,
+        *,
+        principal: Any,
+        keep_turn: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Stop a channel the way ``POST /v1/channels/{id}/stop`` does,
+        whichever surface asked: silence it for :data:`STOP_SILENCE_S`, then
+        cancel its turns, the runs it asked for and the work it queued
+        (:meth:`cancel_channel`). ``None`` when there is no such channel.
+
+        ``viewer`` is who asked; the silence checks that they may post.
+        ``keep_turn`` is a turn to leave running: the one carrying a
+        ``/stop`` typed in the channel itself, which still has to answer.
+        There is one channel stop, so the route and a stop from chat cannot
+        drift apart in what they do.
+        """
+        until = self.clock() + STOP_SILENCE_S
+        channel = self.collaboration.set_silence(viewer, channel_id, until, self.clock())
+        if channel is None:
+            return None
+        return self.cancel_channel(
+            channel_id, channel.silenced_until, principal=principal, keep_turn=keep_turn
+        )
+
     def cancel_channel(
-        self, channel_id: str, until: float | None, *, principal: Any
+        self,
+        channel_id: str,
+        until: float | None,
+        *,
+        principal: Any,
+        keep_turn: str | None = None,
     ) -> dict[str, Any]:
         """Stop a channel: cancel its turns, cancel the runs it asked for,
         abandon the work it queued, and silence it until ``until``. What a
@@ -1325,10 +1407,17 @@ class ApiContext:
         only items whose ``channel_id`` is this channel are touched. Gated
         work and work awaiting review is left alone: it waits on a person
         already, and dropping it would discard a finished result.
+        ``keep_turn`` is left running (see :meth:`stop_channel`).
         """
-        turns = self.turns.cancel_channel(channel_id)
+        turns = self.turns.cancel_channel(channel_id, keep=keep_turn)
         scoped = _channel_stop_principal(principal)
         running, queued = self._channel_work(channel_id)
+        # The store names the runs the channel's items are executing; the
+        # loop also knows a run whose channel it holds only through the
+        # run's conversation, so both are read and a run is cancelled once.
+        for run_id in self._live_runs(channel_id):
+            if run_id not in running:
+                running.append(run_id)
         runs: list[str] = []
         for run_id in running:
             try:
@@ -1370,6 +1459,18 @@ class ApiContext:
         except Exception:
             log.warning("collaboration.channel_runs_unreadable", exc_info=True)
             return [], []
+
+    def _live_runs(self, channel_id: str) -> list[str]:
+        """The runs in flight the loop holds for ``channel_id``, found
+        through the run's conversation as well as its item."""
+        live = getattr(self.loop, "live_runs_in_channel", None)
+        if not callable(live):
+            return []
+        try:
+            return list(live(channel_id))
+        except Exception:
+            log.warning("collaboration.channel_runs_unreadable", exc_info=True)
+            return []
 
     def _agent_memory(
         self,
@@ -1510,26 +1611,30 @@ class ApiContext:
         merely argues for stopping is steering, and goes the other way.
 
         It takes the rule ``POST /v1/channels/{id}/stop`` takes: anyone who
-        may post in the channel may stop the runs *this channel* asked for,
-        so a plain member may stop as well as steer. The cancels run through
-        the control service under the same channel-scoped principal the
-        route uses, keeping the person's identity for the audit record. A
-        turn another agent started never reaches here.
+        may post in the channel may stop what *this channel* asked for, so
+        a plain member may stop as well as steer. A bare `/stop` is that
+        route: it goes through :meth:`stop_channel`, so the channel's turns,
+        runs and queued work are cancelled and the channel silenced exactly
+        as the route does it, with this turn left running to answer. An
+        `@agent stop` is narrower and cancels that agent's runs alone. The
+        cancels run through the control service under the same
+        channel-scoped principal the route uses, keeping the person's
+        identity for the audit record. A turn another agent started never
+        reaches here.
         """
         scope = stop_command(text, target)
         if scope is None or self.loop is None:
             return None
+        if not self._may_stop_channel(turn.channel_id, principal):
+            return "Nothing was stopped: you may not stop work in this channel."
+        scoped = _channel_stop_principal(principal)
+        if scope == "channel":
+            return self._stop_channel_from_chat(turn, principal.id, scoped)
         stop = getattr(self.loop, "stop_channel", None)
         if not callable(stop):
             return None
-        if not self._may_stop_channel(turn.channel_id, principal):
-            return "Nothing was stopped: you may not stop work in this channel."
         try:
-            stopped = stop(
-                turn.channel_id,
-                _channel_stop_principal(principal),
-                agent_slug=target if scope == "agent" else None,
-            )
+            stopped = stop(turn.channel_id, scoped, agent_slug=target)
         except ControlError as exc:
             if exc.code == "forbidden":
                 return "Nothing was stopped: you may not stop work in this channel."
@@ -1539,11 +1644,25 @@ class ApiContext:
             return None
         if not stopped:
             return "Nothing is running here to stop."
-        runs = ", ".join(f"`{run_id}`" for run_id in stopped)
-        return (
-            f"Stopping {runs}. Work already done stays where it is; "
-            "`resume-run` would continue, `retry` would start over."
-        )
+        return f"Stopping {_names(stopped)}. {_STAYS}"
+
+    def _stop_channel_from_chat(self, turn: Turn, viewer: str, principal: Principal) -> str | None:
+        """A bare ``/stop`` typed in the channel: the channel stop, with
+        this turn kept running, and a reply naming what it stopped."""
+        try:
+            outcome = self.stop_channel(
+                turn.channel_id, viewer, principal=principal, keep_turn=turn.id
+            )
+        except CollaborationError as exc:
+            if exc.code == "forbidden":
+                return "Nothing was stopped: you may not stop work in this channel."
+            return f"Nothing was stopped: {exc.message}"
+        except Exception:
+            log.warning("collaboration.stop_failed", channel=turn.channel_id, exc_info=True)
+            return None
+        if outcome is None:
+            return None
+        return _stop_reply(outcome)
 
     def _may_stop_channel(self, channel_id: str, principal: Principal) -> bool:
         """Whether the person behind ``principal`` may stop ``channel_id``:

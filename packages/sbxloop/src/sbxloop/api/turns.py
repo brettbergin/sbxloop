@@ -85,18 +85,20 @@ class TurnCoordinator:
             if entry.channel_id not in self._current:
                 self._dispatch(entry.channel_id)
 
-    def cancel_channel(self, channel_id: str) -> list[str]:
+    def cancel_channel(self, channel_id: str, *, keep: str | None = None) -> list[str]:
         """Cancel the channel's queued turns and ask its current one to stop.
 
         Returns the ids of the turns it stopped, the current turn first, then
         the queued ones in lane order. A turn whose ``cancel`` reports it was
         already over, or raises, is left out, as is a current turn without a
         ``cancel``; a queued turn without one is simply dropped and counted.
+        ``keep`` names a turn to leave running: the one asking for the stop,
+        when the stop is typed in the channel itself.
         """
         with self._changed:
             entries = list(self._lanes.pop(channel_id, ()))
             current = self._current.get(channel_id)
-            if current is not None and not current.cancelled:
+            if current is not None and not current.cancelled and current.turn_id != keep:
                 entries.insert(0, current)
             for entry in entries:
                 entry.cancelled = True
