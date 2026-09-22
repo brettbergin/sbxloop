@@ -29,7 +29,7 @@ single environment ever holds both credentials. In the table, `<forge>` is
 | Sandbox                 | Credential                                                                                                                                                                                                                                                                                                           | Purpose                                                                                                                                                                                                                                                              |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission), `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex, or the variable `[agent.openai] api_key_env` names for an OpenAI-compatible endpoint ([Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)) | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK, the Python Codex SDK, or the `openai` client against the endpoint you name. All model calls and tool executions happen inside this VM. |
-| `sbxloop-<run>-<forge>` | The configured forge token; on GitHub, `GH_TOKEN` or a host-minted, auto-refreshed App installation token ([GitHub App auth](#github-app-auth))                                                                                                                                                                      | Performs forge operations (branch, change, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                                                                                             |
+| `sbxloop-<run>-<forge>` | The configured forge token; on GitHub, `GH_TOKEN` or a host-minted, auto-refreshed App installation token ([GitHub App auth](#github-app-auth))                                                                                                                                                                      | Performs forge operations (branch, change, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when a repository is declared.                                                                                           |
 | `sbxloop-<run>-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                                                                                                                                    | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today.                           |
 
 The rule behind the table: **the only key in an agent sandbox is its inference
@@ -633,7 +633,7 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   runs as `cd <dir> && <gate>`, a package.json script under the client
   the monorepo's root pins. A later task can break what an earlier one proved,
   so this is the last look at the tree exactly as it will be delivered. A run
-  with no `[github] repo` ends **`completed`** here, its work in the
+  with no repository declared ends **`completed`** here, its work in the
   workspace.
 - **Deliver** — the tree becomes one commit on `sbxloop/<run>` and a draft
   pull request. Every later round re-delivers onto the same branch, so one
@@ -829,7 +829,7 @@ output goes to the **sink** its plan named in `needs.sink`: `chat` — the
 default, needing no profile — is a reply where the run was asked for (the
 Discord thread, or the terminal), carrying the run's closing line and every
 chat task's result text; `issue` files **one** result issue per run in the
-configured `[github] repo`, titled from the plan and carrying every task that
+run's repository, titled from the plan and carrying every task that
 chose it, under the `[workload] result_label` (`sbxloop:result` by default,
 created if missing); `artifact` copies the files a task reported — exactly
 those, mounted or not — to `runs/<run>/artifacts`, where `sbxloop artifacts <run>` lists them
@@ -1390,7 +1390,7 @@ changes billing arrangements.
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured
-repository (`--repo` / `[github] repo` — the repo being worked on) for open
+repository (`--repo`, or the `[[vcs.repos]]` entries) for open
 issues carrying the trigger label (`sbxloop:run`), claims each one, runs it
 as **one** engine run — task graph, gate, draft PR, review, fix rounds, CI,
 merge — and settles the outcome on the issue. One labeled issue is one run

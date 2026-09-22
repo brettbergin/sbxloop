@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+**The docs say where a repository is declared.** Third part of #2255: the
+deployment guide, the console guide, the architecture map and the user guide
+describe `[[vcs.repos]]` as the one place a repository is declared, name the
+legacy spellings as such, and point at `sbxloop config migrate`.
+
 **Every surface reads the repositories from where they are declared, and
 the legacy spelling can be rewritten in place.** Second part of #2255: the
 daemon, the engine, the concierge, the doctor, the console and the CLI read
