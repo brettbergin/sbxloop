@@ -491,10 +491,17 @@ def message_author(role: str, kind: str, agent_slug: str | None, owner_id: str |
 
 
 def bridge_origin(
-    backend: str, surface_id: str, external_message_id: str, author_name: str | None = None
+    backend: str,
+    surface_id: str,
+    external_message_id: str,
+    author_name: str | None = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     """Where a message that arrived over a bridge came from. ``author_name``
-    rides along for a guest, who has no account to read a name from."""
+    rides along for a guest, who has no account to read a name from.
+    ``thread_id`` is the thread the link it arrived through names, when it
+    names one: a thread link and a whole-channel link on the same surface
+    are two origins, and the mirror echoes to neither its own."""
     origin: dict[str, Any] = {
         "backend": backend,
         "surface_id": surface_id,
@@ -502,6 +509,8 @@ def bridge_origin(
     }
     if author_name:
         origin["author_name"] = author_name
+    if thread_id is not None:
+        origin["thread_id"] = thread_id
     return origin
 
 
@@ -3298,6 +3307,7 @@ class CollaborationStore:
             link.surface_id,
             external_message_id,
             None if author_user_id else display_name,
+            thread_id=link.thread_id,
         )
         with self.dstore.immediate_transaction() as session:
             channel = session.get(ChannelRow, link.channel_id)

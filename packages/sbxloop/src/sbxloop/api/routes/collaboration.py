@@ -318,15 +318,17 @@ def _artifact_ref_out(ref: ArtifactRef) -> ArtifactRefOut:
 
 
 def _origin_out(origin: dict[str, Any] | None) -> MessageOriginOut | None:
-    """The three public facts of a message's origin. The stored value may
-    carry more — a guest's name, which is served as the author instead."""
+    """The public facts of a message's origin. The stored value may carry
+    more — a guest's name, which is served as the author instead."""
     if not isinstance(origin, dict) or not origin.get("backend"):
         return None
     external = origin.get("external_message_id")
+    thread = origin.get("thread_id")
     return MessageOriginOut(
         backend=str(origin["backend"]),
         surface_id=str(origin.get("surface_id") or ""),
         external_message_id=None if external is None else str(external),
+        thread_id=None if thread is None else str(thread),
     )
 
 

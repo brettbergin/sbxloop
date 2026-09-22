@@ -21,6 +21,7 @@ from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.collaboration import CollaborationStore
 from sbxloop.api.context import ApiContext
 from sbxloop.daemon.channel_mirror import ChannelMirror
+from tests.unit import test_daemon_mattermost as mattermost_tests, test_daemon_slack as slack_tests
 from tests.unit.test_daemon_discord import (
     BOT_USER,
     FakeChannel,
@@ -57,6 +58,35 @@ class ChannelConcierge:
         return future
 
 
+def open_store(
+    bridge: Any, loop: Any, channel_agent: Any
+) -> tuple[ApiContext, CollaborationStore, Any, Any]:
+    """The API context a bridge reaches through its daemon loop, over a real
+    collaboration store, with the workspace owner and one channel of theirs."""
+    config = bridge.config
+    ctx = ApiContext(
+        config,
+        loop=loop,
+        auth=ApiAuthStore(bridge.dstore),
+        keys=load_or_create(config.paths),
+        clock=time.time,
+        concierge=channel_agent,
+    )
+    ctx.ready.set()
+    loop.api_ctx = ctx
+    store: CollaborationStore = ctx.collaboration
+    user = store.register_user(
+        username="owner",
+        email="owner@example.test",
+        password="correct horse battery staple",
+        full_name="Local Owner",
+        timezone="UTC",
+        now=time.time(),
+    )
+    channel = store.create_channel(user.id, "Plans", time.time())
+    return ctx, store, user, channel
+
+
 class Linked:
     """A started bridge over a real collaboration store, with an API context
     the bridge reaches through its daemon loop."""
@@ -66,27 +96,9 @@ class Linked:
         self.concierge = FakeConcierge()
         self.channel_agent = ChannelConcierge()
         self.bridge, self.client, self.loop = make_bridge(tmp_path, concierge=self.concierge)
-        config = self.bridge.config
-        self.ctx = ApiContext(
-            config,
-            loop=self.loop,
-            auth=ApiAuthStore(self.bridge.dstore),
-            keys=load_or_create(config.paths),
-            clock=time.time,
-            concierge=self.channel_agent,
+        self.ctx, self.store, self.user, self.channel = open_store(
+            self.bridge, self.loop, self.channel_agent
         )
-        self.ctx.ready.set()
-        self.loop.api_ctx = self.ctx
-        self.store: CollaborationStore = self.ctx.collaboration
-        self.user = self.store.register_user(
-            username="owner",
-            email="owner@example.test",
-            password="correct horse battery staple",
-            full_name="Local Owner",
-            timezone="UTC",
-            now=time.time(),
-        )
-        self.channel = self.store.create_channel(self.user.id, "Plans", time.time())
         if surface not in self.client.channels:
             self.client.channels[surface] = FakeChannel(self.client, surface, name="linked")
         self.link = (
@@ -340,3 +352,202 @@ def test_a_linked_discord_thread_hears_the_channel(threaded: Any) -> None:
     threaded.say("plan the bread", author=FakeUser(99, "stranger"))
     assert wait_for(lambda: any("reply from" in sent for sent in threaded.sent()))
     assert not any("plan the bread" in sent for sent in threaded.sent() if sent.startswith("**"))
+
+
+def test_a_mirrored_guest_post_is_marked_as_a_guest_from_its_bridge(guests: Any) -> None:
+    """A guest's name is whatever they call themselves on the other service,
+    so a post of theirs mirrored to a second surface must say so, or a guest
+    named after a member reads as that member."""
+    guests.client.channels[ELSEWHERE] = FakeChannel(guests.client, ELSEWHERE, name="elsewhere")
+    guests.store.create_channel_link(
+        None,
+        guests.channel.id,
+        backend="discord",
+        surface_id=ELSEWHERE_SURFACE,
+        thread_id=None,
+        allow_guests=False,
+        created_by=guests.user.id,
+        now=time.time(),
+    )
+    mirror = ChannelMirror(guests.store, lambda backend: guests.bridge)
+    guests.store.add_message_observer(mirror.message_appended)
+    elsewhere = guests.client.channels[ELSEWHERE]
+
+    guests.say("plan the bread", author=FakeUser(99, "stranger"))
+    assert wait_for(lambda: any("plan the bread" in sent for sent in elsewhere.sent))
+    post = next(sent for sent in elsewhere.sent if "plan the bread" in sent)
+    assert post == "**stranger (guest, via discord)**\nplan the bread"
+    # The channel's own answer came over no bridge, and its header says nothing of one.
+    assert wait_for(lambda: any("reply from" in sent for sent in elsewhere.sent))
+    reply = next(sent for sent in elsewhere.sent if "reply from" in sent)
+    assert "via" not in reply.splitlines()[0]
+
+
+def test_a_mirrored_post_from_a_mapped_author_names_the_bridge_it_came_over(linked: Any) -> None:
+    linked.store.link_identity(
+        linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
+    )
+    linked.client.channels[ELSEWHERE] = FakeChannel(linked.client, ELSEWHERE, name="elsewhere")
+    linked.store.create_channel_link(
+        None,
+        linked.channel.id,
+        backend="discord",
+        surface_id=ELSEWHERE_SURFACE,
+        thread_id=None,
+        allow_guests=False,
+        created_by=linked.user.id,
+        now=time.time(),
+    )
+    mirror = ChannelMirror(linked.store, lambda backend: linked.bridge)
+    linked.store.add_message_observer(mirror.message_appended)
+    elsewhere = linked.client.channels[ELSEWHERE]
+
+    linked.say("plan the bread")
+    assert wait_for(lambda: any("plan the bread" in sent for sent in elsewhere.sent))
+    header = next(sent for sent in elsewhere.sent if "plan the bread" in sent).splitlines()[0]
+    author = linked.messages()[0].author
+    assert header == f"**{author.display_name or author.id} (via discord)**"
+    assert "guest" not in header
+
+
+# -- Slack and Mattermost: a thread is a surface of its own, inside a channel --
+
+#: The ts of a post in the linked Slack channel that a thread hangs under.
+SLACK_THREAD = "1700000001.000001"
+#: The root post of a Mattermost thread in the linked channel.
+MATTERMOST_ROOT = "r" * 26
+
+
+class LinkedSurface:
+    """A started Slack or Mattermost bridge whose control channel is linked
+    to a channel, with the one member mapped to the service account the
+    harness's messages come from."""
+
+    def __init__(self, tmp_path: Path, backend: str) -> None:
+        self.backend = backend
+        self.concierge = FakeConcierge()
+        harness = slack_tests if backend == "slack" else mattermost_tests
+        self.surface = harness.CHANNEL
+        self.bridge, self.client, self.loop = harness.make_bridge(
+            tmp_path, concierge=self.concierge
+        )
+        assert wait_for(lambda: self.client.connected)
+        self.ctx, self.store, self.user, self.channel = open_store(
+            self.bridge, self.loop, ChannelConcierge()
+        )
+        self.link = self.link_to(None)
+        external = "U1" if backend == "slack" else mattermost_tests.USER_ID
+        self.store.link_identity(
+            self.user.id, backend=backend, external_user_id=external, display_name="me", now=1.0
+        )
+
+    def link_to(self, thread_id: str | None) -> Any:
+        return self.store.create_channel_link(
+            None,
+            self.channel.id,
+            backend=self.backend,
+            surface_id=self.surface,
+            thread_id=thread_id,
+            allow_guests=False,
+            created_by=self.user.id,
+            now=time.time(),
+        )
+
+    def messages(self) -> list[Any]:
+        return self.store.list_messages(None, self.channel.id)
+
+    def close(self) -> None:
+        self.bridge.close()
+        self.ctx.close()
+
+
+@pytest.fixture
+def slack_linked(tmp_path: Path) -> Any:
+    built = LinkedSurface(tmp_path, "slack")
+    yield built
+    built.close()
+
+
+@pytest.fixture
+def mattermost_linked(tmp_path: Path) -> Any:
+    built = LinkedSurface(tmp_path, "mattermost")
+    yield built
+    built.close()
+
+
+def test_a_thread_reply_under_a_linked_slack_channel_reaches_the_channel(
+    slack_linked: Any,
+) -> None:
+    """Whoever replies in a thread under a mirrored post is talking to the
+    channel the surface is linked to, not to the daemon's concierge."""
+    slack_linked.client.deliver(
+        {
+            "type": "message",
+            "channel": slack_tests.CHANNEL,
+            "user": "U1",
+            "text": f"<@{slack_tests.BOT}> plan the bread",
+            "ts": "1700000002.000002",
+            "thread_ts": SLACK_THREAD,
+        }
+    )
+    assert wait_for(lambda: len(slack_linked.messages()) >= 1)
+    message = slack_linked.messages()[0]
+    assert message.content == "plan the bread"
+    assert message.author.id == slack_linked.user.id
+    assert message.origin == {
+        "backend": "slack",
+        "surface_id": slack_tests.CHANNEL,
+        "external_message_id": "1700000002.000002",
+    }
+    assert slack_linked.concierge.turns == []
+
+
+def test_a_thread_reply_under_a_linked_mattermost_channel_reaches_the_channel(
+    mattermost_linked: Any,
+) -> None:
+    mattermost_linked.client.deliver(
+        mattermost_tests.posted(
+            f"@{mattermost_tests.BOT_NAME} plan the bread",
+            post_id="q" * 26,
+            root_id=MATTERMOST_ROOT,
+        )
+    )
+    assert wait_for(lambda: len(mattermost_linked.messages()) >= 1)
+    message = mattermost_linked.messages()[0]
+    assert message.content == "plan the bread"
+    assert message.author.id == mattermost_linked.user.id
+    assert message.origin == {
+        "backend": "mattermost",
+        "surface_id": mattermost_tests.CHANNEL,
+        "external_message_id": "q" * 26,
+    }
+    assert mattermost_linked.concierge.turns == []
+
+
+def test_a_message_in_a_linked_thread_is_still_mirrored_to_the_channel_link(
+    mattermost_linked: Any,
+) -> None:
+    """A channel linked to both a Mattermost channel and one thread in it:
+    what is typed in the thread reaches the channel link's readers at the
+    top level, and is never echoed back into the thread it came from."""
+    mattermost_linked.link_to(MATTERMOST_ROOT)
+    mirror = ChannelMirror(mattermost_linked.store, lambda backend: mattermost_linked.bridge)
+    mattermost_linked.store.add_message_observer(mirror.message_appended)
+    posts = mattermost_linked.client.posts
+
+    mattermost_linked.client.deliver(
+        mattermost_tests.posted(
+            f"@{mattermost_tests.BOT_NAME} plan the bread",
+            post_id="q" * 26,
+            root_id=MATTERMOST_ROOT,
+        )
+    )
+    assert wait_for(lambda: any("reply from" in p["message"] for p in posts))
+    message = mattermost_linked.messages()[0]
+    assert message.origin.get("surface_id") == mattermost_tests.CHANNEL
+    assert message.origin.get("thread_id") == MATTERMOST_ROOT
+    top_level = [p for p in posts if "plan the bread" in p["message"] and not p.get("root_id")]
+    assert len(top_level) == 1
+    assert not any(
+        "plan the bread" in p["message"] and p.get("root_id") == MATTERMOST_ROOT for p in posts
+    )

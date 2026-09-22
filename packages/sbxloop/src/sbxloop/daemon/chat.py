@@ -869,8 +869,12 @@ class ChatBridge(ABC):
         """The active link for the surface this message arrived on, or None.
 
         A thread is looked up as a thread first (``parent`` is the channel it
-        lives in), then the surface itself, so linking a whole channel and
-        linking one thread in it both work.
+        lives in), then as the channel it lives in, so linking a whole
+        channel and linking one thread in it both work: a reply in any
+        thread under a linked channel belongs to that channel's link. On a
+        service where a thread is a surface of its own (Slack, Mattermost)
+        ``channel_id`` is the thread's id and a whole-channel link is stored
+        under the parent, so the parent is what the fallback must ask for.
         """
         store = self._collaboration()
         if store is None or msg.channel_id is None:
@@ -882,6 +886,7 @@ class ChatBridge(ABC):
                 )
                 if threaded is not None:
                     return threaded
+                return store.link_for_surface(self.backend, str(msg.parent_channel_id), None)
             return store.link_for_surface(self.backend, str(msg.channel_id), None)
         except Exception:
             # A link nobody can read is not a reason to drop the message:

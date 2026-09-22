@@ -4175,7 +4175,7 @@
       },
       "MessageOriginOut": {
         "additionalProperties": false,
-        "description": "The bridge surface a message arrived on, for a message that did.",
+        "description": "The bridge surface a message arrived on, for a message that did.\n``thread_id`` is set when it came in through a link to one thread.",
         "properties": {
           "backend": {
             "title": "Backend",
@@ -4195,6 +4195,17 @@
           "surface_id": {
             "title": "Surface Id",
             "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
           }
         },
         "required": [

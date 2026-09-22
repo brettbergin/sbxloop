@@ -40,6 +40,25 @@ the user created are withdrawn (a demotion withdraws those above the new
 role), each as a `workspace.invite.revoked` event with a `reason`, and an
 invite whose creator is no longer an active member admits nobody while one
 above its creator's current role grants that role instead.
+**A reply in a thread under a linked Slack or Mattermost channel reaches
+the channel, and a thread link no longer hides what it hears from the
+channel link.** On those services a thread is a surface of its own, and the
+bridge looked a threaded message up as its thread and then as its thread
+again, never as the channel the thread hangs under, so a reply under a
+mirrored post went to the daemon's concierge or nowhere. It now falls back
+to the link on the parent channel. A message accepted through a link to one
+thread also records that thread in its origin, and the mirror skips only
+the link it came through: a channel linked to both a Mattermost channel and
+one thread in it now shows the thread's messages at the top level, and
+still never echoes one back into its own thread. The API serves the thread
+as an optional `thread_id` on a message's `origin`.
+
+**A mirrored post says when its author came in over a bridge, and whether
+they are a guest.** A message that arrived over a bridge and is mirrored to
+another linked surface carried only `**name**`, so a guest calling
+themselves after a member read as that member. The header is now
+`**name (guest, via discord)**` for a guest and `**name (via slack)**` for a
+mapped member; a post that came over no bridge is unchanged.
 
 **A member removed from the workspace receives nothing further on an open
 event stream.** The SSE stream and the WebSocket re-check their token every
