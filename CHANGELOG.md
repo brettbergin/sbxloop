@@ -22,6 +22,18 @@ runs filed from channels they cannot open. A turn now claims an item only
 when it precedes the item's creation, and a run answers to the channel
 that had asked for the issue by the time the run started.
 
+**A run's reply in its channel is credited only to an agent on that run.**
+A steer names the agent it is for, and the engine took that name at its word
+when it stamped the reply: the persona was checked against the run's team,
+but the name on the `chat.reply` event was not, and the chronicle used it as
+the post's author. Anyone allowed to steer a run tied to a channel could
+therefore have the run's reply appear as written by any agent, on the run or
+not, with the wording the steer asked for. The engine now stamps the agent
+only when the run's assignment has it, and the chronicle credits a stamped
+agent only when it is on the run's team; otherwise the reply is told in the
+run's own steering voice, as an unnamed steer always was. A task id the run
+does not have was already cleared before the reply and stays so.
+
 **An OIDC sign-in trusts a provider email only when the provider has checked
 it, and a member's typed-in address can no longer steer a colleague's first
 sign-in.** Any member could set their email to an address nobody held yet;
