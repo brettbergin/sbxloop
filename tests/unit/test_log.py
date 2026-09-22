@@ -5,7 +5,10 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import re
 from pathlib import Path
+from typing import TextIO
 
 import pytest
 
@@ -451,6 +454,81 @@ class TestDaemonLogFile:
             assert json.loads(line)["event"] == "daemon.starting"
         finally:
             configure_logging("WARNING")
+
+
+_ISO_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+
+class TestJournaldTimestamp:
+    """journald stamps every line it receives, so a console line with our
+    own ISO stamp showed two times side by side in ``journalctl``. systemd
+    names the journal stream in ``JOURNAL_STREAM`` (``<dev>:<inode>``);
+    only a stream that *is* that stream loses the stamp."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_buffer(self) -> None:
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    @staticmethod
+    def _journal_stream(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, matching: bool = True
+    ) -> TextIO:
+        stream = (tmp_path / "journal").open("w+", encoding="utf-8")
+        st = os.fstat(stream.fileno())
+        inode = st.st_ino if matching else st.st_ino + 1
+        monkeypatch.setenv("JOURNAL_STREAM", f"{st.st_dev}:{inode}")
+        return stream
+
+    @staticmethod
+    def _read(stream: TextIO) -> str:
+        stream.flush()
+        stream.seek(0)
+        return stream.read()
+
+    def test_console_to_the_journal_drops_our_stamp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_logging: None
+    ) -> None:
+        with self._journal_stream(tmp_path, monkeypatch) as stream:
+            configure_logging("INFO", stream=stream, file=tmp_path / "daemon.log")
+            get_logger("sbxloop.test").info("daemon.tick", n=1)
+            configure_logging("WARNING")  # close the file handler
+            line = self._read(stream)
+        assert "daemon.tick" in line and "n=1" in line
+        assert not _ISO_STAMP.search(line)
+        # The copies nothing else stamps keep theirs.
+        assert _ISO_STAMP.search((tmp_path / "daemon.log").read_text())
+        (record,) = [r for r in log_buffer().tail(10) if "daemon.tick" in r.line]
+        assert _ISO_STAMP.search(record.line)
+
+    def test_a_stream_that_is_not_the_journal_keeps_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_logging: None
+    ) -> None:
+        """An inherited JOURNAL_STREAM with stderr redirected elsewhere."""
+        with self._journal_stream(tmp_path, monkeypatch, matching=False) as stream:
+            configure_logging("INFO", stream=stream)
+            get_logger("sbxloop.test").info("daemon.tick")
+            line = self._read(stream)
+        assert _ISO_STAMP.search(line)
+
+    def test_no_journal_keeps_it(
+        self, monkeypatch: pytest.MonkeyPatch, restore_logging: None
+    ) -> None:
+        monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        stream = io.StringIO()
+        configure_logging("INFO", stream=stream)
+        get_logger("sbxloop.test").info("daemon.tick")
+        assert _ISO_STAMP.search(stream.getvalue())
+
+    def test_json_to_the_journal_keeps_its_timestamp_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_logging: None
+    ) -> None:
+        with self._journal_stream(tmp_path, monkeypatch) as stream:
+            configure_logging("INFO", fmt="json", stream=stream)
+            get_logger("sbxloop.test").info("daemon.tick")
+            (line,) = self._read(stream).splitlines()
+        assert "timestamp" in json.loads(line)
 
 
 class TestErrorEventsExplainThemselves:
