@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -11,6 +12,10 @@ from sbxloop.api.models import ApiModel
 
 WorkspaceRole = Literal["owner", "admin", "member"]
 AuthSource = Literal["local", "oidc"]
+
+#: User ids read ``usr_<token>`` and are public, so a username may not
+#: spell one: no selector an operator types may name two accounts.
+_USERNAME_LIKE_ID = re.compile(r"^\s*usr_", re.IGNORECASE)
 
 
 class LocalRegisterRequest(ApiModel):
@@ -22,6 +27,13 @@ class LocalRegisterRequest(ApiModel):
     #: Required for every user after the installation's first: the token of
     #: a workspace invite, which sets the new user's role.
     invite_token: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def _not_a_user_id(cls, value: str) -> str:
+        if _USERNAME_LIKE_ID.match(value):
+            raise ValueError("a username may not begin with usr_")
+        return value
 
 
 class LocalLoginRequest(ApiModel):

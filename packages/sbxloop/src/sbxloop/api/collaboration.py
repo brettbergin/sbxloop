@@ -67,6 +67,10 @@ log = get_logger(__name__)
 
 #: Characters a provider-suggested username may not keep.
 _USERNAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+#: User ids read ``usr_<token>`` and are public (``GET /v1/users``),
+#: so no username may spell one: a selector an operator types resolves
+#: to one account, never to whichever of two a lookup order picks.
+_USERNAME_LIKE_ID = re.compile(r"^usr_", re.IGNORECASE)
 MAX_HANDOFFS_PER_TURN = 6
 MAX_HANDOFFS_PER_RESPONSE = 2
 # Four hops admit a bounded review return path such as coordinator -> author
@@ -364,6 +368,9 @@ class MergeReport:
     #: The target's workspace role before and after the merge.
     previous_role: Role | None
     role: Role
+    #: Whether the merge put a target that had left the workspace back
+    #: in, which only an explicit ``readmit`` allows.
+    readmitted: bool = False
 
 
 #: Workspace roles, weakest first: a merge keeps the stronger of two.
@@ -1064,6 +1071,8 @@ class CollaborationStore:
         email = email.strip().casefold()
         if not username or not email:
             raise CollaborationError("invalid_profile", "username and email are required")
+        if _USERNAME_LIKE_ID.match(username):
+            raise CollaborationError("invalid_profile", "a username may not begin with usr_")
         if len(password) < 8:
             raise CollaborationError("weak_password", "password must contain at least 8 characters")
         user_id = "usr_" + _token(12)
@@ -1146,6 +1155,8 @@ class CollaborationStore:
     @staticmethod
     def _free_username(session: Any, hint: str) -> str:
         base = _USERNAME_UNSAFE.sub("-", hint.strip()).strip("-.")[:64] or "user"
+        # A provider hint that spells a user id gives up the prefix.
+        base = _USERNAME_LIKE_ID.sub("", base).strip("-.") or "user"
         taken = set(
             session.scalars(
                 select(LocalUserRow.username).where(
@@ -1428,20 +1439,37 @@ class CollaborationStore:
             return None if row is None else _user(row)
 
     def find_user(self, selector: str) -> LocalUser | None:
-        """The user a selector names: a user id, or else a username."""
+        """The user a selector names: a user id, or else a username.
+
+        A selector that is at once one account's id and another's
+        username names neither (``ambiguous_selector``): no lookup
+        order may decide which of two people an operator meant.
+        """
         selector = selector.strip()
         with self.dstore.read() as session:
             row = session.get(LocalUserRow, selector)
-            if row is None:
-                row = session.scalars(
-                    select(LocalUserRow).where(LocalUserRow.username == selector)
-                ).first()
-            return None if row is None else _user(row)
+            named = session.scalars(
+                select(LocalUserRow).where(LocalUserRow.username == selector)
+            ).first()
+            if row is not None and named is not None and str(named.id) != str(row.id):
+                raise CollaborationError(
+                    "ambiguous_selector",
+                    f"{selector!r} is one account's id and another's username",
+                )
+            found = row if row is not None else named
+            return None if found is None else _user(found)
 
     # -- merging two accounts --------------------------------------------------------
 
     def merge_users(
-        self, source_id: str, target_id: str, now: float, *, dry_run: bool = False
+        self,
+        source_id: str,
+        target_id: str,
+        now: float,
+        *,
+        dry_run: bool = False,
+        readmit: bool = False,
+        actor: dict[str, Any] | None = None,
     ) -> MergeReport:
         """Fold ``source_id`` into ``target_id``, in one immediate transaction.
 
@@ -1454,7 +1482,8 @@ class CollaborationStore:
         value wins a clash), workflows, agent memories the source authored,
         the invites it created, its bridge identities and the events meant
         for it alone. The target keeps the stronger of the two workspace
-        roles.
+        roles, except that a deactivated source lends none: an account
+        somebody shut off hands on nothing it could no longer use.
 
         The source's provider identity moves onto the target, which keeps
         its username, email, password and ``auth_source``: an account that
@@ -1463,19 +1492,31 @@ class CollaborationStore:
         sign-in methods reach the target afterwards. The source is then
         deactivated, loses its membership, its provider identity and every
         capability, and its refresh tokens are revoked, as a removed member's
-        are. The audit event names the two ids and nothing else.
+        are. The audit event names ``actor`` (who asked for the merge), the
+        two ids, the target's role before and after, and whether the merge
+        re-admitted it.
 
         Refused: merging a user into itself (``merge_same_user``), a user
         that does not exist (``user_not_found``), an inactive target
-        (``merge_target_inactive``), and a target already bound to a
-        different provider identity than the source's
+        (``merge_target_inactive``), a target that is no longer a
+        workspace member (``merge_target_not_member``, unless ``readmit``
+        says to bring it back in on purpose), and a target already bound
+        to a different provider identity than the source's
         (``merge_identity_conflict``). ``dry_run`` does all of it inside the
         transaction and rolls it back, so the report is exactly what a real
         merge would do and nothing is written.
         """
         try:
             with self.dstore.immediate_transaction() as session:
-                report = self._merge(session, source_id, target_id, now, dry_run=dry_run)
+                report = self._merge(
+                    session,
+                    source_id,
+                    target_id,
+                    now,
+                    dry_run=dry_run,
+                    readmit=readmit,
+                    actor=actor,
+                )
                 if dry_run:
                     raise _DryRun(report)
                 return report
@@ -1483,7 +1524,15 @@ class CollaborationStore:
             return unwound.report
 
     def _merge(
-        self, session: Any, source_id: str, target_id: str, now: float, *, dry_run: bool
+        self,
+        session: Any,
+        source_id: str,
+        target_id: str,
+        now: float,
+        *,
+        dry_run: bool,
+        readmit: bool = False,
+        actor: dict[str, Any] | None = None,
     ) -> MergeReport:
         if source_id == target_id:
             raise CollaborationError("merge_same_user", "a user cannot be merged into itself")
@@ -1495,6 +1544,14 @@ class CollaborationStore:
         if not target.active:
             raise CollaborationError(
                 "merge_target_inactive", "the account to merge into is deactivated"
+            )
+        if self._member_row(session, target_id) is None and not readmit:
+            # Somebody took this person out of the workspace; a merge is
+            # not the place to quietly put them back.
+            raise CollaborationError(
+                "merge_target_not_member",
+                "the account to merge into is not a member of the workspace; "
+                "ask for the re-admission explicitly",
             )
         source_identity = (
             None
@@ -1673,14 +1730,18 @@ class CollaborationStore:
         source = session.get(LocalUserRow, source_id)
         target = session.get(LocalUserRow, target_id)
         assert source is not None and target is not None  # nosec B101 - read above
-        # Workspace membership: the target keeps the stronger role.
+        # Workspace membership: the target keeps the stronger role, and a
+        # deactivated source lends none of its own.
         source_member = self._member_row(session, source_id)
         target_member = self._member_row(session, target_id)
         previous_role: Role | None = (
             None if target_member is None else _role(str(target_member.role))
         )
-        candidates = [str(m.role) for m in (source_member, target_member) if m is not None]
+        candidates: list[str] = [] if target_member is None else [str(target_member.role)]
+        if source_member is not None and source.active:
+            candidates.append(str(source_member.role))
         role = _role(max(candidates, key=lambda r: _ROLE_RANK[r]) if candidates else "member")
+        readmitted = target_member is None
         if target_member is None:
             session.add(
                 WorkspaceMemberRow(
@@ -1715,7 +1776,14 @@ class CollaborationStore:
                 session,
                 "collaboration.user.merged",
                 now,
-                data={"source_user_id": source_id, "target_user_id": target_id},
+                actor=actor,
+                data={
+                    "source_user_id": source_id,
+                    "target_user_id": target_id,
+                    "previous_role": previous_role,
+                    "role": role,
+                    "readmitted": readmitted,
+                },
             )
         return MergeReport(
             source_id=source_id,
@@ -1730,6 +1798,7 @@ class CollaborationStore:
             identity=source_identity,
             previous_role=previous_role,
             role=role,
+            readmitted=readmitted,
         )
 
     def user_by_client(self, client_id: str) -> LocalUser | None:
