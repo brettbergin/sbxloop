@@ -240,6 +240,18 @@ class TestBounds:
     def test_allowed_domain_passes(self) -> None:
         assert egress_rejection("registry.npmjs.org", ["registry.npmjs.org"], []) is None
 
+    def test_any_host_is_in_bounds_only_under_an_any_host_bound(self) -> None:
+        assert egress_rejection("*", ["*"], []) is None
+        reason = egress_rejection("*", ["*.example.com", "api.example.org"], [])
+        assert reason is not None and "allow" in reason
+
+    def test_any_host_is_refused_whenever_anything_is_denied(self) -> None:
+        # The sandbox policy is grant-only: a box granted every host cannot
+        # keep a denied one out, so `*` fails closed under any deny pattern.
+        reason = egress_rejection("*", ["*"], ["secrets.example.com"])
+        assert reason is not None and "deny" in reason
+        assert "secrets.example.com" in reason
+
     def test_effective_bounds_include_baseline_and_advertised(self) -> None:
         config = Config.model_validate(
             {
@@ -344,6 +356,25 @@ class TestEgressGranter:
         assert event.data["domain"] == "api.example-saas.com"
         assert event.data["reason"] == "fetch the dataset"
         assert event.data["task_id"] == "t1"
+
+    def test_any_host_is_granted_in_sbx_spelling(self, fake_sbx: FakeSbx) -> None:
+        # sbx spells "every host" `**`; a `*` sbx would read as a hostname.
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events, policy={"allow": ["*"]})
+        granter.apply("t1", [("*", "follow links across the web")])
+        assert fake_sbx.policies() == [["allow", "network", "**", "--sandbox", "sbxloop-r1-agent"]]
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_ALLOW]
+        assert event.data["domain"] == "*"
+
+    def test_any_host_is_refused_when_policy_denies_anything(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(
+            fake_sbx, events, policy={"allow": ["*"], "deny": ["secrets.example.com"]}
+        )
+        granter.apply("t1", [("*", "follow links across the web")])
+        assert fake_sbx.policies() == []
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_DENY]
+        assert event.data["domain"] == "*"
 
     def test_grant_is_idempotent_per_domain(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []

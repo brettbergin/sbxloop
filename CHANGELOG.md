@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+**A workload task that cannot know its hosts in advance can ask for any
+host.** A research plan whose task follows links it has not seen yet declared
+`needs.hosts = ["*"]`, the model refused it, and the retry guessed bare
+suffixes such as `*.com` that were refused too, so the run failed with
+"invalid output twice". A plan may now declare `*`: a profile whose `egress`
+is `*` grants it (sent to sbx as its `**`), any other profile refuses it
+naming `workloads.<name>.egress`, and it is refused whenever `[policy] deny`
+is set, since a box open to every host could not keep a denied one out. The
+planner's bounds say which of these applies, and the validation message names
+the bare-suffix mistake and the `*` alternative.
+
 **The docs say where a repository is declared.** Third part of #2255: the
 deployment guide, the console guide, the architecture map and the user guide
 describe `[[vcs.repos]]` as the one place a repository is declared, name the

@@ -804,7 +804,10 @@ names the one a run gets when `sbxloop run --profile NAME` does not choose
 no drift). The planner is shown the profile's bounds, and right after the
 plan, before any task runs, every declared need is held to them: a host
 inside the profile's egress (and not denied) is allowed on the agent box
-at the task's execute entry, a credential the profile names goes on the
+at the task's execute entry (a task that cannot know its hosts in advance
+may ask for `*`, which only a profile whose egress is `*` grants, and never
+while `[policy] deny` is set: the sandbox policy only grants, so a box open
+to every host could not keep a denied one out), a credential the profile names goes on the
 run row and the run re-provisions from `executing` with the service sandbox
 that holds it (one extra boot, only when a plan asked for a credential —
 the agent box never holds the value), a permitted repository is checked
