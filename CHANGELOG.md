@@ -52,6 +52,16 @@ that member: when the re-check finds the member gone, or the client no
 longer holds `runs:read`, it closes with `access_revoked` (`stream.closed`
 on SSE, `closing` and close code 4403 on the socket). A stream opened by a
 plain API client is unchanged.
+**Labelling an issue for a run from a channel grants that channel the
+runs that follow, never the runs that already existed.** A code item
+no channel asked for (an operator ran it from the host) resolved to the
+first turn anywhere that ever filed or labelled its issue, and a poll
+that re-queued the issue after a later label gave the whole item, every
+earlier run included, to the labelling channel: a member could label an
+existing issue from their own channel and read the files and events of
+runs filed from channels they cannot open. A turn now claims an item only
+when it precedes the item's creation, and a run answers to the channel
+that had asked for the issue by the time the run started.
 
 **A run's reply in its channel is credited only to an agent on that run.**
 A steer names the agent it is for, and the engine took that name at its word
