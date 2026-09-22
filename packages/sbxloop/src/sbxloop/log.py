@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import io
 import logging
 import logging.handlers
+import os
 import re
 import sys
 from datetime import UTC, datetime
@@ -327,6 +329,26 @@ def _level_no_safe(level: str) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _is_journal(stream: TextIO) -> bool:
+    """Whether ``stream`` is the journald stream systemd connected. systemd
+    names it in ``JOURNAL_STREAM`` as ``<dev>:<inode>``; a child inherits
+    the variable even with its stderr redirected elsewhere, so the stream
+    itself must match. No fd, or anything unparseable, is not the journal."""
+    value = os.environ.get("JOURNAL_STREAM", "")
+    try:
+        dev, inode = (int(part) for part in value.split(":"))
+        st = os.fstat(stream.fileno())
+    except (ValueError, OSError, AttributeError, io.UnsupportedOperation):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, inode)
+
+
+def _drop_timestamp(_logger: Any, _name: str, event_dict: Any) -> Any:
+    """journald stamps every line it receives; a second stamp is noise."""
+    event_dict.pop("timestamp", None)
+    return event_dict
+
+
 def configure_logging(
     level: str = "INFO",
     *,
@@ -390,7 +412,8 @@ def configure_logging(
             colors=bool(getattr(target, "isatty", lambda: False)()),
             exception_formatter=structlog.dev.plain_traceback,
         )
-        tail = [renderer]
+        # The journal keeps its own time; the file and the buffer do not.
+        tail = [_drop_timestamp, renderer] if _is_journal(target) else [renderer]
         # Plain text for the buffer: greppable, and safe to paste into chat.
         buffer_tail = [
             structlog.dev.ConsoleRenderer(
