@@ -24,7 +24,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
     wait as wait_for_futures,
 )
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from sbxloop.agents.assignment import RUN_ROLES, agent_memory_block
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
@@ -283,6 +283,13 @@ class ApiContext:
         self.keys = keys
         self.concierge = concierge
         self.clock = clock
+        # A check proves provider authentication for this daemon process only.
+        # Configuration edits need a restart before its bridges and workers use them.
+        self.connection_checks: dict[
+            str,
+            tuple[str, float, Literal["connected", "expired", "error", "disconnected"], str],
+        ] = {}
+        self.connection_pending_restart: set[str] = set()
         self.ready = threading.Event()
         self.stopping = threading.Event()
         self.limiter = FailureLimiter()

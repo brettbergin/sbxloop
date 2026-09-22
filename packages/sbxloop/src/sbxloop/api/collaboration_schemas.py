@@ -284,6 +284,10 @@ class ConnectionOut(ApiModel):
     auth_type: Literal["oauth2", "api_key", "token", "credentials"]
     status: Literal["connected", "expired", "error", "disconnected"]
     masked_credentials: dict[str, str]
+    configured: bool = False
+    active: bool = False
+    restart_required: bool = False
+    settings: dict[str, str] = Field(default_factory=dict)
     scopes: str | None = None
     token_expires_at: str | None = None
     last_used_at: str | None = None
@@ -296,6 +300,14 @@ class ConnectionMutation(ApiModel):
     service_type: str | None = None
     credentials: dict[str, str] = Field(default_factory=dict)
     display_name: str | None = None
+
+
+class ConnectionConfigure(ApiModel):
+    """Only known service settings and write-only credentials are accepted."""
+
+    settings: dict[str, str] = Field(default_factory=dict)
+    credentials: dict[str, str] = Field(default_factory=dict)
+    activate: bool = True
 
 
 class ConnectionTestOut(ApiModel):

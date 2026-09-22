@@ -1853,6 +1853,33 @@
         "title": "ConfigurationEntry",
         "type": "object"
       },
+      "ConnectionConfigure": {
+        "additionalProperties": false,
+        "description": "Only known service settings and write-only credentials are accepted.",
+        "properties": {
+          "activate": {
+            "default": true,
+            "title": "Activate",
+            "type": "boolean"
+          },
+          "credentials": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Credentials",
+            "type": "object"
+          },
+          "settings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Settings",
+            "type": "object"
+          }
+        },
+        "title": "ConnectionConfigure",
+        "type": "object"
+      },
       "ConnectionMutation": {
         "additionalProperties": false,
         "properties": {
@@ -1892,6 +1919,11 @@
       "ConnectionOut": {
         "additionalProperties": false,
         "properties": {
+          "active": {
+            "default": false,
+            "title": "Active",
+            "type": "boolean"
+          },
           "auth_type": {
             "enum": [
               "oauth2",
@@ -1901,6 +1933,11 @@
             ],
             "title": "Auth Type",
             "type": "string"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
           },
           "created_at": {
             "anyOf": [
@@ -1957,6 +1994,11 @@
             "title": "Masked Credentials",
             "type": "object"
           },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          },
           "scopes": {
             "anyOf": [
               {
@@ -1971,6 +2013,13 @@
           "service_type": {
             "title": "Service Type",
             "type": "string"
+          },
+          "settings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Settings",
+            "type": "object"
           },
           "status": {
             "enum": [
@@ -10040,11 +10089,11 @@
         },
         "summary": "List Connections",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "post": {
-        "operationId": "create_connection_v1_connections_post",
+        "operationId": "legacy_create_v1_connections_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -10077,15 +10126,15 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Create Connection",
+        "summary": "Legacy Create",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
     "/v1/connections/services": {
       "get": {
-        "operationId": "connection_services_v1_connections_services_get",
+        "operationId": "services_v1_connections_services_get",
         "responses": {
           "200": {
             "content": {
@@ -10094,7 +10143,7 @@
                   "items": {
                     "$ref": "#/components/schemas/ServiceDefinitionOut"
                   },
-                  "title": "Response Connection Services V1 Connections Services Get",
+                  "title": "Response Services V1 Connections Services Get",
                   "type": "array"
                 }
               }
@@ -10102,22 +10151,22 @@
             "description": "Successful Response"
           }
         },
-        "summary": "Connection Services",
+        "summary": "Services",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
     "/v1/connections/{connection_id}": {
       "delete": {
-        "operationId": "delete_connection_v1_connections__connection_id__delete",
+        "operationId": "remove_connection_v1_connections__connection_id__delete",
         "parameters": [
           {
-            "in": "query",
-            "name": "_connection_id",
+            "in": "path",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": " Connection Id",
+              "title": "Connection Id",
               "type": "string"
             }
           }
@@ -10137,9 +10186,9 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Delete Connection",
+        "summary": "Remove Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "get": {
@@ -10179,18 +10228,18 @@
         },
         "summary": "Get Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "patch": {
-        "operationId": "update_connection_v1_connections__connection_id__patch",
+        "operationId": "legacy_patch_v1_connections__connection_id__patch",
         "parameters": [
           {
-            "in": "query",
-            "name": "_connection_id",
+            "in": "path",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": " Connection Id",
+              "title": "Connection Id",
               "type": "string"
             }
           }
@@ -10227,9 +10276,59 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Update Connection",
+        "summary": "Legacy Patch",
         "tags": [
-          "collaboration"
+          "connections"
+        ]
+      },
+      "put": {
+        "operationId": "configure_connection_v1_connections__connection_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionConfigure"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Configure Connection",
+        "tags": [
+          "connections"
         ]
       }
     },
@@ -10271,7 +10370,7 @@
         },
         "summary": "Test Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
