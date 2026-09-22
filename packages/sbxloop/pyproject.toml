@@ -65,7 +65,7 @@ dependencies = [
 # inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
 copilot = ["github-copilot-sdk>=1.0.8"]
 # Host-side model listing; agent sessions install the worker's matching extra.
-codex = ["openai-codex==0.147.0"]
+codex = ["openai-codex==0.154.0"]
 # `sbxloop daemon`'s chat bridge (chronology + steering), one extra per
 # backend; the daemon runs without either when no [chat] backend is set.
 discord = ["discord.py>=2.3"]
