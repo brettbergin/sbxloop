@@ -63,9 +63,6 @@ from sbxloop.api.collaboration_schemas import (
     ChannelStopOut,
     ChannelUpdate,
     ChannelWorkOut,
-    ConnectionMutation,
-    ConnectionOut,
-    ConnectionTestOut,
     DetailOut,
     ExternalIdentityOut,
     ExternalIdentityPage,
@@ -81,7 +78,6 @@ from sbxloop.api.collaboration_schemas import (
     PreferenceOut,
     PreferenceUpdate,
     ReactionSet,
-    ServiceDefinitionOut,
     TeamCreate,
     TeamOut,
     TeamUpdate,
@@ -159,82 +155,6 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     },
 )
 PREFERENCE_NAMES = frozenset(item["name"] for item in PREFERENCE_DEFINITIONS)
-
-SERVICE_DEFINITIONS: tuple[dict[str, object], ...] = (
-    {
-        "key": "gitlab",
-        "name": "GitLab",
-        "description": "GitLab repositories, merge requests, and issues",
-        "auth_type": "api_key",
-        "color": "#FC6D26",
-        "fields": [],
-        "agent_slug": None,
-        "available": False,
-        "unavailable_reason": (
-            "GitLab execution is not available in this SBXLOOP version. "
-            "Connection setup will be available when its forge backend is implemented."
-        ),
-    },
-    {
-        "key": "gitea",
-        "name": "Gitea",
-        "description": "Self-hosted Gitea repositories, pull requests, and issues",
-        "auth_type": "api_key",
-        "color": "#609926",
-        "fields": [],
-        "agent_slug": None,
-        "available": False,
-        "unavailable_reason": (
-            "Gitea execution is not available in this SBXLOOP version. "
-            "Connection setup will be available when its forge backend is implemented."
-        ),
-    },
-    {
-        "key": "github",
-        "name": "GitHub",
-        "description": "Repository management — pull requests, issues, and code review",
-        "auth_type": "api_key",
-        "color": "#333333",
-        "fields": [
-            {
-                "key": "personal_access_token",
-                "label": "Personal Access Token",
-                "type": "password",
-            }
-        ],
-        "agent_slug": "github",
-    },
-    {
-        "key": "slack",
-        "name": "Slack",
-        "description": "Team messaging through sbxloop's Slack bridge",
-        "auth_type": "token",
-        "color": "#4A154B",
-        "fields": [
-            {"key": "bot_token", "label": "Bot Token (xoxb-…)", "type": "password"},
-            {"key": "app_token", "label": "App Token (xapp-…)", "type": "password"},
-        ],
-        "agent_slug": None,
-    },
-    {
-        "key": "discord",
-        "name": "Discord",
-        "description": "Community messaging through sbxloop's Discord bridge",
-        "auth_type": "token",
-        "color": "#5865F2",
-        "fields": [{"key": "bot_token", "label": "Bot Token", "type": "password"}],
-        "agent_slug": None,
-    },
-    {
-        "key": "mattermost",
-        "name": "Mattermost",
-        "description": "Self-hosted messaging through sbxloop's Mattermost bridge",
-        "auth_type": "token",
-        "color": "#0058CC",
-        "fields": [{"key": "bot_token", "label": "Bot Token", "type": "password"}],
-        "agent_slug": None,
-    },
-)
 
 
 def _problem(exc: CollaborationError) -> Problem:
@@ -764,130 +684,6 @@ async def delete_preference(
         raise Problem(404, "preference_not_found", "preference not found")
     ctx.hub.notify()
     return DetailOut(detail=f"Preference {clean_name!r} deleted")
-
-
-# -- operator-managed connections -----------------------------------------------
-
-
-def _connections(ctx: ApiContext) -> list[ConnectionOut]:
-    values: list[ConnectionOut] = []
-    github_enabled = bool(ctx.config.github.repo or ctx.config.github.repos)
-    if github_enabled:
-        values.append(
-            ConnectionOut(
-                id="github",
-                service_type="github",
-                display_name="sbxloop configuration",
-                auth_type="api_key",
-                status="connected",
-                masked_credentials={"credential": "managed by sbxloop"},
-            )
-        )
-    envs = {
-        "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
-        "discord": ("DISCORD_BOT_TOKEN",),
-        "mattermost": ("MATTERMOST_BOT_TOKEN",),
-    }
-    for name, required_env in envs.items():
-        section = getattr(ctx.config, name)
-        if not section.enabled:
-            continue
-        ready = all(os.environ.get(key) for key in required_env)
-        values.append(
-            ConnectionOut(
-                id=name,
-                service_type=name,
-                display_name="sbxloop configuration",
-                auth_type="token",
-                status="connected" if ready else "error",
-                masked_credentials={
-                    key: "configured" if os.environ.get(key) else "missing" for key in required_env
-                },
-            )
-        )
-    return values
-
-
-def _operator_managed() -> Problem:
-    return Problem(
-        409,
-        "operator_managed_connection",
-        "configure credentials with sbxloop's environment and sbxloop.toml; "
-        "remote protected credential intake is tracked by sbxloop issue #1043",
-    )
-
-
-@router.get("/connections/services", response_model=list[ServiceDefinitionOut])
-async def connection_services(
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> list[ServiceDefinitionOut]:
-    return [ServiceDefinitionOut.model_validate(item) for item in SERVICE_DEFINITIONS]
-
-
-@router.get("/connections", response_model=list[ConnectionOut])
-async def list_connections(
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> list[ConnectionOut]:
-    return _connections(ctx)
-
-
-@router.get("/connections/{connection_id}", response_model=ConnectionOut)
-async def get_connection(
-    connection_id: str,
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> ConnectionOut:
-    value = next((item for item in _connections(ctx) if item.id == connection_id), None)
-    if value is None:
-        raise Problem(404, "connection_not_found", "connection not found")
-    return value
-
-
-@router.post("/connections", response_model=ConnectionOut)
-async def create_connection(
-    _body: ConnectionMutation,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> ConnectionOut:
-    raise _operator_managed()
-
-
-@router.patch("/connections/{connection_id}", response_model=ConnectionOut)
-async def update_connection(
-    _connection_id: str,
-    _body: ConnectionMutation,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> ConnectionOut:
-    raise _operator_managed()
-
-
-@router.delete("/connections/{connection_id}", status_code=204)
-async def delete_connection(
-    _connection_id: str,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> None:
-    raise _operator_managed()
-
-
-@router.post("/connections/{connection_id}/test", response_model=ConnectionTestOut)
-async def test_connection(
-    connection_id: str,
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> ConnectionTestOut:
-    value = next((item for item in _connections(ctx) if item.id == connection_id), None)
-    if value is None:
-        raise Problem(404, "connection_not_found", "connection not found")
-    success = value.status == "connected"
-    return ConnectionTestOut(
-        success=success,
-        message=(
-            "sbxloop configuration is present"
-            if success
-            else "the sbxloop connection is configured but a required credential is missing"
-        ),
-        status=value.status,
-    )
 
 
 # -- workflow definitions --------------------------------------------------------
@@ -1618,7 +1414,11 @@ async def list_bridges(
         data=[
             BridgeOut(
                 backend=service.name,  # type: ignore[arg-type]
-                configured=bool(ctx.config.chat_section(service.name).enabled),  # type: ignore[arg-type]
+                configured=(
+                    ctx.config.chat_backend == service.name
+                    and bool(ctx.config.chat_section(service.name).enabled)
+                    and all(os.environ.get(env) for env in service.token_envs)
+                ),
                 label=service.label,
             )
             for service in CHAT_SERVICES

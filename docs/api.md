@@ -121,7 +121,7 @@ for the configuration and role mapping.
 | Turns       | `POST /v1/channels/{id}/turns`, `GET .../{turn}`               | Idempotent input acceptance and durable completion state     |
 | Preferences | `/v1/prompts`, `/v1/prompts/definitions`                       | Prompt context saved for the local user                      |
 | Workflows   | `/v1/workflows[/{id}]`                                         | Workflow metadata used by the Angie management screen        |
-| Connections | `/v1/connections`, `/v1/connections/services`                  | Redacted view of operator-managed sbxloop integrations       |
+| Connections | `/v1/connections`, `/v1/connections/services`                  | Redacted status and owner management of host integrations    |
 
 ### Agents
 
@@ -513,9 +513,39 @@ call is logged by length, not by content, as `agent.memory.*` events are
 logged by id. The log is one stream for the whole installation, and any agent
 can read it from any channel through `daemon_log`.
 
-Connection credentials remain in sbxloop's environment and configuration.
-These routes report redacted readiness and deliberately reject browser-supplied
-secret mutation until protected credential intake is implemented (#1043).
+### Connections
+
+When capability discovery includes `collaboration.connections.manage`, a
+workspace owner can configure GitHub, GitLab, Slack, Discord and Mattermost
+through `PUT /v1/connections/{service}`. The body has `settings` (the service's
+nonsecret URL and channel fields), `credentials` (write-only tokens), and
+`activate`. Only the listed fields are accepted. Secrets are written to the
+home's private `config/secrets.env`; other settings go to its
+`config/sbxloop.toml`. Both save paths keep timestamped backups; secret
+backups remain mode `0600`. The response contains
+only presence flags and nonsecret settings. Existing `POST /v1/connections`
+and `PATCH /v1/connections/{id}` clients still receive
+`operator_managed_connection` instead of accidentally using the old mutation
+shape.
+
+`GET /v1/connections` reports `configured` (settings and required credentials
+are present), `active` (the running daemon selected that service),
+`restart_required`, and `status`. A saved configuration begins as
+`disconnected`: the list never calls it connected solely because a token or
+channel ID exists. `POST /v1/connections/{id}/test` contacts the provider and,
+for chat services, checks channel access. A successful check verifies those
+requests; it does not prove that the long-lived bridge is running. A failed
+check reports a generic refusal without returning provider bodies or secrets.
+
+Changes take effect after a daemon restart. `DELETE /v1/connections/{id}`
+clears credentials owned by `secrets.env`; for a chat bridge it also removes
+its channel selection. For a forge it leaves repository and VCS assignments
+intact, so existing repositories are never silently moved to another forge.
+Secrets supplied outside the managed file must be removed by the host operator;
+the API refuses to claim their removal. Gitea remains visible but unavailable
+until it has an execution backend. GitHub App credentials remain host-managed;
+the catalog identifies that auth method, and its check directs the operator to
+`sbxloop doctor` rather than claiming a PAT check verified the App installation.
 
 ### Workspace people
 
@@ -883,7 +913,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/bridges`                                | collaboration read     | The chat services a channel can be linked to                          |
 | CRUD     | `/v1/channels/{id}/links`                    | collaboration          | The bridge surfaces mirroring a channel                               |
 | CRUD     | `/v1/users/me/identities[/{backend}]`        | collaboration          | Who you are on a bridge, and the code that proves it                  |
-| CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
+| CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted connections and owner management           |
 | `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
 | `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
 | `POST`   | `/v1/items`                                  | `items:create`         | Admit an issue, a workload ask or a tool recipe                       |
@@ -1136,7 +1166,7 @@ from a developer machine.
 
 ## What is not offered
 
-By design, on this API: configuration writes, repository registration,
+By design, on this API: general configuration writes, repository registration,
 backup and restore, garbage collection, sandbox deletion, and starting a
 daemon that is not running. Each stays on the host's own CLI until it has
 its own attribution, conflict and active-run story. A tool run takes no
