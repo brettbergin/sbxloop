@@ -341,6 +341,9 @@ class Item(ApiModel):
     #: The agent in each run role: the planned team once the item was
     #: dispatched, the roles asked for before. ``None`` when none were.
     assignment: dict[str, str] | None = None
+    #: A conversation the requesting viewer can open, when one exists.
+    #: This is a presentation link, not the item's execution admission.
+    channel_id: str | None = None
 
 
 class ItemDetail(Item):

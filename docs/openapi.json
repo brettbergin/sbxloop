@@ -1101,6 +1101,157 @@
         "title": "ChannelCreate",
         "type": "object"
       },
+      "ChannelJobOut": {
+        "additionalProperties": false,
+        "description": "Additive all-jobs view, including real runs without a work item.",
+        "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "historical": {
+            "default": false,
+            "title": "Historical",
+            "type": "boolean"
+          },
+          "item_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Actions",
+            "type": "array"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
+          },
+          "item_revision": {
+            "default": 0,
+            "title": "Item Revision",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "run_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Run Actions",
+            "type": "array"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "run_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Revision"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ExternalWorkSourceOut"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Id"
+          },
+          "unavailable": {
+            "default": false,
+            "title": "Unavailable",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "work_id": {
+            "title": "Work Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_id",
+          "channel_id",
+          "title",
+          "kind",
+          "state",
+          "source",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ChannelJobOut",
+        "type": "object"
+      },
       "ChannelLinkCreate": {
         "additionalProperties": false,
         "description": "Link a surface of a chat service to this channel.\n\n``allow_guests`` admits people on that surface who have linked no\naccount: their messages are stored under the name they use there.",
@@ -1371,6 +1522,16 @@
               }
             ],
             "title": "Created By"
+          },
+          "external_work": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExternalWorkOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "id": {
             "title": "Id",
@@ -2479,6 +2640,89 @@
         "title": "ExternalIdentityPage",
         "type": "object"
       },
+      "ExternalWorkOut": {
+        "additionalProperties": false,
+        "description": "Durable job identity and import baseline for a job conversation.",
+        "properties": {
+          "historical": {
+            "title": "Historical",
+            "type": "boolean"
+          },
+          "read_baseline": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Read Baseline",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ExternalWorkSourceOut"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "system_created": {
+            "title": "System Created",
+            "type": "boolean"
+          },
+          "work_id": {
+            "title": "Work Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_id",
+          "source",
+          "system_created",
+          "historical"
+        ],
+        "title": "ExternalWorkOut",
+        "type": "object"
+      },
+      "ExternalWorkSourceOut": {
+        "additionalProperties": false,
+        "description": "Known admission provenance; an absent source link is not invented.",
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "repository": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repository"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ExternalWorkSourceOut",
+        "type": "object"
+      },
       "Gate": {
         "additionalProperties": false,
         "properties": {
@@ -2922,6 +3166,17 @@
             "title": "Available Actions",
             "type": "array"
           },
+          "channel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Id"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -3151,6 +3406,17 @@
             "default": "",
             "title": "Body",
             "type": "string"
+          },
+          "channel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Id"
           },
           "created_at": {
             "title": "Created At",
@@ -3981,6 +4247,11 @@
             "title": "Created At",
             "type": "string"
           },
+          "historical": {
+            "default": false,
+            "title": "Historical",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -4036,6 +4307,28 @@
           "sequence": {
             "title": "Sequence",
             "type": "integer"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          },
+          "source_work_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Work Id"
           },
           "turn_id": {
             "anyOf": [
@@ -9308,6 +9601,52 @@
           }
         },
         "summary": "Download Channel Artifact",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/jobs": {
+      "get": {
+        "operationId": "channel_jobs_v1_channels__channel_id__jobs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChannelJobOut"
+                  },
+                  "title": "Response Channel Jobs V1 Channels  Channel Id  Jobs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Channel Jobs",
         "tags": [
           "collaboration"
         ]

@@ -46,6 +46,7 @@ from sbxloop.api.collaboration_schemas import (
     BridgePage,
     ChannelArtifactPage,
     ChannelCreate,
+    ChannelJobOut,
     ChannelLinkCreate,
     ChannelLinkOut,
     ChannelLinkPage,
@@ -66,6 +67,7 @@ from sbxloop.api.collaboration_schemas import (
     DetailOut,
     ExternalIdentityOut,
     ExternalIdentityPage,
+    ExternalWorkOut,
     LinkCodeOut,
     LocalLoginRequest,
     LocalRegisterRequest,
@@ -202,6 +204,11 @@ def _channel_out(channel: Channel) -> ChannelOut:
         silenced_until=channel.silenced_until,
         unread_count=channel.unread_count,
         my_role=channel.my_role,
+        external_work=(
+            None
+            if channel.external_work is None
+            else ExternalWorkOut.model_validate(channel.external_work)
+        ),
     )
 
 
@@ -275,6 +282,9 @@ def _work_out(message: Message) -> ChannelWorkOut | None:
 
 
 def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
+    origin = message.origin or {}
+    source_run_id = origin.get("source_run_id")
+    source_work_id = origin.get("source_work_id")
     return MessageOut(
         id=message.id,
         channel_id=message.channel_id,
@@ -291,6 +301,9 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         post_kind=message.post_kind,
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
         origin=_origin_out(message.origin),
+        source_run_id=source_run_id if isinstance(source_run_id, str) else None,
+        source_work_id=source_work_id if isinstance(source_work_id, str) else None,
+        historical=origin.get("historical") is True,
     )
 
 
@@ -927,6 +940,25 @@ async def channel_work(
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return await ctx.call(ctx.project_work, channel_id)
+
+
+@router.get("/channels/{channel_id}/jobs", response_model=list[ChannelJobOut])
+async def channel_jobs(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> list[ChannelJobOut]:
+    from sbxloop.api.external_work import jobs, reconcile
+
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    if ctx.ready.is_set() and not ctx.stopping.is_set():
+        await ctx.call(reconcile, ctx)
+    await ctx.call(ctx.project_work, channel_id)
+    snapshots = await ctx.call(jobs, ctx, channel_id)
+    return [ChannelJobOut.model_validate(snapshot) for snapshot in snapshots]
 
 
 async def _targets(
