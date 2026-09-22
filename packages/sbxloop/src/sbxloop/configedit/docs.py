@@ -111,7 +111,7 @@ def _looks_like_value(value: str) -> bool:
 def doc_lines() -> dict[str, str]:
     """The packaged example's docs, parsed once per process.
 
-    ``[[github.repos]]`` is the legacy spelling of ``[[vcs.repos]]`` (#1283):
+    ``[[github.repos]]`` is the legacy spelling of ``[[vcs.repos]]`` (#2255):
     the example documents the entry once, under the current name, and the
     legacy path reads the same lines."""
     docs = parse(_example_text())

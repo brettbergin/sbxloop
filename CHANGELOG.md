@@ -2,7 +2,7 @@
 
 **A repository is declared under `[[vcs.repos]]`, whatever forge it lives
 on.** The repository list moves from the GitHub section to the forge section
-(#1283): `[[vcs.repos]]` carries the same entries and keys `[[github.repos]]`
+(#2255): `[[vcs.repos]]` carries the same entries and keys `[[github.repos]]`
 did, and `[github]` keeps only the GitHub backend's own settings (where GitHub
 is, naming, identity, reviewers). The legacy spelling, `[[github.repos]]` or a
 single `[github] repo`, still loads, folded into the same list with one notice

@@ -1,5 +1,5 @@
 """``[[vcs.repos]]``: the repositories sbxloop works with are declared under
-the forge section, whatever the forge (#1283).
+the forge section, whatever the forge (#2255).
 
 The contract: ``[[vcs.repos]]`` is the one place a repository is declared;
 ``[[github.repos]]`` and the single ``[github] repo`` are the legacy spelling

@@ -161,7 +161,7 @@ descriptor the worker needs.
 the API root a backend of that kind speaks to, and `sbxloop doctor` prints
 one `vcs backend <kind>` row per forge with each capability's state, or a
 failing row for a kind no backend answers yet. A repository is declared
-under `[[vcs.repos]]`, whatever forge it lives on (#1283); `[github]` keeps
+under `[[vcs.repos]]`, whatever forge it lives on (#2255); `[github]` keeps
 the GitHub backend's own settings, reads as `kind = "github"` when no
 `[vcs]` section names the forge, and still accepts the legacy
 `[[github.repos]]` spelling, which the loader folds into the same list with

@@ -1157,7 +1157,7 @@ class TestSandboxEnv:
                 '[[vcs.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
                 r"\[\[vcs.repos\]\]",
             ),
-            # The legacy spelling is named by the entry's current name (#1283).
+            # The legacy spelling is named by the entry's current name (#2255).
             (
                 '[[github.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
                 r"\[\[vcs.repos\]\]",

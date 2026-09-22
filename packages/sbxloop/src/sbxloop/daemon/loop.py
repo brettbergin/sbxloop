@@ -4381,7 +4381,7 @@ class DaemonLoop:
         )
         update: dict[str, Any] = {
             "github": gh,
-            # The declared list follows the section's view (#1283).
+            # The declared list follows the section's view (#2255).
             "vcs": self.config.vcs.model_copy(update={"repos": list(gh.repos)}),
             "keep_on_failure": False,
         }

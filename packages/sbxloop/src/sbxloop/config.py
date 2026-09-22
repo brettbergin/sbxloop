@@ -990,7 +990,7 @@ def _check_api_root(value: str, key: str, example: str, *, allow_http: bool = Fa
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
-    Declared as ``[[vcs.repos]]`` entries (#1283), whatever forge the
+    Declared as ``[[vcs.repos]]`` entries (#2255), whatever forge the
     repository lives on; ``[[github.repos]]`` is the legacy spelling of the
     same entry. Everything here is per-repo; the daemon-wide guardrails
     (daily run cap, per-item retry cap, the consecutive-failure circuit
@@ -1139,7 +1139,7 @@ class VcsConfig(_ConfigModel):
     repositories themselves.
 
     ``repos`` is where a repository is declared — ``[[vcs.repos]]``, one
-    entry per repository, whatever forge it lives on (#1283). ``kind`` is
+    entry per repository, whatever forge it lives on (#2255). ``kind`` is
     the daemon-wide default forge; an entry may name its own. ``api_url``
     is the forge's API root; for ``github`` it is the same setting as
     ``[github] api_url``, and the two must agree when both are set.
@@ -1202,7 +1202,7 @@ class VcsConfig(_ConfigModel):
 class GithubConfig(_ConfigModel):
     """The GitHub backend's own settings: where GitHub is, how the loop
     names what it writes there, and the identity and reviewers it acts
-    with. A repository is declared under ``[[vcs.repos]]`` (#1283);
+    with. A repository is declared under ``[[vcs.repos]]`` (#2255);
     ``repo`` and ``repos`` here are the legacy spelling of that
     declaration, still accepted, and after loading they are a *view* of the
     declared list that :class:`Config` keeps in step (``repo`` is the first
@@ -3124,7 +3124,7 @@ class Config(_ConfigModel):
 
     @model_validator(mode="after")
     def _fold_repos(self) -> Config:
-        """One repository list, declared under ``[[vcs.repos]]`` (#1283).
+        """One repository list, declared under ``[[vcs.repos]]`` (#2255).
 
         The legacy spelling — ``[[github.repos]]``, or the single
         ``[github] repo`` the GitHub section has already normalised into
@@ -3185,7 +3185,7 @@ class Config(_ConfigModel):
             )
         return self
 
-    # -- the repositories, forge-neutral (#1283) ------------------------------
+    # -- the repositories, forge-neutral (#2255) ------------------------------
     # The declared list is `vcs.repos`; the GitHub section's copies of these
     # answer the same, because `_fold_repos` keeps its view in step. New code
     # reads these; the section's own stay for the callers that predate them.
@@ -4180,7 +4180,7 @@ def load_config_with_sources(
         and not (merged.get("vcs") or {}).get("repos")
     ):
         # The same kind of notice for where the repositories are declared
-        # (#1283): the legacy spelling loads unchanged, and reads as the
+        # (#2255): the legacy spelling loads unchanged, and reads as the
         # forge-neutral one.
         log.info(
             "config.repos_legacy",
