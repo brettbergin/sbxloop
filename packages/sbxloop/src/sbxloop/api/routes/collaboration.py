@@ -100,9 +100,6 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
-#: How long a stop keeps the channel quiet before it lifts on its own; a
-#: person who wants it quiet for longer says so with `silence`.
-STOP_SILENCE_S = 3600.0
 
 PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
@@ -1117,16 +1114,14 @@ async def stop_channel(
     running turns are cancelled, the runs the channel asked for are
     cancelled and the work it queued is abandoned through the daemon's
     control service (scoped to this channel's own work, so a member who
-    may post needs no run control), and the channel is silenced until
-    ``resume`` or a ``silence`` of its own lifts it.
+    may post needs no run control), and the channel is silenced for an
+    hour (``sbxloop.api.context.STOP_SILENCE_S``) until ``resume`` or a
+    ``silence`` of its own lifts it. A ``/stop`` typed in the channel goes
+    through the same :meth:`ApiContext.stop_channel`.
     """
-    until = ctx.clock() + STOP_SILENCE_S
-    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, until, ctx.clock())
-    if channel is None:
+    outcome = await ctx.call(ctx.stop_channel, channel_id, member, principal=auth.principal)
+    if outcome is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    outcome = await ctx.call(
-        ctx.cancel_channel, channel_id, channel.silenced_until, principal=auth.principal
-    )
     return ChannelStopOut.model_validate(outcome)
 
 

@@ -838,7 +838,10 @@ control service with run control scoped to this channel's own work, so a
 plain member who may post stops them too, the audit record names that
 member, and nothing another channel asked for is touched. Gated work and
 work awaiting review is left alone: it already waits on a person, and
-dropping it would discard a finished result.
+dropping it would discard a finished result. A bare `/stop` or `/cancel`
+typed in the channel is this same stop (the turn carrying it is left to
+answer, and its reply names what was cancelled, abandoned and silenced);
+see "Steering and stopping from chat" below.
 Silence quiets the agents without cancelling anything. Channel-level
 permission for stop, resume and silence is **post**, not manage: a person
 watching agents go somewhere they should not is the guard that matters, and
@@ -1169,19 +1172,23 @@ In a channel, `collaboration.mention_steering` means a mention of an agent
 already working live work there is taken as direction for that run instead
 of starting a fresh answer: the turn's `steered_run_id` names the run. The
 mention has to be unambiguous -- one live run in the channel with that agent
-on it -- or it stays an ordinary turn. Stopping stays explicit: `/stop`,
-`/cancel`, or exactly `@agent stop` cancels the channel's runs (that agent's
-alone, for the third), through the same cancel the API's
-`POST /v1/runs/{id}/cancel` uses. A message that merely argues for stopping
-is steering, not a stop.
+on it -- or it stays an ordinary turn. Stopping stays explicit. A bare `/stop` or
+`/cancel` does exactly what `POST /v1/channels/{id}/stop` does: it cancels
+the channel's other turns, cancels the runs the channel asked for, abandons
+the work items it queued that have not started, and silences the channel
+for the same hour; the reply names each run, item and turn it stopped, or
+says nothing was running or queued, and that the channel is quiet. Exactly
+`@agent stop` is narrower: it cancels that agent's runs in the channel and
+nothing else, through the same cancel the API's `POST /v1/runs/{id}/cancel`
+uses. A message that merely argues for stopping is steering, not a stop.
 
 Both act as the person who wrote the message. A steer takes the
 capabilities their workspace role grants (`runs:steer`, which a `member`
 holds). A stop takes the rule `POST /v1/channels/{id}/stop` takes: anyone
-who may post in the channel may stop the runs that channel asked for,
+who may post in the channel may stop the work that channel asked for,
 without `runs:control`, so a plain `member` may stop as well as steer. The
 cancel is recorded in the person's name and reaches only that channel's
-runs; someone who may not post there is told nothing was stopped. Only a
+work; someone who may not post there is told nothing was stopped. Only a
 message the person wrote steers or stops: a turn another agent started
 never does, and an agent reached through another agent's handoff answers
 the request it was handed.
