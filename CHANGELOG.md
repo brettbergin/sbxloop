@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+**Retiring the concierge sandbox no longer stalls every other turn.** When
+a failed turn condemned the concierge box, the last lease to come back
+removed it (two `sbx rm` calls, each up to the settle timeout and longer on
+a host where the backend is wedged) while holding the lease pool's lock, so
+until the removal returned every other turn waiting for a session could not
+even time out, and reads of a lease's generation blocked with it. The lock
+now only moves the pool to the next generation and takes the box's handles;
+the removal runs after it is released. Leases, their timeouts and generation
+reads stay responsive throughout, and the next provision still waits for the
+removal to finish, so the same name is never re-created into a teardown
+still in flight.
+
 **A message typed on a linked chat surface addresses the agents it
 mentions, is authorized by the link alone (live and after a restart), and a
 failure to accept it never posts internal error text to the surface.**
