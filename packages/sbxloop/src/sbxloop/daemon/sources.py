@@ -275,7 +275,7 @@ class GitHubIssueSource:
         self.pid = os.getpid() if pid is None else pid
         self._alive = alive
         self._clock = clock
-        # The repository's own ``labels = [...]`` (``[[github.repos]]``): added
+        # The repository's own ``labels = [...]`` (``[[vcs.repos]]``): added
         # to an issue alongside the in-progress mark when it is claimed. The
         # engine puts the same labels on the pull request it opens.
         self.extra_labels = tuple(extra_labels)

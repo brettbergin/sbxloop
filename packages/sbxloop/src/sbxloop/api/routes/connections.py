@@ -235,9 +235,7 @@ def _record(
     else:
         selected = name in config.vcs_kinds() or config.vcs.kind == name
         active = name in ctx.config.vcs_kinds()
-        present = (selected and bool(config.github.repo or config.github.repos)) or any(
-            provided.values()
-        )
+        present = (selected and config.vcs.enabled) or any(provided.values())
         if name in {"gitlab", "gitea"}:
             present = present or selected
         has_credentials = any(provided.values()) if name == "github" else all(provided.values())

@@ -210,12 +210,12 @@ _REF_REFUSALS: tuple[tuple[str, str], ...] = (
     (
         "branch name",
         "the repository's rules do not admit that branch name — set `[github] "
-        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+        "branch_prefix` (or the [[vcs.repos]] entry's) to a prefix its rulesets allow",
     ),
     (
         "creations being restricted",
         "the repository's rules do not admit that branch name — set `[github] "
-        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+        "branch_prefix` (or the [[vcs.repos]] entry's) to a prefix its rulesets allow",
     ),
 )
 

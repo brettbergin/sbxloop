@@ -2,7 +2,7 @@
 
 Two jobs. The first is **flattening**: the resolved view is one row per
 *leaf*, and everything above a leaf is walked, so the second
-``[[github.repos]]`` entry is ``github.repos[1].repo`` — its own row, its
+``[[vcs.repos]]`` entry is ``vcs.repos[1].repo`` — its own row, its
 own edit — instead of a whole array of tables printed as one unreadable
 blob. A list of scalars (``policy.allow``) stays a single leaf, because
 the useful edit there is the list, not an element of it; an empty table
@@ -71,7 +71,7 @@ def is_model_key(dotted: str) -> bool:
 
 
 def parse_path(dotted: str) -> tuple[PathPart, ...]:
-    """``github.repos[1].repo`` → ``("github", "repos", 1, "repo")``."""
+    """``vcs.repos[1].repo`` → ``("github", "repos", 1, "repo")``."""
     if not dotted.strip():
         raise PathError("empty key")
     parts: list[PathPart] = []
@@ -115,7 +115,7 @@ def ancestors(dotted: str) -> Iterator[str]:
 
 def source_for(dotted: str, sources: Mapping[str, str]) -> str:
     """Which layer supplied ``dotted``. The loader attributes whole
-    containers — a ``[[github.repos]]`` array is one key to it — so a leaf
+    containers — a ``[[vcs.repos]]`` array is one key to it — so a leaf
     inherits the nearest attributed ancestor's layer."""
     for prefix in ancestors(dotted):
         source = sources.get(prefix)

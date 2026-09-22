@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**Every surface reads the repositories from where they are declared, and
+the legacy spelling can be rewritten in place.** Second part of #2255: the
+daemon, the engine, the concierge, the doctor, the console and the CLI read
+the repository list through the forge-neutral accessors instead of the GitHub
+section, so nothing downstream names GitHub for a repository on another
+forge. `sbxloop doctor` names a repository's row by its own forge (`gitlab repo group/project`), `sbxloop config repos` shows each entry's forge and
+token variable, and the console's repository pane addresses entries as
+`vcs.repos[i]`. `sbxloop config migrate` moves `[[github.repos]]` entries, or
+a single `[github] repo` with its delivery settings, under `[[vcs.repos]]`
+with every comment kept and the previous file backed up; a file that declares
+repositories under both is refused, never merged. `sbxloop setup` runs the
+same migration before it writes a repository, so it always writes the current
+spelling. Messages and hints name `[[vcs.repos]]`.
+
 **A repository is declared under `[[vcs.repos]]`, whatever forge it lives
 on.** The repository list moves from the GitHub section to the forge section
 (#2255): `[[vcs.repos]]` carries the same entries and keys `[[github.repos]]`

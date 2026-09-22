@@ -583,7 +583,7 @@ class LoopEngine:
             )
             self._prior = PriorArtifacts(branch=None, pr_number=None)
             return self._drive(run_id, outcome, expects_mount=expects_mount, warm=warm)
-        workspace = self.config.workspace_for_repo(self.config.github.repo)
+        workspace = self.config.workspace_for_repo(self.config.primary_repo)
         self.bus.emit(
             HostEventTypes.RUN_START,
             run_id,
@@ -591,7 +591,7 @@ class LoopEngine:
             seeded=len(tasks or ()),
             workspace=str(workspace) if workspace is not None else None,
             workspace_source=workspace_source
-            or self.config.workspace_source(self.config.github.repo),
+            or self.config.workspace_source(self.config.primary_repo),
         )
         self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
         return self._drive(run_id, outcome, expects_mount=expects_mount, warm=warm)
@@ -820,8 +820,8 @@ class LoopEngine:
         )
         # An override removed from the live config must disappear from the
         # resumed allocation too. The repository's other pinned rules survive.
-        for entry in stored.github.repos:
-            live = current.github.find_repo(entry.repo)
+        for entry in stored.vcs.repos:
+            live = current.find_repo(entry.repo)
             entry.cpus = live.cpus if live is not None else None
             entry.memory = live.memory if live is not None else None
         self.config = stored
@@ -988,7 +988,7 @@ class LoopEngine:
         pair = provisioner.ensure_pair(
             run_id,
             workspace,
-            self.config.github.repo,
+            self.config.primary_repo,
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
@@ -1024,7 +1024,7 @@ class LoopEngine:
                         # Per-job stdin delivery when provisioning chose it;
                         # None keeps the launch exactly as before (#592).
                         job_env=provisioner.job_env(
-                            "agent", self.config.github.repo, sandbox=pair.agent
+                            "agent", self.config.primary_repo, sandbox=pair.agent
                         ),
                     )
                     agent.provider_recovery = provider_recovery
@@ -1040,10 +1040,10 @@ class LoopEngine:
                             # every github op; None under a PAT — and under
                             # stdin delivery, where job_env re-mints per job.
                             credential_refresh=provisioner.gh_refresher(
-                                pair.github, self.config.github.repo
+                                pair.github, self.config.primary_repo
                             ),
                             job_env=provisioner.job_env(
-                                "github", self.config.github.repo, sandbox=pair.github
+                                "github", self.config.primary_repo, sandbox=pair.github
                             ),
                         )
                         if pair.github is not None
@@ -1063,7 +1063,7 @@ class LoopEngine:
                             # passes it, else the in-VM env file.
                             job_env=provisioner.job_env(
                                 "service",
-                                self.config.github.repo,
+                                self.config.primary_repo,
                                 sandbox=pair.service,
                                 credentials=credentials,
                             ),
@@ -1081,7 +1081,7 @@ class LoopEngine:
                             run_id,
                             self.bus,
                             self.config.credentials_named(credentials),
-                            self.config.credentialed_registries_for(self.config.github.repo),
+                            self.config.credentialed_registries_for(self.config.primary_repo),
                             workdir=pair.agent_workdir,
                             workspace=pair.workspace,
                             agent=agent,
@@ -1106,7 +1106,7 @@ class LoopEngine:
                         # `setup_commands` prepare a cloned checkout; a
                         # workload has none to prepare (#755).
                         self._run_setup_commands(run_id, pair, agent)
-                    repo_config = self.config.github.effective_repo(None)
+                    repo_config = self.config.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
                         if github is not None and repo_config is not None
@@ -1156,7 +1156,7 @@ class LoopEngine:
                             self.bus,
                             run_id,
                             pair.agent.name,
-                            repo=self.config.github.repo,
+                            repo=self.config.primary_repo,
                             # A workload's profile bounds its hosts (#758);
                             # a tool's recipe declares them outright.
                             extra_allow=self._profile_egress(kind, run_id),
@@ -1167,7 +1167,7 @@ class LoopEngine:
                         repo=repo_config.repo if ops is not None and repo_config else None,
                         repo_config=repo_config if ops is not None else None,
                         bot_login=(
-                            provisioner.gh_bot_login(self.config.github.repo)
+                            provisioner.gh_bot_login(self.config.primary_repo)
                             if ops is not None
                             else None
                         ),
@@ -1299,7 +1299,7 @@ class LoopEngine:
                 expect_prebaked=prebaked_expected,
                 # The operator's OS packages (#681) beside the toolchains;
                 # a template baked with them makes this a dpkg probe.
-                apt_packages=self.config.apt_packages_for(self.config.github.repo),
+                apt_packages=self.config.apt_packages_for(self.config.primary_repo),
             )
         ]
         if github is not None:
@@ -1313,7 +1313,7 @@ class LoopEngine:
                     extras="",
                     ensure_dev_tools=False,
                     apt_packages=["git"]
-                    if self.config.credentialed_registries_for(self.config.github.repo)
+                    if self.config.credentialed_registries_for(self.config.primary_repo)
                     else [],
                     expect_prebaked=prebaked_expected,
                 )
@@ -1483,7 +1483,7 @@ class LoopEngine:
         before the first phase. A failure raises out of provisioning — the
         sandbox is kept under keep_on_failure like any install failure, and
         the run's events name the command and its output."""
-        commands = self.config.setup_commands_for(self.config.github.repo)
+        commands = self.config.setup_commands_for(self.config.primary_repo)
         if not commands:
             return
         agent.run_setup(commands, run_id=run_id, cwd=pair.agent_workdir)
@@ -1658,7 +1658,7 @@ class LoopEngine:
         configuration (#1015)."""
         from sbxloop.vcs.backends import backend_for
 
-        entry = self.config.github.effective_repo(None)
+        entry = self.config.effective_repo(None)
         kind = self.config.vcs_kind_for(entry.repo if entry is not None else None)
         return backend_for(kind, client, run_id, api_url=self.config.vcs_api_url_for(kind))
 
@@ -1672,7 +1672,7 @@ class LoopEngine:
         whether the repository has Issues enabled (#631), read off the same
         payload; None when there is no repository or the payload did not say.
         """
-        entry = self.config.github.effective_repo(None)
+        entry = self.config.effective_repo(None)
         if ops is None or entry is None:
             return None
         probe = ensure_repository(
@@ -1943,7 +1943,7 @@ class LoopEngine:
         repo = task.spec.needs.repo
         if repo is None:
             return None
-        if self.config.github.effective_repo(repo) is None:
+        if self.config.effective_repo(repo) is None:
             return f"task {task.spec.id} needs repository `{repo}`, which is not configured"
         if not p.pair.mounted:
             return (
@@ -2509,7 +2509,7 @@ class LoopEngine:
                     sink,
                     task_id,
                     None,
-                    f"{self.config.github.repo} has Issues disabled",
+                    f"{self.config.primary_repo} has Issues disabled",
                 )
             elif sink == "pr" and repo_of_task[task_id] is None:
                 refuse(
@@ -2530,7 +2530,7 @@ class LoopEngine:
                     f"workloads.{pname}.repo",
                     f"profile {pname!r} allows none",
                 )
-            elif self.config.github.effective_repo(repo) is None:
+            elif self.config.effective_repo(repo) is None:
                 refuse("repo", repo, task_id, "github.repos", "not a configured repository")
             elif not p.pair.mounted:
                 refuse(
@@ -2598,7 +2598,7 @@ class LoopEngine:
     @property
     def _verify_mode(self) -> VerifyMode:
         """What this run's verify phase and gate decide (#682)."""
-        return self.config.verify_mode_for(self.config.github.repo)
+        return self.config.verify_mode_for(self.config.primary_repo)
 
     def _hint_services(self, run_id: str, workspace: Path | None) -> None:
         """Name the evidence of a service-backed suite (#682) before the plan
@@ -2625,7 +2625,7 @@ class LoopEngine:
                 "the suite may need services the sandbox does not have; `[sandbox] "
                 'verify_mode = "advisory"` reports a failing verify without spending '
                 'the budget on it, `"ci-only"` leaves the judging to the pull request\'s '
-                "checks (a `[[github.repos]]` entry sets either per repository)"
+                "checks (a `[[vcs.repos]]` entry sets either per repository)"
             ),
         )
 
@@ -3388,7 +3388,7 @@ class LoopEngine:
         return title
 
     def _label_pr(self, p: Pipeline, number: int) -> None:
-        """Put the repository's own ``labels`` (``[[github.repos]]``) on the
+        """Put the repository's own ``labels`` (``[[vcs.repos]]``) on the
         pull request the run just opened — the other half of what the config
         promises, the issue half being applied at claim. Best effort: a
         label refusal must not fail a delivery that succeeded."""

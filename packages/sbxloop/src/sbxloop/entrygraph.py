@@ -95,7 +95,7 @@ def resolve_targets(
     """Resolve one selector; no selector means every enabled repository."""
     if sum((repo is not None, url is not None, all_repos)) > 1:
         raise ValueError("choose one of repo, url or all_repos")
-    entries = config.github.enabled_repos()
+    entries = config.enabled_repos()
     if repo is not None:
         match = next((r.repo for r in entries if r.repo.casefold() == repo.casefold()), None)
         if match is None:
@@ -103,7 +103,7 @@ def resolve_targets(
         return [match]
     if url is not None:
         canonical = _public_url(url)
-        for entry in config.github.repo_list():
+        for entry in config.repo_list():
             known = config.clone_url_for_repo(entry.repo)
             if canonical.removesuffix(".git").casefold() == known.casefold():
                 if not entry.enabled:

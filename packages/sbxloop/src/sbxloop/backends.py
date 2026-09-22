@@ -105,7 +105,7 @@ class AgentBackend:
     config-taking accessors below are the only way to read it, so a caller
     without a loaded config cannot name a host that may not be knowable
     without one. ``repo`` is the repository a run acts for: a backend whose
-    endpoint a ``[[github.repos]]`` entry may override answers for that
+    endpoint a ``[[vcs.repos]]`` entry may override answers for that
     repository; the fixed-host backends ignore it.
     """
 

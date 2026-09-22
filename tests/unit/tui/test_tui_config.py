@@ -190,6 +190,27 @@ def test_config_screen_resolves_filters_and_shows_the_policy(
     drive(scenario)
 
 
+def test_the_repository_pane_keys_entries_by_their_current_spelling(
+    seeded: SbxloopHome, hermetic: None
+) -> None:
+    """A repository row is addressed as `vcs.repos[i]` (#2255), whichever
+    spelling the file used, so an edit from the pane lands on the current key."""
+    _seed_config(seeded, '[[github.repos]]\nrepo = "acme/app"\n')
+
+    async def scenario() -> None:
+        app = make_app(seeded, **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
+            assert isinstance(app.screen, ConfigScreen)
+            await _loaded(pilot, app.screen)
+            repos = app.screen.query_one("#repos", ConsoleTable)
+            assert await until(pilot, lambda: repos.row_count == 1)
+            assert [str(key.value) for key in repos.rows] == ["vcs.repos[0]"]
+
+    drive(scenario)
+
+
 def test_config_screen_shows_the_workload_profiles(seeded: SbxloopHome, hermetic: None) -> None:
     """#804: the bounds decide what a workload can do, and the console is
     where an operator looks first — each profile as a card, the stored
@@ -620,11 +641,13 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
             repos.move_cursor(row=1)
             await pilot.press("enter")
             await pilot.pause(0.5)
-            assert screen.filter_text == "github.repos[1]"
+            # The pane addresses the entry by its current key (#2255), whichever
+            # spelling the file used.
+            assert screen.filter_text == "vcs.repos[1]"
             assert screen.query_one("#tabs", TabbedContent).active == "resolved-pane"
             assert 0 < table.row_count < len(screen.flat)
 
-            await _open_key(pilot, screen, "github.repos[1].deliver_base")
+            await _open_key(pilot, screen, "vcs.repos[1].deliver_base")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -632,7 +655,10 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
             await pilot.press("enter")
             await pilot.pause(2.0)
             saved = _config_text(seeded)
-            assert saved.count("[[github.repos]]") == 2
+            # The edit lands under the current key: a file still on the
+            # legacy spelling is migrated first, every entry moved, so the
+            # loader never sees two lists.
+            assert saved.count("[[vcs.repos]]") == 2 and "[[github.repos]]" not in saved
             assert 'repo = "o/s"\ndeliver_base = "develop"' in saved
             assert 'repo = "o/r"\n' in saved, "the other entry is untouched"
 

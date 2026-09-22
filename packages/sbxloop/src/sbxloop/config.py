@@ -1165,6 +1165,12 @@ class VcsConfig(_ConfigModel):
     def _check_kind(cls, value: object) -> VcsKind:
         return _check_vcs_kind(value, "vcs.kind")
 
+    @property
+    def enabled(self) -> bool:
+        """Whether a repository is declared at all — the forge is on (#2255).
+        The GitHub section's ``enabled`` answers the same."""
+        return bool(self.repos)
+
     @field_validator("repos")
     @classmethod
     def _check_repos(cls, value: list[RepoConfig]) -> list[RepoConfig]:

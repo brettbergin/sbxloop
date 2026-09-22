@@ -17,7 +17,7 @@ class ModelSelection:
 
 def run_model_repo(config: Config) -> str | None:
     """Keep repo-less workloads separate from the daemon's default delivery repo."""
-    return config.github.repo if config.run_model_repo is None else config.run_model_repo or None
+    return config.primary_repo if config.run_model_repo is None else config.run_model_repo or None
 
 
 def model_for_phase(
@@ -44,7 +44,7 @@ def model_for_phase(
     if config.run_model_override is not None:
         return ModelSelection(config.run_model_override, "--model")
     if repo is not None:
-        for entry in config.github.repos:
+        for entry in config.vcs.repos:
             if entry.repo.casefold() == repo.casefold():
                 value = getattr(entry.agent_models, phase)
                 if value is not None:
@@ -76,12 +76,12 @@ def refreshed_models(config: Config) -> Config:
             "the agent backend changed; live refresh supports models only. "
             "Restore the run's backend or start a new run with the new backend"
         )
-    overrides = {entry.repo.casefold(): entry.agent_models for entry in live.github.repos}
+    overrides = {entry.repo.casefold(): entry.agent_models for entry in live.vcs.repos}
     repos = [
         entry.model_copy(
             update={"agent_models": overrides.get(entry.repo.casefold(), AgentModels())}
         )
-        for entry in config.github.repos
+        for entry in config.vcs.repos
     ]
     return config.with_github(config.github.model_copy(update={"repos": repos})).model_copy(
         update={

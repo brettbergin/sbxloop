@@ -135,7 +135,7 @@ def bake_template(
                 extras=config.agent.backend,
                 ensure_dev_tools=True,
                 languages=languages,
-                # The global list only: a `[[github.repos]]` override is
+                # The global list only: a `[[vcs.repos]]` override is
                 # paid at that repository's provision (#681).
                 # Archive extraction must work even when a later run adds
                 # a language that was not selected for this bake.

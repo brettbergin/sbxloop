@@ -1136,9 +1136,9 @@ class Concierge:
 
     def _repo_label(self) -> str:
         """How the tool descriptions name the repositories they act on."""
-        repos = [r.repo for r in self.config.github.repo_list() if r.enabled]
+        repos = [r.repo for r in self.config.repo_list() if r.enabled]
         if not repos:
-            return self.config.github.repo or "(no GitHub repository configured)"
+            return self.config.primary_repo or "(no GitHub repository configured)"
         if len(repos) == 1:
             return repos[0]
         return "the configured repositories (" + ", ".join(repos) + ")"
@@ -1152,7 +1152,7 @@ class Concierge:
                     health[str(row["repo"]).casefold()] = row
         except Exception:  # the listing must not depend on the loop answering
             health = {}
-        for entry in self.config.github.repo_list():
+        for entry in self.config.repo_list():
             base = entry.deliver_base or "(repo default)"
             state = "enabled" if entry.enabled else "disabled"
             trigger = self.config.labels_for(entry.repo).trigger
@@ -1766,7 +1766,7 @@ class Concierge:
                     self._tool_set_config,
                 ),
             ]
-        if self.config.github.repo_list():
+        if self.config.repo_list():
             tools.append(
                 HostTool(
                     HostToolSpec(
@@ -1783,7 +1783,7 @@ class Concierge:
                     self._tool_list_repos,
                 )
             )
-        if self.github is not None and self.config.github.repo:
+        if self.github is not None and self.config.primary_repo:
             tools.append(
                 HostTool(
                     HostToolSpec(
@@ -1842,7 +1842,7 @@ class Concierge:
             )
         if (
             self.github is not None
-            and self.config.github.repo
+            and self.config.primary_repo
             and self.config.concierge.create_issues
         ):
             trigger = self.config.daemon.trigger_label
@@ -2478,7 +2478,7 @@ class Concierge:
             if existing is not None:
                 lines.append(f"`{item_id}` already exists ({existing.state}) for {target}.")
                 continue
-            entry = self.config.github.find_repo(target)
+            entry = self.config.find_repo(target)
             title = f"Run entrygraph against {target}"
             item = WorkItem(
                 item_id=item_id,
@@ -2582,13 +2582,13 @@ class Concierge:
         prefix = str(args.get("prefix") or "").strip().strip(".")
         if not selector:
             return prefix or None, None
-        entry = self.config.github.find_repo(selector)
+        entry = self.config.find_repo(selector)
         if entry is None:
-            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "(none)"
+            known = ", ".join(r.repo for r in self.config.repo_list()) or "(none)"
             return None, f"unknown repository {selector!r} — configured repositories: {known}"
         index = next(
             i
-            for i, candidate in enumerate(self.config.github.repo_list())
+            for i, candidate in enumerate(self.config.repo_list())
             if candidate.repo.casefold() == entry.repo.casefold()
         )
         base = f"github.repos[{index}]"
@@ -2731,7 +2731,7 @@ class Concierge:
         return text
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
-        entries = self.config.github.repo_list()
+        entries = self.config.repo_list()
         if not entries:
             return "no GitHub repository is configured — this daemon runs nothing on GitHub."
         lines = [f"{len(entries)} configured repository(ies):"]

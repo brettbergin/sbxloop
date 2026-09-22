@@ -541,7 +541,7 @@ class DaemonLoop:
         standing in for an item that names none."""
         repo = self._item_repo(item)
         if repo is None:
-            default = self.config.github.default_repo()
+            default = self.config.default_repo()
             repo = default.repo if default is not None else None
         return repo
 
@@ -3140,7 +3140,7 @@ class DaemonLoop:
         # `[github]` says — there is no pull request to merge.
         workload = item.kind != "code"
         landed = state == "merged" or (
-            state == "completed" and (workload or not self.config.github.enabled)
+            state == "completed" and (workload or not self.config.vcs.enabled)
         )
         self._resolve_publish_gate(item, run_id, released=landed, now=now, state=state)
         if landed:
@@ -3178,7 +3178,7 @@ class DaemonLoop:
                 attempt=item.attempts,
             )
             return "done"
-        if state == "blocked" or (state == "completed" and self.config.github.enabled):
+        if state == "blocked" or (state == "completed" and self.config.vcs.enabled):
             reason = (
                 (result.reason if result is not None else None)
                 or ("run ended completed without landing" if state == "completed" else None)
@@ -3368,7 +3368,7 @@ class DaemonLoop:
         self.dstore.create_merge_gate(
             run_id,
             item.item_id,
-            item.repo or self.config.github.repo or "",
+            item.repo or self.config.primary_repo or "",
             pr_number,
             pr_url,
             record.branch if record is not None else report.branch,
@@ -3496,7 +3496,7 @@ class DaemonLoop:
             self._deliver_report(fresh)
             self._frontend_finished(item, report)
             return "blocked"
-        repo = item.repo or self.config.github.repo or ""
+        repo = item.repo or self.config.primary_repo or ""
         # What the base wants, from the run's own record of the park — or,
         # a person's draft hold (#677), what they want: the PR marked
         # ready, no approval count.
@@ -3592,7 +3592,7 @@ class DaemonLoop:
         for who in [
             item.requested_by,
             *self.dstore.run_watchers(run_id),
-            *self.config.review_notify_for(item.repo or self.config.github.repo or ""),
+            *self.config.review_notify_for(item.repo or self.config.primary_repo or ""),
         ]:
             if who and who not in notify:
                 notify.append(who)
@@ -4344,7 +4344,7 @@ class DaemonLoop:
         if repo is None:
             parsed = try_parse_gh_id(item.item_id)
             repo = parsed.repo if parsed is not None else None
-        if repo is not None and self.config.github.find_repo(repo) is None:
+        if repo is not None and self.config.find_repo(repo) is None:
             log.warning("run.unknown_item_repo", item=item.item_id, repo=repo)
             return None
         return repo
@@ -4524,9 +4524,9 @@ class DaemonLoop:
         """
         resolved = repo
         if resolved is None:
-            default = self.config.github.default_repo()
+            default = self.config.default_repo()
             resolved = default.repo if default is not None else None
-            if resolved is None and self.config.github.enabled_repos():
+            if resolved is None and self.config.enabled_repos():
                 log.info(
                     "workspace.refresh_skipped",
                     reason="the item names no repository and several are configured",
@@ -4644,9 +4644,8 @@ class DaemonLoop:
         body = _MARKER_RE.sub("", item.body).strip()
         if body:
             parts.append(body)
-        origin = (
-            f"GitHub issue #{item.source_key} in {self._item_repo(item) or self.config.github.repo}"
-        )
+        where = self._item_repo(item) or self.config.primary_repo
+        origin = f"GitHub issue #{item.source_key} in {where}"
         if item.url:
             origin += f" ({item.url})"
         provenance = f"---\nThis work item came from: {origin}."
@@ -4684,7 +4683,7 @@ class DaemonLoop:
         marker-stamped comments are left out."""
         if self.github is None:
             return UNKNOWN_IDENTITY
-        repo = self._item_repo(item) or self.config.github.repo
+        repo = self._item_repo(item) or self.config.primary_repo
         if repo is None:
             return UNKNOWN_IDENTITY
         try:
@@ -5248,8 +5247,8 @@ class DaemonLoop:
     def _any_credentialed_registries(self) -> bool:
         """Whether any repo this daemon runs for fetches through a service
         sandbox (#766)."""
-        repos: list[str | None] = [r.repo for r in self.config.github.repos] or [
-            self.config.github.repo
+        repos: list[str | None] = [r.repo for r in self.config.vcs.repos] or [
+            self.config.primary_repo
         ]
         return any(self.config.credentialed_registries_for(repo) for repo in repos)
 

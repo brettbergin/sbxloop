@@ -117,7 +117,7 @@ def registry_for(config: Config) -> WarmRegistry:
 
 def warm_fingerprint(config: Config, *, sbx_version: str | None = None) -> str:
     """What shaped a warm set; a set from another shape is never handed out."""
-    repo = config.github.repo
+    repo = config.primary_repo
     parts = {
         "sbxloop": sbxloop.__version__,
         "sbx": sbx_version,
@@ -127,7 +127,7 @@ def warm_fingerprint(config: Config, *, sbx_version: str | None = None) -> str:
         "apt_packages": sorted(config.apt_packages_for(repo)),
         "agent": config.sandbox_resources_for("agent", repo).model_dump(mode="json"),
         "github": config.sandbox_resources_for("github").model_dump(mode="json"),
-        "github_enabled": config.github.enabled,
+        "github_enabled": config.vcs.enabled,
         "forge": config.vcs_kind_for(repo),
         "secret_strategy": config.secret_strategy,
         "transport": config.worker_transport,
@@ -215,7 +215,7 @@ class Warmer:
             pair = provisioner._provision_pair(
                 run_id,
                 workspace,
-                self.config.github.repo,
+                self.config.primary_repo,
                 languages=languages,
                 expects_mount=False,
                 kind="code",
@@ -259,7 +259,7 @@ class Warmer:
     ) -> None:
         """The engine's own install step (`_install_workers`), so a run that
         claims the set finds exactly what it would have installed."""
-        repo = self.config.github.repo
+        repo = self.config.primary_repo
         prebaked = bool(self.config.sandbox.template)
         python = self.worker_python or DEFAULT_PYTHON
         agent = WorkerClient(

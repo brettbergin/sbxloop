@@ -150,7 +150,7 @@ class Views:
         resolved = self.ids.resolve(public_id)
         if resolved is None or resolved.kind != "repository":
             raise not_found()
-        entry = self.config.github.find_repo(resolved.key)
+        entry = self.config.find_repo(resolved.key)
         if entry is None:
             raise not_found()
         return entry
@@ -457,7 +457,7 @@ class Views:
     # -- the catalog ---------------------------------------------------------------
 
     def repositories(self) -> list[Repository]:
-        entries = list(self.config.github.repo_list())
+        entries = list(self.config.repo_list())
         ids = self.ids.repository_ids([e.repo for e in entries], self.now) if entries else {}
         health = {
             str(h["repo"]): h

@@ -1415,7 +1415,7 @@ class PhaseRunner:
                 "verify commands violate the sandbox's toolchain conventions:\n"
                 + "\n".join(problems)
             )
-        allow, deny = effective_egress_bounds(self.config, self.config.github.repo)
+        allow, deny = effective_egress_bounds(self.config, self.config.primary_repo)
         egress_problems = [
             f"- task {task.id}: {egress.domain}: {rejection}"
             for task in graph.tasks

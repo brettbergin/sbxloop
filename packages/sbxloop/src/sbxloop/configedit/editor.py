@@ -146,7 +146,9 @@ class ConfigEditor:
         return self._row(key, flat, sources, self.file_text())
 
     def _row(self, key: str, flat: Mapping[str, Any], sources: Mapping[str, str], text: str) -> Row:
-        _, in_file = configtoml.file_value(text, configkeys.parse_path(key))
+        parts = configkeys.parse_path(key)
+        text, _moved = self._current_spelling(text, parts)
+        _, in_file = configtoml.file_value(text, parts)
         return Row(
             key=key,
             value=flat.get(key),
@@ -181,15 +183,25 @@ class ConfigEditor:
             raise ConfigEditError(f"{change.key}: {change.verdict.text}")
         return save_text(self.path, change.text, now=now)
 
+    @staticmethod
+    def _current_spelling(
+        text: str, parts: tuple[configkeys.PathPart, ...]
+    ) -> tuple[str, list[str]]:
+        """A write under ``vcs.repos`` lands on the current spelling: a file
+        still on ``[[github.repos]]`` is migrated first (#2255), see
+        :func:`sbxloop.configedit.toml.current_spelling`."""
+        return configtoml.current_spelling(text, parts)
+
     def _change(self, key: str, value: Any, *, unset: bool) -> Change:
         parts = configkeys.parse_path(key)
         current = self.file_text()
-        old, _ = configtoml.file_value(current, parts)
+        base, moved = self._current_spelling(current, parts)
+        old, _ = configtoml.file_value(base, parts)
         try:
             text = (
-                configtoml.unset_value(current, parts)
+                configtoml.unset_value(base, parts)
                 if unset
-                else configtoml.set_value(current, parts, value)
+                else configtoml.set_value(base, parts, value)
             )
         except ValueError as exc:
             raise ConfigEditError(f"{key}: {exc}") from None
@@ -199,6 +211,12 @@ class ConfigEditor:
         note, level = (
             answered_by(key, verdict, unset=unset) if verdict.ok else (None, "information")
         )
+        if moved and verdict.ok:
+            migration = (
+                f"the file's legacy repository entries ({', '.join(moved)}) were moved "
+                "under [[vcs.repos]], comments kept"
+            )
+            note = f"{note}; {migration}" if note else migration
         return Change(
             key=key,
             text=text,

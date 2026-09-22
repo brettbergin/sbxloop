@@ -137,7 +137,7 @@ def harness_context(config: Config, *, role: Role) -> str:
     a worker or a model.
     """
     parts = [_HEAD, _TAILS[role]]
-    if role == "planner" and config.github.repo is not None:
+    if role == "planner" and config.primary_repo is not None:
         parts.append(_LANDS_AS_PR)
     return "\n".join(part.rstrip() for part in parts) + "\n"
 

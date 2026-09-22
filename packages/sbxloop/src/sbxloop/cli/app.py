@@ -201,9 +201,9 @@ def _resolve_run_workspace(
         if not chosen.is_dir():
             raise SbxloopError(f"{chosen} is not a directory")
         return _pin_workspace(config, chosen.resolve()), chosen.resolve(), "--workspace"
-    source = config.workspace_source(config.github.repo)
+    source = config.workspace_source(config.primary_repo)
     if source == "configured":
-        return config, config.workspace_for_repo(config.github.repo), source
+        return config, config.workspace_for_repo(config.primary_repo), source
     if source == "remote":
         # Configured for some other repository: the provisioner clones this
         # one from its remote rather than borrowing that checkout.
@@ -245,15 +245,15 @@ def _resolve_repo(config: Config, selector: str | None) -> RepoConfig:
     with nothing to choose between them — is a clear CLI error rather than a
     silent pick of the first entry.
     """
-    entries = config.github.repo_list()
+    entries = config.repo_list()
     if not entries:
         console.print(
-            "[bold red]no GitHub repository is configured.[/] Add "
-            '[cyan]\\[github] repo = "owner/name"[/] or a [cyan]\\[\\[github.repos]][/] '
-            "entry to sbxloop.toml, or pass [cyan]--repo owner/name[/]."
+            "[bold red]no repository is configured.[/] Add a "
+            "[cyan]\\[\\[vcs.repos]][/] entry to sbxloop.toml, or pass "
+            "[cyan]--repo owner/name[/]."
         )
         raise typer.Exit(2)
-    entry = config.github.find_repo(selector)
+    entry = config.find_repo(selector)
     if entry is not None:
         return entry
     known = ", ".join(r.repo for r in entries)
@@ -563,7 +563,7 @@ def _print_github_summary(result: RunResult, config: Config) -> None:
     if not repo and not result.pr_url:
         return
     suffix = " [dim](created this run)[/]" if created else ""
-    console.print(f"\ngithub: [bold]{repo or config.github.repo}[/]{suffix}")
+    console.print(f"\ngithub: [bold]{repo or config.primary_repo}[/]{suffix}")
     for line in lines:
         console.print(f"  {line}")
 
@@ -888,7 +888,7 @@ def run(
             if "repo" in github_overrides:
                 # --repo names the one repository this run targets, replacing
                 # any configured repo list — unless it selects one of them.
-                selected = config.github.find_repo(repo)
+                selected = config.find_repo(repo)
                 if selected is not None:
                     github_overrides["repo"] = selected.repo
                     base["repos"] = [selected.model_dump()]
@@ -904,7 +904,7 @@ def run(
         # default to the sole enabled repo, else make the operator choose.
         entry = _resolve_repo(config, None)
         config = config.for_repo(entry.repo, workspace=config.workspace_for_repo(entry.repo))
-    if (deliver_base or create_repo or create_public) and not config.github.enabled:
+    if (deliver_base or create_repo or create_public) and not config.vcs.enabled:
         console.print(
             "[bold red]GitHub integration is not configured.[/] Those options need a "
             "repository: pass [cyan]--repo owner/repo[/] or set "
@@ -921,7 +921,7 @@ def run(
         console.print(f"workspace: {chosen} ({_WORKSPACE_SOURCE_TEXT[source]})")
     elif source == "remote":
         console.print(
-            f"workspace: a fresh clone of {config.github.repo} (the configured checkout "
+            f"workspace: a fresh clone of {config.primary_repo} (the configured checkout "
             "belongs to another repository)"
         )
     else:
@@ -1901,26 +1901,58 @@ def config_repos(
 ) -> None:
     """List the configured repositories with their enabled state and base branch."""
     config = load_config()
-    entries = [_resolve_repo(config, repo)] if repo is not None else config.github.repo_list()
+    entries = [_resolve_repo(config, repo)] if repo is not None else config.repo_list()
     if not entries:
         console.print(
-            "no GitHub repository configured — add [cyan]\\[github] repo[/] or "
-            "[cyan]\\[\\[github.repos]][/] to sbxloop.toml"
+            "no repository configured — add a [cyan]\\[\\[vcs.repos]][/] entry to sbxloop.toml"
         )
         return
     table = Table(title="sbxloop repositories")
-    for col in ("repo", "enabled", "base", "token env", "trigger label"):
+    for col in ("repo", "forge", "enabled", "base", "token env", "trigger label"):
         table.add_column(col)
     for entry in entries:
-        effective = config.github.effective_repo(entry.repo) or entry
+        effective = config.effective_repo(entry.repo) or entry
         table.add_row(
             entry.repo,
+            config.vcs_kind_for(entry.repo),
             "yes" if entry.enabled else "no",
             effective.deliver_base or "(repo default)",
-            entry.token_env or "GH_TOKEN",
+            config.vcs_token_env_for(entry.repo) or "GH_TOKEN",
             config.labels_for(entry.repo).trigger,
         )
     console.print(table)
+
+
+@config_app.command("migrate")
+def config_migrate() -> None:
+    """Rewrite the legacy [[vcs.repos]] (or [github] repo) declaration as
+    [[vcs.repos]] in the home's config/sbxloop.toml, every comment kept.
+
+    The file still loads either way; this moves it to the current spelling.
+    The previous file is kept as a backup."""
+    from sbxloop.configedit.edit import save_text, validate_text
+    from sbxloop.configedit.toml import ConfigWriteError, migrate_repos
+
+    editor = _config_editor()
+    before = editor.file_text()
+    try:
+        after, moved = migrate_repos(before)
+    except ConfigWriteError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not moved or after == before:
+        console.print("nothing to migrate: the repositories are declared under [[vcs.repos]]")
+        return
+    verdict = validate_text(after, home=editor.home, env=editor.env)
+    if not verdict.ok:
+        console.print(f"[bold red]the migrated file does not load:[/] {verdict.error}")
+        raise typer.Exit(2)
+    backup = save_text(editor.path, after)
+    console.print(f"moved under [[vcs.repos]]: {', '.join(moved)}")
+    console.print(
+        f"wrote {editor.path}" + (f" (previous file kept as {backup.name})" if backup else "")
+    )
+    console.print("the daemon reads it at its next start: restart to apply")
 
 
 @config_app.command("policy")
@@ -2371,7 +2403,7 @@ def init_repo_command(
     """Create the labels sbxloop relies on in a repository (idempotent).
 
     The seven lifecycle labels (with this repository's renames from
-    `[[github.repos]]` applied) and the follow-up label, each with a color
+    `[[vcs.repos]]` applied) and the follow-up label, each with a color
     and a description; existing labels are left alone. Boots one github-ops
     sandbox for the writes, as `doctor --probe` does.
     """
@@ -2551,11 +2583,11 @@ def daemon(
     # backend and no `[github]` runs on those alone.
     # (`--once` skips the concierge but still runs what one already queued.)
     chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
-    if config.github.enabled and not config.github.enabled_repos():
+    if config.vcs.enabled and not config.enabled_repos():
         log.error(
             "daemon.no_enabled_repository",
             hint="every configured repository is disabled — set enabled = true on at "
-            "least one [[github.repos]] entry",
+            "least one [[vcs.repos]] entry",
         )
         raise typer.Exit(2)
 
@@ -2585,14 +2617,14 @@ def daemon(
     # Schedules live in the store (#818): a daemon with stored schedules
     # and nothing else is a valid daemon, as one with `[[schedules]]` was.
     if (
-        not config.github.enabled
+        not config.vcs.enabled
         and not chat_intake
         and not config.schedules
         and not dstore.schedules()
     ):
         log.error(
             "daemon.no_repository",
-            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
+            hint="set --repo owner/name (or a [[vcs.repos]] entry): the "
             "daemon's work is the labeled issues of the configured repositories — or "
             "configure a chat backend with the concierge on, and workloads asked for "
             "in chat are its work — or create a schedule (`sbxloop daemon ctl schedules "
@@ -2605,7 +2637,7 @@ def daemon(
     # attribute them to, so the non-terminal ones are dropped instead of
     # left to double-queue or mis-route; the next poll re-creates them
     # repo-qualified against the repository they actually came from.
-    configured = config.github.repo_list()
+    configured = config.repo_list()
     stranded: list[WorkItem] = []
     if len(configured) == 1:
         dstore.backfill_repo(configured[0].repo)
@@ -2657,7 +2689,7 @@ def daemon(
     dstore.clear_prefix(REPO_HEALTH_KEY)
     github: DaemonGithub | None = None
     source: WorkSource
-    if config.github.enabled:
+    if config.vcs.enabled:
         github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
         labels = GitHubLabels(
             config.daemon.trigger_label,
@@ -2677,7 +2709,7 @@ def daemon(
         # stay global across all of them.
         source = build_github_source(
             github.ops,
-            config.github.enabled_repos(),
+            config.enabled_repos(),
             labels,
             on_failure=github.note_failure,
             stale_after_s=config.daemon.claim_stale_after_s,
@@ -2707,8 +2739,8 @@ def daemon(
         pid=os.getpid(),
         home=str(config.home),
         archived_state=str(archived) if archived else None,
-        repo=config.github.repo,
-        repos=[r.repo for r in config.github.enabled_repos()],
+        repo=config.primary_repo,
+        repos=[r.repo for r in config.enabled_repos()],
         source=source.name,
         trigger_label=config.daemon.trigger_label,
         workload_label=config.daemon.workload_label,
