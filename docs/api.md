@@ -882,8 +882,11 @@ it does run. Commands on the control channel, run-thread steering and an
 unlinked surface behave exactly as they did. Every message appended to the
 channel — a person's, an agent's, a run's delivery, a failed turn's error,
 one agent's request to another — is posted back to each linked surface
-under a `**name**` header, except to the surface it arrived on, so two
-linked services mirror each other without a loop.
+under a `**name**` header, except to the link it arrived through, so two
+linked services mirror each other without a loop. A message that itself
+came in over a bridge is mirrored under `**name (via slack)**`, and a
+guest's under `**name (guest, via slack)**`: a guest's name is their own
+claim, not a member's.
 
 A message that arrived over a bridge carries `origin`:
 
@@ -891,6 +894,7 @@ A message that arrived over a bridge carries `origin`:
 { "backend": "discord", "surface_id": "C123", "external_message_id": "998" }
 ```
 
+`thread_id` is set as well when it came in through a link to one thread.
 Angie shows it as a "via" badge; it is `null` for everything typed here.
 
 Who somebody is on a bridge is theirs to prove, once:
