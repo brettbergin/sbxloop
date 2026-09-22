@@ -4674,26 +4674,33 @@ class DaemonLoop:
         stays keyed on the item's own repository; a repo-less item never
         starts one.
 
-        On a daemon with several repositories a repo-less item refreshes
-        nothing: no repository means no credential, and the checkout would
-        otherwise fall back to the primary repository's, fetched anonymously
-        -- a private forge answered with a username prompt and every chat ask
-        or scheduled workload posted a refresh failure.
+        On a daemon with several repositories, or with every repository
+        disabled, a repo-less item refreshes nothing: no sole enabled
+        repository means no credential, and the checkout would otherwise
+        fall back to the primary repository's, fetched anonymously -- a
+        private forge answered with a username prompt and every chat ask or
+        scheduled workload posted a refresh failure. Only a daemon that
+        declares no repository at all falls through to the legacy
+        daemon-wide workspace.
+
+        Only a live *code* run holds the checkout still: a workload or tool
+        run works from its own data directory, never from the checkout, so
+        a code run admitted beside one still refreshes.
         """
         resolved = repo
         if resolved is None:
             default = self.config.default_repo()
             resolved = default.repo if default is not None else None
-            if resolved is None and self.config.enabled_repos():
+            if resolved is None and self.config.repo_list():
                 log.info(
                     "workspace.refresh_skipped",
-                    reason="the item names no repository and several are configured",
+                    reason="the item names no repository and none is the sole enabled one",
                 )
                 return
-        if resolved is not None and resolved in self._live_repos():
-            # Another run is working from this checkout right now: moving
-            # it under that run's feet is not ours to do. The next run
-            # started with the repository free refreshes it.
+        if resolved is not None and resolved in self._live_repos(code_only=True):
+            # Another code run is cloning from this checkout right now:
+            # moving it under that run's feet is not ours to do. The next
+            # run started with the repository free refreshes it.
             log.info(
                 "workspace.refresh_skipped",
                 repo=resolved,

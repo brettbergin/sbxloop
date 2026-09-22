@@ -12,6 +12,25 @@ reads stay responsive throughout, and the next provision still waits for the
 removal to finish, so the same name is never re-created into a teardown
 still in flight.
 
+**A code run always starts from a fresh checkout unless another code run
+on the same repository is live, and a daemon with every repository
+disabled never refreshes a checkout for a repo-less item.** With
+`max_concurrent_runs` above one, a code run admitted while a workload on
+the same repository was in flight skipped its pre-launch refresh: the
+skip counted every live run that named the repository, though a workload
+or tool run works from its own data directory and never from the
+checkout. The code run cloned a stale HEAD, redid work already merged and
+opened pull requests that conflicted with the current base. Only a live
+code run holds the checkout still now. Separately, an operator who paused
+issue polling by disabling every repository while keeping chat asks and
+scheduled workloads running found each such item fetching the first
+repository's checkout anonymously: the guard that keeps a repo-less item
+off the primary checkout fired only with an enabled repository, so a
+private forge answered every ask with a username prompt posted as a
+refresh warning. The guard now fires whenever a repository is declared at
+all; only a daemon with none falls through to the legacy daemon-wide
+workspace.
+
 **A message typed on a linked chat surface addresses the agents it
 mentions, is authorized by the link alone (live and after a restart), and a
 failure to accept it never posts internal error text to the surface.**
