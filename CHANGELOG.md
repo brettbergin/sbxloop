@@ -24,6 +24,23 @@ answered; the prefilter now reads the new message alone (the classifier
 still reads the window) and classification runs after the addressed agents
 have answered, so it never holds up the person's turn.
 
+**Leaving the workspace ends every standing a member had.** Removing or
+deactivating a member deleted their workspace row and nothing else: they
+stayed in every channel, so a later invite handed back every private channel
+they had been in, a channel could lose its last active owner because a
+departed owner still counted as one, and `GET /v1/channels/{id}/members`
+kept listing them. Their invites outlived them too: an admin removed from
+the workspace, or an owner demoted, left invites behind that still admitted
+new members at the invite's full role. Now removal and deactivation take the
+user out of every channel in the same transaction (the longest-standing
+member still in the workspace takes over a channel they were the last owner
+of; a channel nobody else was in is left without a member), the last-owner
+rules count only members still active in the workspace, the unused invites
+the user created are withdrawn (a demotion withdraws those above the new
+role), each as a `workspace.invite.revoked` event with a `reason`, and an
+invite whose creator is no longer an active member admits nobody while one
+above its creator's current role grants that role instead.
+
 **A member removed from the workspace receives nothing further on an open
 event stream.** The SSE stream and the WebSocket re-check their token every
 minute and re-read the member behind it; a removed member's access token
