@@ -326,7 +326,13 @@ class TestStopFromChat:
         silenced = api.client.get(f"/v1/channels/{channel}", headers=headers).json()
         assert silenced["silenced_until"] == api.clock() + 3600.0
         assert len(concierge.calls) == 1
-        (reply,) = [m for m in _replies(api, headers, channel) if m["turn_id"] == done["id"]]
+        # The stop's own answer: the abandon also posts the item's result
+        # to the channel, which hangs on whichever turn asked for the item.
+        (reply,) = [
+            m
+            for m in _replies(api, headers, channel)
+            if m["turn_id"] == done["id"] and m["kind"] == "message"
+        ]
         assert "Stopping `r1`" in reply["content"]
         assert "`gh:issue:2`" in reply["content"]
         assert "quiet" in reply["content"]
