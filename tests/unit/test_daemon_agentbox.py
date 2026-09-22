@@ -620,7 +620,7 @@ def run_in_thread(fn: Callable[[], object]) -> tuple[threading.Thread, list[obje
     def target() -> None:
         try:
             outcome.append(fn())
-        except BaseException as exc:  # noqa: BLE001 - the test inspects it
+        except BaseException as exc:
             outcome.append(exc)
 
     thread = threading.Thread(target=target, daemon=True)
