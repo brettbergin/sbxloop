@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import Depends, Request
 from sqlalchemy.exc import SQLAlchemyError
 
-from sbxloop.api.auth.store import Client
+from sbxloop.api.auth.store import AuthError, Client
 from sbxloop.api.auth.tokens import AccessClaims, TokenError, verify_access
 from sbxloop.api.collaboration import Member
 from sbxloop.api.context import ApiContext
@@ -37,8 +37,8 @@ class Authenticated:
     #: on a schedule and closes when it no longer stands.
     token: str = ""
     #: The workspace member the client belongs to. ``None`` for a plain API
-    #: client with no local user (or a user no longer in the workspace);
-    #: such a client keeps the reach its capabilities give it.
+    #: client with no local user; such a client keeps its capability grant.
+    #: Removed or inactive human users are refused rather than becoming clients.
     member: Member | None = None
 
 
@@ -81,6 +81,16 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
     client = ctx.auth.get_client(claims.client_id)
     if client is None or not client.active:
         raise Problem(401, "client_revoked", "the client was revoked")
+    try:
+        ctx.auth.check_session(
+            client.id,
+            claims.session_id,
+            now,
+            local_auth_enabled=ctx.api.local_auth_enabled,
+            oidc_issuer=ctx.api.oidc.issuer if ctx.api.oidc.enabled else "",
+        )
+    except AuthError as exc:
+        raise Problem(401, exc.code, exc.message) from exc
     # The token's scope, narrowed by what the client still holds: a grant
     # taken away since the token was minted is gone at once.
     capabilities = claims.scope & client.capabilities

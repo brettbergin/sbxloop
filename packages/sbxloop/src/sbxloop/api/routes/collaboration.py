@@ -401,6 +401,8 @@ async def register_local(
     body: LocalRegisterRequest,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
 ) -> TokenResponse:
+    if not ctx.api.local_auth_enabled:
+        raise Problem(403, "local_auth_disabled", "sign in through the identity provider")
     try:
         user = await ctx.call(
             ctx.collaboration.register_user,
@@ -425,6 +427,8 @@ async def login_local(
     request: Request,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
 ) -> TokenResponse:
+    if not ctx.api.local_auth_enabled:
+        raise Problem(403, "local_auth_disabled", "sign in through the identity provider")
     address = request.client.host if request.client else "unknown"
     keys = [f"local-user:{body.username}", f"addr:{address}"]
     now = ctx.clock()
