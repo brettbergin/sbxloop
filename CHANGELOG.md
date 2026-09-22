@@ -13,6 +13,16 @@ An abandoned summary is now cancelled, which frees its place in the pool
 when it has not started, and each summary is a stateless call that
 neither resumes nor stores a session.
 
+**A run's posts in a channel now reach the surfaces linked to it.** A
+channel linked to Slack, Mattermost or Discord promises that every message
+it shows is posted to each linked surface, and it kept that promise for
+what people and agents typed but not for what a run posted: the `plan`,
+`progress`, `review`, `notice` and `delivery` posts a run made appeared in
+the web channel and nowhere else, because the store never told its
+observers (the channel mirror among them) about them. A run's post is now
+observed like any other message once it is stored; a replay under a dedupe
+key already posted still stores nothing and is not mirrored again.
+
 **Retiring the concierge sandbox no longer stalls every other turn.** When
 a failed turn condemned the concierge box, the last lease to come back
 removed it (two `sbx rm` calls, each up to the settle timeout and longer on
