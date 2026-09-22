@@ -326,7 +326,7 @@ class TestStopFromChat:
         silenced = api.client.get(f"/v1/channels/{channel}", headers=headers).json()
         assert silenced["silenced_until"] == api.clock() + 3600.0
         assert len(concierge.calls) == 1
-        reply = _replies(api, headers, channel)[-1]
+        (reply,) = [m for m in _replies(api, headers, channel) if m["turn_id"] == done["id"]]
         assert "Stopping `r1`" in reply["content"]
         assert "`gh:issue:2`" in reply["content"]
         assert "quiet" in reply["content"]
