@@ -83,6 +83,24 @@ def test_the_profile_bounds_reach_the_planner() -> None:
     assert "WEATHER_API_KEY" not in text and "KEYED_TOKEN" not in text
 
 
+def test_an_any_host_bound_tells_the_planner_how_to_ask() -> None:
+    config = _config(workloads=[{"name": "open", "egress": ["*"]}], workload={"default": "open"})
+    text = _plan_prompt(config)
+    assert "- hosts: any — declare `*` for a task that cannot know its hosts" in text
+    assert "a bare suffix such as `*.com` is refused" in text
+
+
+def test_an_any_host_bound_under_a_deny_tells_the_planner_to_name_hosts() -> None:
+    config = _config(
+        workloads=[{"name": "open", "egress": ["*"]}],
+        workload={"default": "open"},
+        policy={"deny": ["bad.example.com"]},
+    )
+    text = _plan_prompt(config)
+    assert "- hosts: any named domain" in text
+    assert "`*` is refused while `[policy] deny` is set" in text
+
+
 def test_an_empty_profile_says_so_line_by_line() -> None:
     config = _config(workloads=[{"name": "bare"}], workload={"default": "bare"})
     text = _plan_prompt(config)

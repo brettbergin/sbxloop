@@ -493,10 +493,21 @@ class TestWorkloadPlan:
         assert not needs.empty
         with pytest.raises(ValidationError, match=r"needs\.hosts"):
             TaskNeeds(hosts=["https://api.example.com/v1"])
-        with pytest.raises(ValidationError, match=r"needs\.hosts"):
-            TaskNeeds(hosts=["*"])
         with pytest.raises(ValidationError):
             TaskNeeds.model_validate({"credentials": ["x"], "token": "sk-live"})
+
+    def test_needs_may_ask_for_any_host(self) -> None:
+        # A task that cannot know its hosts in advance asks for `*`; whether
+        # that is granted is the profile's decision, not the plan's shape.
+        assert TaskNeeds(hosts=["*"]).hosts == ["*"]
+
+    def test_a_bare_suffix_wildcard_is_refused_with_the_fix(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            TaskNeeds(hosts=["*.com", "*.org"])
+        message = str(caught.value)
+        assert "['*.com', '*.org']" in message
+        assert "not a bare suffix" in message
+        assert "'*' for any host" in message
 
     def test_plan_title_folds_like_the_pr_title(self) -> None:
         plan = WorkloadPlan.model_validate(

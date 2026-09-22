@@ -883,6 +883,50 @@ class TestNeeds:
         phases = [r.phase for r in engine.store.phase_attempts(result.run_id)]
         assert phases == ["plan"], "no task ran"
 
+    def test_any_host_is_granted_under_a_profile_that_bounds_nothing(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """A task that cannot know its hosts in advance asks for `*`, and a
+        profile whose egress is `*` grants it: the plan is valid, the run
+        completes, and the agent box is opened to every host."""
+        profiled["workloads"] = [{**RESEARCH, "egress": ["*"]}]
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled).start("follow the news", kind="workload")
+        assert result.state == "completed", result.reason
+        agent = run_name(harness.home, result.run_id, "agent")
+        assert ["allow", "network", "**", "--sandbox", agent] in harness.fake_sbx.policies()
+        (grant,) = self.granted(harness)
+        assert grant["hosts"] == ["*"]
+        assert self.refused(harness) == []
+
+    def test_any_host_is_refused_under_a_profile_that_names_its_hosts(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled).start("follow the news", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert (refusal["need"], refusal["value"]) == ("host", "*")
+        assert refusal["key"] == "workloads.research.egress"
+        assert [e for e in harness.events if e.type == "policy.allow"] == []
+
+    def test_any_host_is_refused_when_policy_denies_anything(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        profiled["workloads"] = [{**RESEARCH, "egress": ["*"]}]
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled, policy={"deny": ["bad.example.com"]}).start(
+            "follow the news", kind="workload"
+        )
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None
+        assert refusal["message"] == (
+            "task t1 needs host `*` — a sandbox granted every host cannot keep out "
+            "[policy] deny pattern 'bad.example.com'; name the hosts instead"
+        )
+        assert [e for e in harness.events if e.type == "policy.allow"] == []
+
     def test_a_denied_host_is_refused_even_inside_the_profile(
         self, harness: Harness, profiled: dict[str, Any]
     ) -> None:
