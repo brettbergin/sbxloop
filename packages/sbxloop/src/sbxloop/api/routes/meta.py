@@ -21,6 +21,7 @@ FEATURES: tuple[str, ...] = (
     "operations",
     "auth.client_credentials",
     "auth.refresh",
+    "auth.sso_policy",
     "items",
     "queue",
     "runs",
@@ -82,6 +83,7 @@ def features(config: Config) -> list[str]:
     served = list(FEATURES)
     if config.api.oidc.enabled:
         served.append("auth.oidc")
+        served.append("auth.oidc.backchannel_logout")
     return served
 
 

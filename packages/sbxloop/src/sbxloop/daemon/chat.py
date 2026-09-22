@@ -985,7 +985,7 @@ class ChatBridge(ABC):
         except Exception as exc:
             self.log.warning("chat.linked_turn_failed", channel=link.channel_id, exc_info=True)
             await self._ack_now(msg, ACK_FAILED)
-            await self._send(msg.channel, f"⚠ {_one_line(str(exc), 300)}", reply_to=msg.raw)
+            await self._send(msg.channel, f"⚠ {_linked_turn_refusal(exc)}", reply_to=msg.raw)
             return
         await self._ack_now(msg, ACK_ANSWERED)
 
@@ -2794,6 +2794,21 @@ def choice_answer(choice: Choice) -> str:
     """The text a selected choice sends to the concierge — identical to what
     a user typing that option's value would send."""
     return choice.value
+
+
+def _linked_turn_refusal(exc: BaseException) -> str:
+    """What a linked surface hears when the message it carried was not
+    accepted as a turn. A refusal the store worded for people is repeated;
+    anything else (a database or OS error, which may quote SQL or a path)
+    is for the daemon log, and the surface, which a link may open to
+    strangers, hears only that the message did not land."""
+    # The bridge reaches the API by duck typing everywhere else; the one
+    # type it names is loaded once an API context has raised it.
+    from sbxloop.api.collaboration import CollaborationError
+
+    if isinstance(exc, CollaborationError):
+        return _one_line(exc.message, 300)
+    return "I could not post that to the channel; check the daemon logs."
 
 
 def _tool_call_summary(name: str, args: dict[str, Any]) -> str:

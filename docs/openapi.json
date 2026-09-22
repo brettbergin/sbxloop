@@ -844,6 +844,22 @@
                 "type": "null"
               }
             ]
+          },
+          "oidc_session_max_age_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oidc Session Max Age S"
+          },
+          "policy_version": {
+            "default": 1,
+            "title": "Policy Version",
+            "type": "integer"
           }
         },
         "required": [
@@ -9110,6 +9126,45 @@
         "summary": "Register Local",
         "tags": [
           "collaboration"
+        ]
+      }
+    },
+    "/v1/auth/oidc/backchannel-logout": {
+      "post": {
+        "description": "An authenticated, signed provider event; no browser or bearer session needed.",
+        "operationId": "backchannel_logout_v1_auth_oidc_backchannel_logout_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "logout_token": {
+                    "maxLength": 16384,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "logout_token"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Backchannel Logout",
+        "tags": [
+          "auth"
         ]
       }
     },

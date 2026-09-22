@@ -551,3 +551,60 @@ def test_a_message_in_a_linked_thread_is_still_mirrored_to_the_channel_link(
     assert not any(
         "plan the bread" in p["message"] and p.get("root_id") == MATTERMOST_ROOT for p in posts
     )
+
+
+def test_a_linked_message_addresses_the_agents_it_mentions(linked: Any) -> None:
+    # "@software-dev review this" typed on the surface reaches software-dev
+    # exactly as it would typed in Angie: the turn targets the agent, the
+    # agent joins the channel, and the reply posted is the agent's own.
+    linked.store.link_identity(
+        linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
+    )
+    linked.say("@software-dev review this")
+    assert wait_for(lambda: len(linked.messages()) >= 2)
+    turns = linked.store.list_turns(None, linked.channel.id)
+    assert [turn.targets for turn in turns] == [("software-dev",)]
+    assert [call["session_key"] for call in linked.channel_agent.calls] == [
+        f"{linked.channel.id}:software-dev"
+    ]
+    assert linked.messages()[1].agent_slug == "software-dev"
+    joined = linked.store.list_participants(None, linked.channel.id)
+    assert "software-dev" in {participant.agent_slug for participant in joined}
+
+
+def test_a_failed_linked_turn_keeps_the_exception_out_of_the_surface(
+    linked: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A database or OS error is for the daemon log. The surface, which the
+    # link may open to strangers, hears only that the message did not land.
+    linked.store.link_identity(
+        linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
+    )
+    detail = "database is locked (/srv/sbxloop/state/state.db)"
+
+    def explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"sqlite3.OperationalError: {detail}")
+
+    monkeypatch.setattr(linked.ctx, "accept_bridge_turn", explode)
+    linked.say("plan the bread")
+    control = linked.client.channels[CONTROL]
+    assert wait_for(lambda: any("daemon log" in sent for sent in control.sent))
+    assert not any("database is locked" in sent or "state.db" in sent for sent in control.sent)
+    assert linked.messages() == []
+
+
+def test_a_refused_linked_turn_still_says_why(linked: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A refusal the store words for people is worth repeating.
+    from sbxloop.api.collaboration import CollaborationError
+
+    linked.store.link_identity(
+        linked.user.id, backend="discord", external_user_id="1", display_name="brett", now=1.0
+    )
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise CollaborationError("channel_not_found", "channel not found")
+
+    monkeypatch.setattr(linked.ctx, "accept_bridge_turn", refuse)
+    linked.say("plan the bread")
+    control = linked.client.channels[CONTROL]
+    assert wait_for(lambda: any("channel not found" in sent for sent in control.sent))
