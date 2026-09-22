@@ -10419,7 +10419,7 @@
     },
     "/v1/channels/{channel_id}/stop": {
       "post": {
-        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced until\n``resume`` or a ``silence`` of its own lifts it.",
+        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced for an\nhour (``sbxloop.api.context.STOP_SILENCE_S``) until ``resume`` or a\n``silence`` of its own lifts it. A ``/stop`` typed in the channel goes\nthrough the same :meth:`ApiContext.stop_channel`.",
         "operationId": "stop_channel_v1_channels__channel_id__stop_post",
         "parameters": [
           {

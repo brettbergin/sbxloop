@@ -91,6 +91,21 @@ observers (the channel mirror among them) about them. A run's post is now
 observed like any other message once it is stored; a replay under a dedupe
 key already posted still stores nothing and is not mirrored again.
 
+**A `/stop` typed in chat now does what `POST /v1/channels/{id}/stop`
+does.** It cancelled the channel's live runs and nothing else, so with one
+run live and a second item queued the reply said "Stopping `r1`" and the
+queued item then started, and with nothing live it said nothing was running
+even though queued work was waiting. A bare `/stop` or `/cancel` now goes
+through the same channel stop the route uses: the channel's other turns
+are cancelled, the runs it asked for are cancelled, the work it queued is
+abandoned, and the channel is silenced for the same hour; the turn carrying
+the stop is left to answer, and its reply names each run, item and turn it
+stopped and says the channel is quiet. Who may stop is unchanged (anyone
+who may post in the channel), and exactly `@agent stop` still cancels that
+agent's runs alone. The route's response is unchanged; it also now cancels
+a live run whose channel the daemon knows only through the run's
+conversation, which the chat stop already reached.
+
 **Retiring the concierge sandbox no longer stalls every other turn.** When
 a failed turn condemned the concierge box, the last lease to come back
 removed it (two `sbx rm` calls, each up to the settle timeout and longer on
