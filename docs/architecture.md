@@ -2172,12 +2172,24 @@ outcome as `message` until the loop grows structured results of its own; a
 JSON surface exposes the structured fields and never parses the message.
 
 The attribution is derived from the principal, never the reverse: the
-surfaces that exist today are trusted completely, as they always were, and
-`dispatch` builds them a `Principal.trusted(by, via)` holding every
-capability with the legacy string byte-for-byte. A principal with fewer
-capabilities can only come from a surface that authenticated it, and such
-a surface calls the service directly — it never goes through the prose
-dispatcher.
+surfaces the operator owns (`ctl`, a restricted chat channel, the console)
+are trusted completely, as they always were, and `dispatch` builds them a
+`Principal.trusted(by, via)` holding every capability with the legacy
+string byte-for-byte. A principal with fewer capabilities can only come
+from a surface that authenticated it, and such a surface calls the service
+directly — it never goes through the prose dispatcher.
+
+The concierge is the one prose surface that is not the operator's alone: a
+product channel's turn comes from a person with a workspace role. So a turn
+carries a principal (`submit_turn(principal=…)`, on the `TurnContext`), and
+`sbx_control` and `set_config` answer to it: the control service refuses an
+operator's verb the person's role does not grant, and the config write
+takes `daemon:manage`, as the admin routes do. The API hands over the same
+principal a stop or a steer from chat uses (`_chat_principal`); a chat
+bridge, whose control channel the operator restricted, hands over an
+explicit `Principal.trusted`; a turn with no principal (nobody vouched for
+it) keeps the read verbs alone. The attribution the source hears is still
+the concierge's `<author> (via concierge)`.
 
 `controls/eligibility.py` is the pure function a surface can answer
 *before* asking: given a run's kind and state, its item's state, the gate
