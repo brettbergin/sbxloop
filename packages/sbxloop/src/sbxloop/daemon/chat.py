@@ -65,7 +65,7 @@ from sbxloop.daemon.chat_choices import (
     render_prose,
 )
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message, strip_mentions
-from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
+from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX, ConciergeReply
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.discord_format import (
@@ -103,7 +103,7 @@ from sbxloop.log import get_logger
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
-    from sbxloop.daemon.concierge import Concierge, ConciergeReply
+    from sbxloop.daemon.concierge import Concierge
     from sbxloop_worker.protocol import HostToolResponse
 
 log = get_logger(__name__)
@@ -1311,6 +1311,18 @@ class ChatBridge(ABC):
                 reply_to=msg.raw,
             )
             return
+        refusal = self._turn_budget_refusal()
+        if refusal is not None:
+            # The day's token budget is spent: the turn is refused before
+            # anything reaches the model, and the refusal is the answer,
+            # posted and acknowledged as a failed turn is.
+            self.log.info(
+                "chat.concierge_turn_refused", by=self._author_name(msg), reason="token_budget"
+            )
+            await self._post_concierge_reply(
+                msg, ConciergeReply("", ok=False, error=refusal), nudge=nudge
+            )
+            return
         turn = _ConciergeTurn(msg)
         behind = self.concierge.pending
         if behind > 0:
@@ -1375,6 +1387,21 @@ class ChatBridge(ABC):
             return
         await finish_notes()
         await self._post_concierge_reply(msg, reply, nudge=nudge)
+
+    def _turn_budget_refusal(self) -> str | None:
+        """Why the workspace's daily token budget refuses a concierge turn
+        right now, worded for the person; ``None`` when the pool admits one,
+        or when the concierge has no pool or no budget is set. A turn from a
+        bridge answers no product channel, so it is admitted against the
+        workspace's budget alone."""
+        pool = getattr(self.concierge, "usage_pool", None)
+        if pool is None:
+            return None
+        now = time.time()
+        admission = pool.admit_turn(None, None, now)
+        if admission.ok:
+            return None
+        return str(pool.refusal_text(admission, now))
 
     async def _post_concierge_reply(
         self, msg: Inbound, reply: ConciergeReply, *, nudge: bool = False

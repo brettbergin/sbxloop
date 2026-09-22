@@ -988,6 +988,17 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Fixed
 
+- **A chat turn a person starts is refused once the daily token budget is
+  spent.** Every turn was charged to `[daemon] daily_token_budget`, but
+  only a turn one agent started for another was ever refused by it: one
+  member's chat could spend the whole budget by noon, after which every
+  queued run in the workspace waited for midnight while that chat kept
+  spending. A turn a person starts, in a channel or on a bridge, now
+  passes the same admission before anything reaches the model; a refused
+  turn settles as failed and its reply names the day's spend against the
+  budget and when it resets. Stopping or steering work from chat spends
+  nothing and is never refused. Without a budget nothing changes.
+
 - **A failed rollback no longer hides the provisioning failure it was
   cleaning up after.** When the worker install failed after `sbx create`
   and the rollback `sbx rm` then failed too (the hung-box timeout), the

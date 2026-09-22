@@ -192,6 +192,58 @@ class TestInbound:
         finally:
             bridge.close(drain_wait_s=1)
 
+    def test_a_control_mention_is_refused_once_the_budget_is_spent(self, tmp_path: Path) -> None:
+        """The daily token budget is spent before the person asks: the turn
+        never reaches the concierge, the message is marked failed, and the
+        channel says why, naming the budget and when it resets."""
+        from sbxloop.daemon.usagepool import UsagePool
+
+        concierge = FakeConcierge([ConciergeReply("should never be sent")])
+        bridge, dstore, _ = make_bridge(tmp_path, concierge=concierge)
+        budgeted = Config.model_validate(
+            {"home": str(tmp_path / "state"), "daemon": {"daily_token_budget": 10}}
+        )
+        concierge.usage_pool = UsagePool(dstore, lambda: budgeted)
+        dstore.record_usage(
+            ts=time.time(),
+            source="run",
+            ref_id="spent",
+            agent_slug=None,
+            channel_id=None,
+            input_tokens=12,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        bridge.start(connect_wait_s=2)
+        try:
+            asked = typed(dstore, "control", "@sbx what's running?")
+            assert wait_for(lambda: any("token budget" in s for s in texts(dstore, "control")))
+            (refusal,) = [s for s in texts(dstore, "control") if "token budget" in s]
+            assert refusal.startswith("⚠ concierge:"), refusal
+            assert "12/10" in refusal and "00:00 UTC" in refusal
+            assert concierge.turns == []
+            assert wait_for(lambda: "⚠" in reactions(dstore, asked))
+        finally:
+            bridge.close(drain_wait_s=1)
+
+    def test_a_control_mention_runs_while_the_budget_has_room(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.usagepool import UsagePool
+
+        concierge = FakeConcierge([ConciergeReply("sure")])
+        bridge, dstore, _ = make_bridge(tmp_path, concierge=concierge)
+        budgeted = Config.model_validate(
+            {"home": str(tmp_path / "state"), "daemon": {"daily_token_budget": 10}}
+        )
+        concierge.usage_pool = UsagePool(dstore, lambda: budgeted)
+        bridge.start(connect_wait_s=2)
+        try:
+            typed(dstore, "control", "@sbx what's running?")
+            assert wait_for(lambda: concierge.turns == [("what's running?", "TUI user `brett`")])
+            assert wait_for(lambda: any("sure" in s for s in texts(dstore, "control")))
+        finally:
+            bridge.close(drain_wait_s=1)
+
     def test_plain_text_in_control_is_left_alone(self, tmp_path: Path) -> None:
         concierge = FakeConcierge()
         bridge, dstore, _ = make_bridge(tmp_path, concierge=concierge)

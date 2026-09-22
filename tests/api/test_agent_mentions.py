@@ -216,9 +216,36 @@ def test_a_chain_runs_to_the_default_depth_of_four_and_no_further(tmp_path: Any)
     api.ctx.close()
 
 
+class SpendingConcierge(ScriptedConcierge):
+    """Answers as scripted and, as the real concierge does, charges what
+    the turn spent to the workspace pool: here, more than the day's budget
+    in one turn."""
+
+    def __init__(self, api: Any, replies: dict[str, str], tokens: int) -> None:
+        super().__init__(replies)
+        self.api = api
+        self.tokens = tokens
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        self.api.loop.dstore.record_usage(
+            ts=self.api.clock(),
+            source="turn",
+            ref_id=kwargs.get("message_id") or "turn",
+            agent_slug=kwargs.get("agent_slug"),
+            channel_id=kwargs.get("channel_id"),
+            input_tokens=self.tokens,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        return super().submit_turn(text, **kwargs)
+
+
 def test_a_spent_token_budget_refuses_the_follow_up(tmp_path: Any) -> None:
     """The workspace budget is the last guardrail: once today's tokens are
-    spent, an agent naming another agent starts nothing."""
+    spent, an agent naming another agent starts nothing. The person's own
+    turn is what spends them here; a budget spent before the person asks
+    refuses that turn itself (``test_turn_budget``)."""
     api = build(
         tmp_path,
         config={
@@ -227,20 +254,9 @@ def test_a_spent_token_budget_refuses_the_follow_up(tmp_path: Any) -> None:
         },
     )
     with api.client:
-        api.ctx.concierge = ScriptedConcierge({"planner": "over to @critic"})
+        api.ctx.concierge = SpendingConcierge(api, {"planner": "over to @critic"}, tokens=1000)
         headers = bearer(register(api))
         channel = _channel(api, headers)
-        api.loop.dstore.record_usage(
-            ts=api.clock(),
-            source="run",
-            ref_id="spent",
-            agent_slug=None,
-            channel_id=None,
-            input_tokens=500,
-            output_tokens=500,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-        )
         _ask(api, headers, channel, "@planner plan the bake")
 
         assert len(_turns(api, headers, channel)) == 1

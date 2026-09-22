@@ -181,6 +181,21 @@ class UsagePool:
         """May a chat turn start now? Only the token budget applies."""
         return self.admit_tokens(now)
 
+    def refusal_text(self, admission: Admission, now: float) -> str:
+        """What a person whose turn ``admission`` refused is told: the day's
+        spend against the budget and when chat and runs resume, in the
+        pool's own zone. The chat surfaces and the collaboration API post
+        this as the turn's answer."""
+        tz = self._config().daemon.run_cap_timezone
+        if admission.reason == "token_budget":
+            budget = self._config().daemon.daily_token_budget
+            return (
+                f"the workspace token budget is spent for today ({tz}): "
+                f"{self.tokens_today(now)}/{budget} tokens; chat turns and new runs "
+                f"resume at 00:00 {tz}"
+            )
+        return f"the workspace refused this turn ({admission.reason}); try again at 00:00 {tz}"
+
     # -- reading -------------------------------------------------------------------
 
     def tokens_today(self, now: float) -> int:
