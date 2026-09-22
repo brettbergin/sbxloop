@@ -3801,6 +3801,11 @@ class CollaborationStore:
         Returns the message id, or None when the channel is gone or
         silenced. A silenced channel still hears a run that has finished
         or stopped: ``delivery`` and ``notice`` are posted anyway.
+
+        A post stored here is told to the observers like any other message,
+        once the write has committed, so the surfaces linked to the channel
+        mirror it. A replay under a key already posted returns the message
+        it posted before and tells nobody: the run said it once.
         """
         if kind not in POST_KINDS:
             # ``PostKind`` is a type, not a check: a caller naming a kind
@@ -3875,7 +3880,9 @@ class CollaborationStore:
                     "run_id": run_public_id(run_id) if run_id else None,
                 },
             )
-            return message_id
+            appended = _message(session, row)
+        self._appended(appended)
+        return message_id
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:
