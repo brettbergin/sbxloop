@@ -970,7 +970,7 @@ daemon may run on schedules alone. `!sbx schedules` (or `sbxloop daemon ctl sche
 | `sbxloop gc`                                        | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `sbxloop secrets list\|clean\|rotate`               | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `sbxloop config show\|describe\|set\|unset\|policy` | Resolved configuration with per-key sources and when a change applies; one key's card (value, layer, what it accepts, what it is for); set or unset one key in the home's `config/sbxloop.toml` — comments kept, the whole file judged by the loader before it is written, the previous file kept as a backup; the effective egress policy.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `sbxloop users merge --from A --into B [--yes]`     | Merge a person's second collaboration account into their first (see "Merging a second account"): a dry run without `--yes`, one transaction with it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `sbxloop users merge --from A --into B [--yes]`     | Merge a person's second collaboration account into their first (see "Merging a second account"): a dry run without `--yes`, one transaction with it; `--readmit` allows an `--into` account that has left the workspace back in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 ## Network egress: least privilege, by plan
 
@@ -2351,7 +2351,10 @@ sbxloop users merge --from alice2 --into alice          # dry run: prints what w
 sbxloop users merge --from alice2 --into alice --yes    # apply it
 ```
 
-`--from` and `--into` take a username or a user id. Without `--yes` the
+`--from` and `--into` take a username or a user id. No username may begin
+with `usr_`, which is how user ids read, so a selector always names one
+account; a selector that is nonetheless one account's id and another's
+username is refused (`ambiguous_selector`) rather than resolved. Without `--yes` the
 command reports what would move and writes nothing. The merge moves the
 `--from` account's channels (ownership, and memberships, keeping the stronger
 channel role and the further read position), the messages and turns it
@@ -2360,15 +2363,22 @@ the invites it created, its bridge identities and the events addressed to it
 alone. A preference both accounts hold keeps the `--into` value and is listed;
 a team or workflow whose slug the `--into` account already uses moves as
 `<slug>-merged`. The `--into` account keeps the stronger of the two workspace
-roles, and its own username, email and password; the provider identity moves
+roles (except that a deactivated `--from` account lends none of its own, so a
+merge never hands on the role of an account somebody shut off), and its own
+username, email and password; the provider identity moves
 onto it, so both the password and the provider sign in to it from then on.
 Its `auth_source` stays `local`, as a linked account's does: the provider
 identity is recorded beside a working password. The `--from` account is
 deactivated, leaves the workspace, loses its provider identity and every
 capability, and its refresh tokens are revoked. The merge is refused for an
-account into itself, an unknown or deactivated `--into` account, and an
-`--into` account already bound to a different provider identity. It is
-recorded as `collaboration.user.merged`, carrying only the two user ids.
+account into itself, an unknown or deactivated `--into` account, an `--into`
+account that is no longer a workspace member (`merge_target_not_member`:
+somebody removed that person, and a merge is not the place to put them back
+quietly; pass `--readmit` to bring them back in, with the merged role, on
+purpose), and an `--into` account already bound to a different provider
+identity. It is recorded as `collaboration.user.merged`, naming the operator
+who ran the command, the two user ids, the `--into` account's role before and
+after, and whether it was re-admitted.
 
 **When it fails.** A provider error or an ID token that does not check out is
 `401 oidc_exchange_failed` with a generic message (the daemon's log says
