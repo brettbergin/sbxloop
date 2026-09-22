@@ -1,5 +1,31 @@
 ## [Unreleased]
 
+**Merging two collaboration accounts takes nothing from a deactivated
+account, never re-admits somebody who was removed, and records who ran
+it.** `sbxloop users merge` kept the stronger of the two workspace roles
+even when the `--from` account was deactivated, so folding a shut-off
+owner into a person's account made that person an owner; it created a
+membership when the `--into` account had none, putting a person somebody
+had removed from the workspace back in without saying so; and the
+`collaboration.user.merged` event held the two user ids and nothing else,
+unlike the member-management events beside it. A deactivated `--from`
+account now lends none of its role, an `--into` account that is not a
+member is refused (`merge_target_not_member`) unless the new `--readmit`
+flag asks for the re-admission on purpose, and the event names the
+operator who ran the command, the role before and after, and whether the
+account was re-admitted.
+
+**A username can no longer spell another person's user id, and a selector
+that names two accounts is refused.** User ids read `usr_<token>` and are
+public in `GET /v1/users`, while a username only had to be 1 to 80
+characters; `users merge` resolved a selector as a user id first and as a
+username second, so somebody who registered the username `usr_<victim>`
+could be merged in the victim's place by an operator taking them at their
+word. Registration now refuses a username beginning with `usr_` (`422`),
+a provider-suggested username gives up that prefix, and a selector that
+is at once one account's id and another's username is refused
+(`ambiguous_selector`) instead of resolved by lookup order.
+
 **Agent-started work counts its chain depth through chat handoffs, and a
 handoff no longer gets round the agent's own guardrails.** Every work
 tool a chat turn offered an agent with `can_start` was built at depth 0,

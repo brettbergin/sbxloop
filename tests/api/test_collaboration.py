@@ -75,6 +75,22 @@ def test_local_onboarding_uses_existing_token_contract(api: Any) -> None:
     assert api.token()["token_type"] == "Bearer"
 
 
+def test_a_username_may_not_spell_a_user_id(api: Any) -> None:
+    """User ids read ``usr_...`` and are public, so no username may look
+    like one: a selector can never resolve to somebody else's account."""
+    refused = api.client.post(
+        "/v1/auth/local/register",
+        json={
+            "email": "mallory@example.test",
+            "username": "usr_abcdef123456",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["code"] == "invalid_request"
+
+
 def test_channels_are_durable_revisioned_and_tombstoned(api: Any) -> None:
     headers = bearer(register(api))
     created = api.client.post("/v1/channels", json={"title": "First"}, headers=headers)

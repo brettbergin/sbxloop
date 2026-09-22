@@ -61,7 +61,9 @@ concierge, operation controls, schedules, events, artifacts, and usage instead
 of starting another scheduler or opening another SQLite writer.
 
 The installation has at most one local user. `POST /v1/auth/local/register`
-creates that profile and its scoped API principal; `/v1/auth/local/login` returns
+creates that profile and its scoped API principal; a `username` beginning
+with `usr_` is refused (`422 invalid_request`), since that is how the user
+ids in `GET /v1/users` read and no name may stand in for one; `/v1/auth/local/login` returns
 the same short-lived access and rotating refresh tokens as the existing client
 credential flow. Existing machine clients and all existing routes keep their
 original behavior.
