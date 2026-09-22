@@ -70,18 +70,27 @@ _PLUMBING = ("structlog", "logging", "sbxloop.log", "sbxloop.telemetry")
 #: A single free-text field is worth a paragraph of context, not a payload.
 _MAX_FIELD_LENGTH = 2_000
 
-#: Set on an exception, and on every member of its chain, once it has been
-#: reported. A failure is logged with its traceback where it happened, then
-#: again by each caller that wraps it on the way up (a DaemonError from a
-#: ProvisionError from an SbxError); the layers group differently and
-#: opened one GlitchTip issue each (#1168). A mark on the object itself
-#: needs no registry and dies with the exception (which takes no weakref).
+#: Set on an exception, and on everything it deliberately wraps, once it
+#: has been reported. A failure is logged with its traceback where it
+#: happened, then again by each caller that wraps it on the way up (a
+#: DaemonError from a ProvisionError from an SbxError); the layers group
+#: differently and opened one GlitchTip issue each (#1168). A mark on the
+#: object itself needs no registry and dies with the exception (which takes
+#: no weakref).
+#:
+#: A report covers its exception, the causes it was raised ``from`` and an
+#: exception group's members. It does not cover an implicit context: an
+#: error raised while another was being handled (a rollback that fails
+#: during the failure it was cleaning up after) shows that other error in
+#: its traceback, but it is not a report of it. Marking the context would
+#: let a cleanup warning swallow the ERROR that later wraps the original
+#: failure with its operator hint.
 _REPORTED_MARK = "_sbxloop_reported"
 
 
-def _chain(error: BaseException) -> Iterator[BaseException]:
-    """``error`` and everything it wraps: causes, unsuppressed contexts, and
-    an exception group's members."""
+def _chain(error: BaseException, *, contexts: bool = True) -> Iterator[BaseException]:
+    """``error`` and everything it wraps: causes, an exception group's
+    members and, with ``contexts``, unsuppressed implicit contexts."""
     seen: set[int] = set()
     stack = [error]
     while stack:
@@ -92,18 +101,23 @@ def _chain(error: BaseException) -> Iterator[BaseException]:
         yield current
         if current.__cause__ is not None:
             stack.append(current.__cause__)
-        elif not current.__suppress_context__ and current.__context__ is not None:
+        elif contexts and not current.__suppress_context__ and current.__context__ is not None:
             stack.append(current.__context__)
         if isinstance(current, BaseExceptionGroup):
             stack.extend(current.exceptions)
 
 
 def _already_reported(error: BaseException) -> bool:
+    """Whether a report already sent showed this failure. The traceback a
+    record would send includes implicit contexts, so a marked context means
+    the same failure again, seen from the error it interrupted."""
     return any(getattr(link, _REPORTED_MARK, False) for link in _chain(error))
 
 
 def _remember(error: BaseException) -> None:
-    for link in _chain(error):
+    """Mark what the report just sent covers: the error and its causes, not
+    the errors it happened to interrupt."""
+    for link in _chain(error, contexts=False):
         with contextlib.suppress(AttributeError, TypeError):
             setattr(link, _REPORTED_MARK, True)
 
