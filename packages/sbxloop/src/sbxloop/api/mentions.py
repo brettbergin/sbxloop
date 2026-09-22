@@ -9,8 +9,10 @@ mentions count.
 :class:`MentionRouter` turns the ones that do into follow-up turns: it keeps
 the slugs that name an active agent, drops the author's own, the source
 message's author and any agent still to answer in the same turn, asks
-:class:`~sbxloop.api.guardrails.Guardrails` about each survivor, and queues
-the allowed ones. ``handoff_agent`` — an agent addressing a peer *within*
+:class:`~sbxloop.api.guardrails.Guardrails` about each survivor, and joins
+the allowed ones to the channel's roster before queueing them. An agent the
+guardrails refused never got into the conversation, so it is not added to
+the roster either. ``handoff_agent`` — an agent addressing a peer *within*
 its own turn — is a different mechanism and is untouched by this one.
 """
 
@@ -100,12 +102,15 @@ class MentionRouter:
             if resolved is None or resolved in passed:
                 continue
             passed.add(resolved)
-            if resolved not in set(self.participants(channel_id)):
-                self.join(channel_id, resolved)
             admission = self.admit(channel_id, target_slug=resolved, depth=depth, trigger=trigger)
             if not getattr(admission, "ok", False):
                 continue
             try:
+                # Admitted, so it is in the conversation: the roster says so
+                # before its turn does. A roster that cannot take it drops
+                # this mention alone, not the ones after it.
+                if resolved not in set(self.participants(channel_id)):
+                    self.join(channel_id, resolved)
                 self.queue(
                     channel_id=channel_id,
                     source_message_id=source_message_id,
