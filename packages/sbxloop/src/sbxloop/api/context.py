@@ -388,35 +388,40 @@ class ApiContext:
     def _summarize(self, channel_id: str, prompt: str) -> str:
         """One cheap, tool-less model call for ``channel_id`` alone.
 
-        The session is this channel's own and is reset first, so the call
-        sees this channel's excerpt and nothing else: no other channel's
-        transcript is resumed into it, and this one does not grow across
-        compactions. Raises when there is no concierge, which the job
+        The call is stateless: it resumes no session and stores none, so
+        it sees this channel's excerpt and nothing else. No other
+        channel's transcript is resumed into it, and an earlier summary of
+        this channel (an abandoned one still running included) cannot
+        grow the next. Raises when there is no concierge, which the job
         treats as "no summary this time".
         """
         concierge = self.concierge
         if concierge is None:
             raise RuntimeError("no concierge to summarise with")
-        session_key = f"{SUMMARY_SESSION_KEY}:{channel_id}"
-        concierge.reset_session(session_key)
         pending = concierge.submit_turn(
             prompt,
             author="sbxloop",
             via="local",
-            session_key=session_key,
+            # Its own lane, so it never queues behind a conversation.
+            session_key=f"{SUMMARY_SESSION_KEY}:{channel_id}",
             allow_actions=False,
             read_only=True,
             # Charged to the channel whose history it compacts.
             channel_id=channel_id,
+            stateless=True,
         )
         # Bounded, and abandoned as soon as the daemon stops: closing must
-        # not wait out a provider that is slow to answer.
+        # not wait out a provider that is slow to answer. A call given up
+        # on is cancelled, so one still waiting for a pool worker is let
+        # go rather than left to hold the pool for a summary nobody reads.
         deadline = time.monotonic() + SUMMARY_TIMEOUT_S
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                pending.cancel()
                 raise TimeoutError("the summary was not answered in time")
             if self.stopping.is_set():
+                pending.cancel()
                 raise RuntimeError("stopping")
             try:
                 reply = pending.result(timeout=min(_SUMMARY_POLL_S, remaining))
