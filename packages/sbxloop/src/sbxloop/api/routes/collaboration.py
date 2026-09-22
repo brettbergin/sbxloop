@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -101,7 +100,6 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
-MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
 #: How long a stop keeps the channel quiet before it lifts on its own; a
 #: person who wants it quiet for longer says so with `silence`.
 STOP_SILENCE_S = 3600.0
@@ -968,35 +966,15 @@ async def channel_jobs(
 async def _targets(
     ctx: ApiContext, user: LocalUser, content: str, requested: list[str]
 ) -> tuple[str, ...]:
-    selectors = list(requested)
-    selectors.extend(match.group(1).casefold() for match in MENTION.finditer(content))
-    result: list[str] = []
-    for selector in dict.fromkeys(selectors):
-        agent = await ctx.call(ctx.agents.get, selector)
-        if addressable(agent, selector):
-            result.append(selector)
-            continue
-        team = await ctx.call(ctx.collaboration.get_team, user.id, selector)
-        if team is not None and team.enabled:
-            for slug in team.agent_slugs:
-                if addressable(await ctx.call(ctx.agents.get, slug), slug):
-                    result.append(slug)
-            continue
-        if selector in requested:
-            raise Problem(422, "unknown_target", f"unknown agent or team: {selector}")
-    return tuple(dict.fromkeys(result))
-
-
-def _mentioned_agents(ctx: ApiContext, content: str, targets: tuple[str, ...]) -> tuple[str, ...]:
-    """The agents a turn names, by ``@slug`` or as a target: each joins the
-    channel. A runner turn's mentions count too, though they seed no reply.
-    Reads the registry, so it runs through ``ctx.call``."""
-    slugs: list[str] = []
-    for selector in (*targets, *(m.group(1).casefold() for m in MENTION.finditer(content))):
-        agent = _addressable(ctx, selector)
-        if agent is not None:
-            slugs.append(agent)
-    return tuple(dict.fromkeys(slugs))
+    """The agents the turn addresses, as :meth:`ApiContext.mention_targets`
+    resolves them for a bridge message too; a requested selector nobody
+    answers to is ``422 unknown_target``."""
+    try:
+        return await ctx.call(ctx.mention_targets, user, content, requested)
+    except CollaborationError as exc:
+        if exc.code == "unknown_target":
+            raise Problem(422, exc.code, exc.message) from exc
+        raise _problem(exc) from exc
 
 
 def _assignees(ctx: ApiContext, slugs: tuple[str, ...]) -> dict[str, str]:
@@ -1042,7 +1020,7 @@ async def create_turn(
     # A mention is a request to reply. It records the agent as a target and
     # joins it to the channel; it never rewrites what the caller asked for.
     intent = body.intent
-    participants = await ctx.call(_mentioned_agents, ctx, body.content, targets)
+    participants = await ctx.call(ctx.mentioned_agents, body.content, targets)
     assignees = (
         await ctx.call(_assignees, ctx, participants) if intent in WORK_INTENTS else None
     ) or None

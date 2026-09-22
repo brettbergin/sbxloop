@@ -10,6 +10,23 @@ observers (the channel mirror among them) about them. A run's post is now
 observed like any other message once it is stored; a replay under a dedupe
 key already posted still stores nothing and is not mirrored again.
 
+**A message typed on a linked chat surface addresses the agents it
+mentions, is authorized by the link alone (live and after a restart), and a
+failure to accept it never posts internal error text to the surface.**
+`@builder review this` typed in a linked Slack, Mattermost or Discord
+surface was answered by Angie alone: a linked turn parsed no mentions, so
+the builder was never reached and `@builder stop` could not target it. A
+linked turn now resolves mentions exactly as a turn typed in Angie does:
+the agents and teams named become its targets and join the channel.
+Recovery after a restart also treated a linked turn differently from live
+acceptance: a mapped author who could not read the channel (a workspace
+member outside a private, linked channel) was answered while the daemon
+stayed up but interrupted after a restart; the link is the authorization
+on both paths now, so such a turn is recovered for its author. And when a
+linked message could not be accepted, the bridge posted the raw exception
+text (SQL fragments, file paths) back to the surface; it now repeats only
+a refusal worded for people and otherwise says to check the daemon logs.
+
 **A listening agent stays quiet once its channel is stopped, joins no
 roster it was refused, answers a guest as itself, and never delays the
 person it listens to.** Four follow-ups to ambient speaking and agent
