@@ -211,6 +211,56 @@ def test_a_completed_turn_leaves_the_observers_nothing_to_mirror(api: Any) -> No
     assert heard == []
 
 
+def _run_post(api: Any, channel_id: str, key: str, text: str = "Kneading the dough") -> str | None:
+    """One post a run makes into ``channel_id``, keyed for replay."""
+    return api.ctx.collaboration.post_agent_update(
+        channel_id=channel_id,
+        author_agent="planner",
+        kind="progress",
+        text=text,
+        run_id="r1",
+        dedupe_key=key,
+        now=api.clock(),
+    )
+
+
+def test_a_run_post_into_a_linked_channel_reaches_the_observers_once(api: Any) -> None:
+    # A channel linked to a surface promised that every message it shows,
+    # a run's posts included, is mirrored there; the mirror hears about a
+    # message only through the observers.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    _link(api, owner, channel_id, backend="slack")
+    heard = _heard(api)
+
+    message_id = _run_post(api, channel_id, "r1:progress:1")
+
+    assert message_id is not None
+    assert [(m.id, m.channel_id, m.kind, m.post_kind, m.content, m.agent_slug) for m in heard] == [
+        (message_id, channel_id, "agent_update", "progress", "Kneading the dough", "planner")
+    ]
+    assert heard[0].author.kind == "agent"
+    assert heard[0].author.id == "planner"
+
+
+def test_a_run_post_replayed_under_its_key_is_not_heard_again(api: Any) -> None:
+    # A resumed run says a thing once in the channel, so the surfaces
+    # linked to it hear it once too.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    _link(api, owner, channel_id, backend="slack")
+    heard = _heard(api)
+
+    first = _run_post(api, channel_id, "r1:progress:2")
+    again = _run_post(api, channel_id, "r1:progress:2")
+
+    assert first is not None
+    assert again == first
+    assert [m.id for m in heard] == [first]
+
+
 def test_a_queued_handoff_mirrors_the_message_it_appends(api: Any) -> None:
     api.ctx.concierge = FakeConcierge()
     owner = bearer(register(api))
