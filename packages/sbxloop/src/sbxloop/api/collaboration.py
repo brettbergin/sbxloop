@@ -1074,6 +1074,10 @@ class CollaborationStore:
                         timezone=timezone.strip() or "UTC",
                         created_at=now,
                         updated_at=now,
+                        # The first registration is the operator's own, and an
+                        # invite addressed to the email vouches for it. An open
+                        # invite vouches for the person, not for the address.
+                        email_verified=1 if invite is None or invite.email is not None else 0,
                     )
                 )
                 session.add(
@@ -1149,17 +1153,22 @@ class CollaborationStore:
         on first sign-in.
 
         An account already bound to ``(issuer, subject)`` is used as is,
-        with its email and name refreshed. Otherwise, with
-        ``link_verified_email``, an unlinked local account whose email
-        matches is linked, but only when the provider has verified the
-        email. Failing both, a new account is provisioned when
-        ``auto_provision`` allows: the installation's first user owns the
-        workspace, anyone else takes ``role_from_groups`` or
-        ``default_role``. An email another account already holds is not
-        given to the new account, which gets an undeliverable one instead.
-        For an existing member, ``role_from_groups`` (when not ``None``)
-        replaces the role, except that the last owner is never demoted. An
-        inactive user, or one no longer in the workspace, is refused.
+        with its name refreshed, and its email too when the provider has
+        verified it. Otherwise, with ``link_verified_email``, an unlinked
+        local account whose email matches is linked, but only when the
+        provider has verified the email and the local account's
+        ``email_verified`` is set (its address came from the first
+        registration, an addressed invite or an earlier verified claim,
+        never from the person editing it). Failing both, a new account is
+        provisioned when ``auto_provision`` allows: the installation's first
+        user owns the workspace, anyone else takes ``role_from_groups`` or
+        ``default_role``. An email another account already holds, or one the
+        provider has not verified, is not given to the new account, which
+        gets an undeliverable one instead. For an existing member,
+        ``role_from_groups`` (when not ``None``) replaces the role, except
+        that the last owner is never demoted and the sign-in that links
+        never changes it. An inactive user, or one no longer in the
+        workspace, is refused.
         """
         email = email.strip().casefold() if email and email.strip() else None
         try:
@@ -1205,27 +1214,40 @@ class CollaborationStore:
                 )
             ).first()
             created = False
-            new_email = email
-            if row is None and email is not None:
+            linked = False
+            # An address the provider has not checked is never stored: the
+            # account keeps the one it has, or gets an undeliverable one.
+            new_email = email if email_verified else None
+            if row is None and new_email is not None:
                 holder: LocalUserRow | None = session.scalars(
-                    select(LocalUserRow).where(LocalUserRow.email == email)
+                    select(LocalUserRow).where(LocalUserRow.email == new_email)
                 ).first()
                 if (
                     holder is not None
                     and link_verified_email
-                    and email_verified
                     and holder.oidc_subject is None
+                    and holder.email_verified
                 ):
-                    # The password keeps working, so the account stays
-                    # ``local``; the provider identity is recorded beside it.
+                    # Both sides vouch for the address. The password keeps
+                    # working, so the account stays ``local``; the provider
+                    # identity is recorded beside it.
                     holder.oidc_issuer = issuer
                     holder.oidc_subject = subject
                     holder.updated_at = now
                     row = holder
+                    linked = True
                     _event(session, "auth.oidc.linked", now, data={"user_id": holder.id})
                 elif holder is not None:
                     # Not linkable: the person gets an account of their own,
                     # and the address stays with the account that holds it.
+                    if link_verified_email and holder.oidc_subject is None:
+                        # Its holder typed the address in, so it proves
+                        # nothing about who the provider is vouching for.
+                        log.info(
+                            "auth.oidc_link_refused",
+                            user_id=holder.id,
+                            reason="local_email_unverified",
+                        )
                     new_email = None
             if row is None:
                 if not auto_provision:
@@ -1247,19 +1269,26 @@ class CollaborationStore:
             if not row.active or member is None:
                 raise CollaborationError("oidc_account_disabled", "this account is disabled")
             if not created:
-                self._refresh_identity(session, row, email, full_name, now)
-                if role_from_groups is not None and role_from_groups != member.role:
-                    if member.role == "owner" and self._owner_count(session) <= 1:
-                        log.info("auth.oidc_last_owner_kept", user_id=row.id)
-                    else:
-                        member.role = role_from_groups
-                        self._grant_role(session, row, role_from_groups)
-                        _event(
-                            session,
-                            "workspace.member.role_changed",
-                            now,
-                            data={"user_id": row.id, "role": role_from_groups},
-                        )
+                self._refresh_identity(session, row, new_email, full_name, now)
+            # Groups are followed from the next sign-in on: the sign-in that
+            # links never changes what the linked account may do.
+            if (
+                not created
+                and not linked
+                and role_from_groups is not None
+                and role_from_groups != member.role
+            ):
+                if member.role == "owner" and self._owner_count(session) <= 1:
+                    log.info("auth.oidc_last_owner_kept", user_id=row.id)
+                else:
+                    member.role = role_from_groups
+                    self._grant_role(session, row, role_from_groups)
+                    _event(
+                        session,
+                        "workspace.member.role_changed",
+                        now,
+                        data={"user_id": row.id, "role": role_from_groups},
+                    )
             _event(session, "auth.oidc.login", now, data={"user_id": row.id})
             session.flush()
             return _user(row)
@@ -1268,6 +1297,8 @@ class CollaborationStore:
     def _refresh_identity(
         session: Any, row: LocalUserRow, email: str | None, full_name: str | None, now: float
     ) -> None:
+        """Follow the provider's name, and its email when ``email`` is the
+        address it has verified (``None`` otherwise)."""
         changed = False
         if email is not None and email != row.email:
             clash = session.scalars(
@@ -1277,6 +1308,7 @@ class CollaborationStore:
             ).first()
             if clash is None:
                 row.email = email
+                row.email_verified = 1
                 changed = True
             else:
                 log.info("auth.oidc_email_kept", user_id=row.id)
@@ -1304,9 +1336,13 @@ class CollaborationStore:
         user_id = "usr_" + _token(12)
         client_id = "local_" + _token(12)
         name = self._free_username(session, username)
+        # Only an address the provider has verified, and nobody else holds,
+        # reaches here; anything else is the placeholder below.
+        verified = email is not None
         if email is None:
             # The column is required and unique; a provider that shares no
-            # address gets one that can never receive mail.
+            # address, or no verified one, gets one that can never receive
+            # mail.
             digest = hashlib.sha256(f"{issuer}\n{subject}".encode()).hexdigest()[:24]
             email = f"oidc-{digest}@users.invalid"
         session.execute(
@@ -1334,6 +1370,7 @@ class CollaborationStore:
                 auth_source="oidc",
                 oidc_issuer=issuer,
                 oidc_subject=subject,
+                email_verified=1 if verified else 0,
             )
         )
         session.add(
@@ -1692,8 +1729,11 @@ class CollaborationStore:
                 ).first()
                 if row is None or not row.active:
                     raise CollaborationError("profile_not_found", "local profile not found")
-                if email is not None:
+                if email is not None and email.strip().casefold() != row.email:
+                    # Typed in by its holder: nobody has shown the address is
+                    # theirs, so no provider identity may be linked to it.
                     row.email = email.strip().casefold()
+                    row.email_verified = 0
                 if full_name is not None:
                     row.full_name = full_name.strip() or None
                 if timezone is not None:

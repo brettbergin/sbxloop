@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+**An OIDC sign-in trusts a provider email only when the provider has checked
+it, and a member's typed-in address can no longer steer a colleague's first
+sign-in.** Any member could set their email to an address nobody held yet;
+with `link_verified_email` on, the colleague's first sign-in was then linked
+to that member's account and, with `owner_groups` / `admin_groups` set, the
+role sync raised that account on the same sign-in, password and all. A local
+account now records whether its address came from a path its holder could
+not steer (the installation's first registration, an invite addressed to it,
+or a provider claim marked verified; `PATCH /v1/users/me` clears it), a
+first sign-in links only to such an account, and the sign-in that links
+never changes the account's role. Accounts from before this release count as
+unverified, so their first sign-in creates a second account to fold in with
+`sbxloop users merge`. An `email` claim the provider has not verified is no
+longer stored either: a first sign-in gets the undeliverable
+`oidc-...@users.invalid` address and a later sign-in keeps the address on
+record, so an unverified claim cannot take the address the real person was
+invited by, in the directory or at registration.
+
 **A workload task that cannot know its hosts in advance can ask for any
 host.** A research plan whose task follows links it has not seen yet declared
 `needs.hosts = ["*"]`, the model refused it, and the retry guessed bare

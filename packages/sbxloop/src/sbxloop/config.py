@@ -2849,10 +2849,16 @@ class ApiOidcConfig(_ConfigModel):
     #: accounts may sign in.
     auto_provision: bool = True
     #: Link a first sign-in to the local account holding the same email when
-    #: the provider says the address is verified. Off by default: a provider
-    #: that lets people edit their email, or asserts ``email_verified`` for
-    #: any address, would otherwise hand them that account (the owner's
-    #: included). Off, or unverified, the person gets an account of their own.
+    #: the provider says the address is verified and the local side does
+    #: too: the address came from the installation's first registration, an
+    #: invite addressed to it or an earlier verified provider claim, never
+    #: from the person editing their own profile (which would let a member
+    #: capture a colleague's first sign-in). The sign-in that links never
+    #: changes the account's role. Off by default: a provider that lets
+    #: people edit their email, or asserts ``email_verified`` for any
+    #: address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified on either side, the person gets an
+    #: account of their own.
     link_verified_email: bool = False
     request_timeout_s: float = Field(default=10.0, gt=0, le=60)
 
