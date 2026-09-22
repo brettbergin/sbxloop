@@ -238,6 +238,50 @@ class TestDaemonClonesOnFirstUse:
         assert calls == []
         assert notices == []
 
+    def test_a_repoless_item_refreshes_nothing_when_every_repository_is_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """An operator pauses issue polling by disabling every repository
+        but keeps chat asks and scheduled workloads running. No repository
+        is enabled, so none is the sole one, none is selected and no
+        credential is: the primary repository's checkout would otherwise
+        be fetched anonymously, the username prompt a private forge answers
+        with posted to every such item as a refresh warning."""
+        loop, home = self.make_loop(tmp_path)
+        loop.config = Config.model_validate(
+            {
+                "home": str(home.root),
+                "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
+                "github": {
+                    "repos": [
+                        {"repo": "o/a", "enabled": False},
+                        {"repo": "o/b", "enabled": False},
+                    ]
+                },
+            }
+        )
+        loop.github = SimpleNamespace(
+            provisioner=Provisioner(SbxCLI(), loop.config, env={"GITLAB_TOKEN": "gitlab-token"})
+        )
+        checkout = home.workspaces / "o" / "a"
+        checkout.mkdir(parents=True)
+        Repo.init(checkout).create_remote("origin", "http://forge.example:8929/o/a")
+        # The checkout is there to be fallen back on; the guard is what
+        # keeps the refresh away from it.
+        assert loop._workspace_checkout(None) == checkout
+        calls = []
+        notices: list[str] = []
+
+        def refresh(*a, **k):
+            calls.append((a, k))
+            return hostgit.RefreshResult(False, "head", "head", "up to date")
+
+        monkeypatch.setattr(hostgit, "refresh_from_origin", refresh)
+        monkeypatch.setattr(loop, "_notice", lambda kind, text, **kw: notices.append(kind))
+        loop._refresh_workspace(None)
+        assert calls == []
+        assert notices == []
+
     @pytest.mark.parametrize("empty_directory", [False, True])
     @pytest.mark.parametrize("repo", ["o/n", "group/subgroup/project"])
     def test_gitlab_bootstrap_uses_its_configured_origin(
