@@ -1,5 +1,18 @@
 ## [Unreleased]
 
+**A channel summary the daemon gives up on no longer holds the concierge
+pool.** The compaction job abandons a summary after its timeout, or when
+the daemon is stopping, but left the model call queued: at the default
+pool width of one it still ran later and held the concierge's only thread
+for up to `[concierge] timeout_s`, so with a slow provider abandoned
+summaries piled up and chat in every channel waited behind them. The job
+also reset the channel's summary session before each call, outside the
+session lane, so an abandoned call finishing later could write its session
+back and the next summary would resume it, growing across compactions.
+An abandoned summary is now cancelled, which frees its place in the pool
+when it has not started, and each summary is a stateless call that
+neither resumes nor stores a session.
+
 **A listening agent stays quiet once its channel is stopped, joins no
 roster it was refused, answers a guest as itself, and never delays the
 person it listens to.** Four follow-ups to ambient speaking and agent

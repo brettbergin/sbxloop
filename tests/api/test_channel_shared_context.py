@@ -138,6 +138,32 @@ def _summary_calls(api: Any) -> list[dict[str, Any]]:
     return [call for call in api.ctx.concierge.calls if head in call["text"]]
 
 
+def _compactions_settled(api: Any) -> bool:
+    """Whether the compactions the settled turns queued on their own thread
+    have all finished: one still running would pick up whatever summariser
+    a test installs next."""
+    return _settles(lambda: not api.ctx._compactions)
+
+
+class _Stuck:
+    """A provider that accepts the turn and never answers, remembering what
+    it was handed."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.resets: list[str | None] = []
+        self.futures: list[Future[Any]] = []
+
+    def reset_session(self, session_key: str | None = None) -> None:
+        self.resets.append(session_key)
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Future[Any]:
+        self.calls.append({"text": text, **kwargs})
+        future: Future[Any] = Future()
+        self.futures.append(future)
+        return future
+
+
 class TestMessageArtifacts:
     def test_a_work_result_attaches_and_serves_the_files_its_run_delivered(self, api: Any) -> None:
         headers, channel, run_id = _deliver(api)
@@ -260,6 +286,10 @@ class TestSummaryCompaction:
         headers = bearer(register(api))
         first = _chatter(api, headers, [f"alpha {index}" for index in range(4)])
         second = _chatter(api, headers, [f"bravo {index}" for index in range(4)])
+        # The turns that built the channels queued compactions of their
+        # own; one still running would summarise with the narrower window
+        # installed below and count a channel twice.
+        assert _compactions_settled(api)
         api.ctx._summaries = ChannelSummarizer(
             api.ctx.collaboration, api.ctx._summarize, api.clock, keep=2
         )
@@ -434,6 +464,26 @@ class TestSummaryCompaction:
             assert call["channel_id"] == channel
             assert call["allow_actions"] is False
 
+    def test_a_summary_is_one_stateless_call(self, api: Any) -> None:
+        # A resumed session would carry an earlier summary's transcript
+        # into the next compaction of the same channel, and a reset made
+        # outside the lane races a call for that channel that was given up
+        # on but is still running: the summary neither resumes nor stores
+        # a session at all.
+        api.ctx.concierge = FakeConcierge()
+        headers = bearer(register(api))
+        channel = _chatter(api, headers, [f"message {index}" for index in range(4)])
+        assert _compactions_settled(api)
+        api.ctx._summaries = ChannelSummarizer(
+            api.ctx.collaboration, api.ctx._summarize, api.clock, keep=2
+        )
+        api.ctx.compact_channel(channel)
+        calls = _summary_calls(api)
+        assert calls
+        for call in calls:
+            assert call["stateless"] is True
+        assert api.ctx.concierge.resets == []
+
     def test_a_summariser_that_never_answers_is_given_up_on(
         self, api: Any, monkeypatch: Any
     ) -> None:
@@ -442,16 +492,9 @@ class TestSummaryCompaction:
         channel = _chatter(api, headers, [f"message {index}" for index in range(4)])
         monkeypatch.setattr("sbxloop.api.context.SUMMARY_TIMEOUT_S", 0.5, raising=False)
 
-        class Stuck:
-            """A provider that accepts the turn and never answers."""
-
-            def reset_session(self, session_key: str | None = None) -> None:
-                return None
-
-            def submit_turn(self, text: str, **kwargs: Any) -> Future[Any]:
-                return Future()
-
-        api.ctx.concierge = Stuck()
+        assert _compactions_settled(api)
+        stuck = _Stuck()
+        api.ctx.concierge = stuck
         api.ctx._summaries = ChannelSummarizer(
             api.ctx.collaboration, api.ctx._summarize, api.clock, keep=2
         )
@@ -461,6 +504,14 @@ class TestSummaryCompaction:
         ).start()
         assert done.wait(10) is True
         assert api.ctx.collaboration.latest_channel_summary(channel) is None
+        # Giving up lets the call go: it no longer waits for a place in the
+        # concierge's pool, so the next summary or chat turn is not queued
+        # behind a summary nobody will read.
+        (future,) = stuck.futures
+        assert future.cancelled() is True
+        (call,) = stuck.calls
+        assert call["stateless"] is True
+        assert stuck.resets == []
 
     def test_closing_waits_for_a_compaction_that_is_writing(self, api: Any) -> None:
         # The daemon closes its store right after the API context. A
@@ -491,16 +542,9 @@ class TestSummaryCompaction:
         headers = bearer(register(api))
         channel = _chatter(api, headers, [f"message {index}" for index in range(4)])
 
-        class Stuck:
-            """A provider that accepts the turn and never answers."""
-
-            def reset_session(self, session_key: str | None = None) -> None:
-                return None
-
-            def submit_turn(self, text: str, **kwargs: Any) -> Future[Any]:
-                return Future()
-
-        api.ctx.concierge = Stuck()
+        assert _compactions_settled(api)
+        stuck = _Stuck()
+        api.ctx.concierge = stuck
         api.ctx._summaries = ChannelSummarizer(
             api.ctx.collaboration, api.ctx._summarize, api.clock, keep=2
         )
@@ -513,6 +557,9 @@ class TestSummaryCompaction:
         # Well inside the model timeout: shutting down does not wait it out.
         assert done.wait(5) is True
         assert api.ctx.collaboration.latest_channel_summary(channel) is None
+        # And the abandoned call is let go rather than left in the pool.
+        (future,) = stuck.futures
+        assert future.cancelled() is True
 
 
 class TestReadChannelArtifact:
