@@ -517,7 +517,9 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
         assert self.UNGUARDED == UNGUARDED_START_TOOLS
 
     @staticmethod
-    def _offered(tmp_path: Path, agent_tools: list[Any], *, start_work: bool = True) -> set[str]:
+    def _offered(
+        tmp_path: Path, agent_tools: list[Any], *, start_work: bool = True, **turn: Any
+    ) -> set[str]:
         from tests.unit.test_daemon_concierge import FakeGithub as ConciergeGithub, make
 
         concierge, client, *_ = make(tmp_path, [{"text": "ok"}], github=ConciergeGithub())
@@ -528,6 +530,7 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
             start_work=start_work,
             agent_role="planner",
             agent_tools=agent_tools,
+            **turn,
         ).result(timeout=10)
         (job,) = client.jobs
         return {tool.name for tool in job.host_tools}
@@ -551,3 +554,15 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
     def test_an_agent_that_declares_nothing_keeps_the_tools_it_had(self, tmp_path: Path) -> None:
         names = self._offered(tmp_path, [])
         assert names >= self.UNGUARDED
+
+    def test_a_turn_handed_off_from_a_guarded_agent_is_offered_no_unguarded_start(
+        self, tmp_path: Path
+    ) -> None:
+        """A peer an agent with ``can_start`` hands off to (Angie, or an agent
+        that declares nothing) is not offered the start tools that agent was
+        denied, or a handoff would be the way round its guardrails. Every
+        other tool the turn had stays."""
+        plain = self._offered(tmp_path / "plain", [])
+        guarded = self._offered(tmp_path / "guarded", [], guarded_start=True)
+        assert guarded.isdisjoint(self.UNGUARDED)
+        assert guarded == plain - self.UNGUARDED
