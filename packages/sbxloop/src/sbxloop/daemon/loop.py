@@ -1693,9 +1693,11 @@ class DaemonLoop:
             poll_interval_s=self.config.daemon.poll_interval_s,
             source=self.source.name,
         )
-        self.narrate_repository_import()
         self._release_request_rejection_hold()
         self._report_restart()
+        # After the restart's own line, so a restart still reads as
+        # "started, restarted by ..." and the import follows it.
+        self.narrate_repository_import()
         self._start_warmer()
         ticks = 0
         try:
