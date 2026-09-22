@@ -448,6 +448,34 @@ class Repository(ApiModel):
     trigger_label: str
     workload_label: str
     health: RepoHealth | None = None
+    #: Where the registration came from (``config``: imported from
+    #: sbxloop.toml; ``api``), who made it and when.
+    source: str | None = None
+    created_by: str | None = None
+    created_at: str | None = None
+    #: The registration's enabled state differs from what this daemon
+    #: process polls: polling follows at the next start.
+    restart_required: bool = False
+
+
+class RepositoryCreate(ApiModel):
+    """A registration: ``owner/name`` (``group/subgroup/project`` on
+    GitLab), the forge it lives on (``[vcs] kind`` when unset), whether it
+    is polled and run, and the branch it delivers to (the repository's
+    default when unset)."""
+
+    repository: str = Field(min_length=3, max_length=200)
+    forge: Literal["github", "gitlab", "gitea"] | None = None
+    enabled: bool = True
+    deliver_base: str | None = Field(default=None, max_length=200)
+
+
+class RepositoryUpdate(ApiModel):
+    """A change to a registration: only the fields sent change;
+    ``deliver_base: null`` clears it."""
+
+    enabled: bool | None = None
+    deliver_base: str | None = Field(default=None, max_length=200)
 
 
 class DiscoveryCredential(ApiModel):
@@ -859,7 +887,9 @@ class RestartRequest(ApiModel):
 
 
 class RepositoryResult(ApiModel):
-    repository: Repository
+    #: The repository as it stands after the command; None once removed.
+    repository: Repository | None = None
+    message: str = ""
     operation: OperationOut
 
 

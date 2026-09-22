@@ -160,6 +160,14 @@ class ScheduleOutcome(Outcome):
     message: str
 
 
+class RepositoryOutcome(Outcome):
+    """A registration added, changed or removed; ``repo`` as registered."""
+
+    verb: Literal["add", "update", "remove"]
+    repo: str
+    message: str
+
+
 class LogTailOutcome(Outcome):
     text: str
 

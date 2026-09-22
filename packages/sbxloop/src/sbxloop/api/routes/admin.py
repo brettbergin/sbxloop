@@ -16,7 +16,9 @@ from sbxloop.api.models import (
     Hold,
     HoldRequest,
     HoldResult,
+    RepositoryCreate,
     RepositoryResult,
+    RepositoryUpdate,
     RestartRequest,
     Schedule,
     ScheduleCreate,
@@ -136,6 +138,48 @@ async def resume_repository(
         request, auth.principal, f"/v1/repositories/{repository_id}/resume", required=False
     )
     return await admin.resume_repository(ctx, auth, repository_id, pair)
+
+
+@router.post("/repositories", response_model=RepositoryResult, status_code=201)
+async def create_repository(
+    body: RepositoryCreate,
+    request: Request,
+    ctx: ApiContext = Depends(ready_daemon),  # noqa: B008
+    auth: Authenticated = Depends(require("daemon:manage")),  # noqa: B008
+) -> RepositoryResult:
+    """Register a repository: admitted for work now, polled from the next
+    daemon start (the answer says so). A name registered already, one that
+    is not a repository on its forge, or an unknown forge is refused."""
+    pair = idempotency(request, auth.principal, "/v1/repositories", required=False)
+    return await admin.create_repository(ctx, auth, body, pair)
+
+
+@router.patch("/repositories/{repository_id}", response_model=RepositoryResult)
+async def update_repository(
+    repository_id: str,
+    body: RepositoryUpdate,
+    request: Request,
+    ctx: ApiContext = Depends(ready_daemon),  # noqa: B008
+    auth: Authenticated = Depends(require("daemon:manage")),  # noqa: B008
+) -> RepositoryResult:
+    """Change whether a registered repository is enabled, or the branch it
+    delivers to; only the fields sent change, live."""
+    pair = idempotency(request, auth.principal, f"/v1/repositories/{repository_id}", required=False)
+    return await admin.update_repository(ctx, auth, repository_id, body, pair)
+
+
+@router.delete("/repositories/{repository_id}", response_model=RepositoryResult)
+async def remove_repository(
+    repository_id: str,
+    request: Request,
+    ctx: ApiContext = Depends(ready_daemon),  # noqa: B008
+    auth: Authenticated = Depends(require("daemon:manage")),  # noqa: B008
+) -> RepositoryResult:
+    """Forget a registration: no longer admitted for work; work already
+    queued or running for it is untouched, and polling stops at the next
+    daemon start."""
+    pair = idempotency(request, auth.principal, f"/v1/repositories/{repository_id}", required=False)
+    return await admin.remove_repository(ctx, auth, repository_id, pair)
 
 
 # -- schedules -------------------------------------------------------------------------

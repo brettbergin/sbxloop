@@ -46,6 +46,7 @@ DAEMON_TABLES = (
     "daemon_pending_clarifications",
     "daemon_local_messages",
     "daemon_schedules",
+    "daemon_repositories",
     "daemon_holds",
     "workspace_usage",
 )

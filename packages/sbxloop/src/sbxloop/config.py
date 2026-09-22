@@ -859,6 +859,17 @@ def _valid_repo(value: str, kind: VcsKind | None = None) -> bool:
     )
 
 
+def check_repo_name(value: str, kind: str) -> None:
+    """Refuse ``value`` unless it names a repository on ``kind``:
+    ``owner/name``, or on GitLab ``group/subgroup/project``. The sentence
+    is for the person who typed it."""
+    if kind not in VCS_KINDS:
+        raise ValueError(f"forge must be one of {', '.join(VCS_KINDS)}, got {kind!r}")
+    if not _valid_repo(value, kind):
+        shape = "group/subgroup/project" if kind == "gitlab" else "owner/name"
+        raise ValueError(f"a {kind} repository must be {shape}, got {value!r}")
+
+
 # What a PR title / commit message template may interpolate (#621).
 # `{title}` is the model-authored title when the plan gave one, else the
 # outcome; the rest are the run's own facts.
@@ -3056,6 +3067,9 @@ class Config(_ConfigModel):
     model_source_dir: Path | None = None
     # Environment values (including secrets) never enter the snapshot.
     _model_env: dict[str, str] | None = PrivateAttr(default=None)
+    # The file's own `[[vcs.repos]]` entries, kept from the first time the
+    # daemon's registry replaced the declared list (see `replace_repos`).
+    _declared_repos: tuple[RepoConfig, ...] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
@@ -3216,6 +3230,23 @@ class Config(_ConfigModel):
         """The repository a run acts on, with the forge's daemon-wide
         defaults folded in; see :meth:`GithubConfig.effective_repo`."""
         return self.github.effective_repo(repo)
+
+    def declared_repos(self) -> list[RepoConfig]:
+        """The file's own entries: what ``[[vcs.repos]]`` declared, before
+        the daemon's registry (:mod:`sbxloop.daemon.repositories`) was
+        applied over it — the same as :meth:`repo_list` until then."""
+        if self._declared_repos is None:
+            return self.repo_list()
+        return list(self._declared_repos)
+
+    def replace_repos(self, repos: Sequence[RepoConfig]) -> None:
+        """``repos`` as the declared list from now on, live, for every
+        consumer of this configuration: what the daemon's registry
+        applies. The file's own entries are kept (:meth:`declared_repos`)
+        the first time, so a later application can fold over them again."""
+        if self._declared_repos is None:
+            self._declared_repos = tuple(self.repo_list())
+        self._with_repos(list(repos))
 
     @property
     def primary_repo(self) -> str | None:

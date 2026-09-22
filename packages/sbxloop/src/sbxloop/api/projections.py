@@ -464,22 +464,35 @@ class Views:
             for h in self.status().get("repos") or []
             if isinstance(h, dict) and "repo" in h and "state" in h
         }
+        # The registration behind each entry: its provenance, and whether
+        # what this process polls has moved on from it.
+        registered = {row.repo.casefold(): row for row in self.dstore.repositories()}
+        polled: frozenset[str] = getattr(self.loop, "polled_repos", frozenset())
         daemon = self.config.daemon
-        return [
-            Repository(
-                id=ids[entry.repo],
-                repository=entry.repo,
-                forge=str(self.config.vcs_kind_for(entry.repo)),
-                enabled=entry.enabled,
-                deliver_base=entry.deliver_base,
-                trigger_label=entry.trigger_label or daemon.trigger_label,
-                workload_label=entry.workload_label or daemon.workload_label,
-                health=(
-                    RepoHealth.model_validate(health[entry.repo]) if entry.repo in health else None
-                ),
+        out: list[Repository] = []
+        for entry in entries:
+            row = registered.get(entry.repo.casefold())
+            out.append(
+                Repository(
+                    id=ids[entry.repo],
+                    repository=entry.repo,
+                    forge=str(self.config.vcs_kind_for(entry.repo)),
+                    enabled=entry.enabled,
+                    deliver_base=entry.deliver_base,
+                    trigger_label=entry.trigger_label or daemon.trigger_label,
+                    workload_label=entry.workload_label or daemon.workload_label,
+                    health=(
+                        RepoHealth.model_validate(health[entry.repo])
+                        if entry.repo in health
+                        else None
+                    ),
+                    source=row.source if row is not None else None,
+                    created_by=row.created_by if row is not None else None,
+                    created_at=rfc3339(row.created_at) if row is not None else None,
+                    restart_required=(entry.repo.casefold() in polled) != entry.enabled,
+                )
             )
-            for entry in entries
-        ]
+        return out
 
     def profiles(self) -> list[Profile]:
         default = self.config.workload.default
