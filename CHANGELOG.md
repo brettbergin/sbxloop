@@ -1,5 +1,22 @@
 ## [Unreleased]
 
+**Leaving the workspace ends every standing a member had.** Removing or
+deactivating a member deleted their workspace row and nothing else: they
+stayed in every channel, so a later invite handed back every private channel
+they had been in, a channel could lose its last active owner because a
+departed owner still counted as one, and `GET /v1/channels/{id}/members`
+kept listing them. Their invites outlived them too: an admin removed from
+the workspace, or an owner demoted, left invites behind that still admitted
+new members at the invite's full role. Now removal and deactivation take the
+user out of every channel in the same transaction (the longest-standing
+member still in the workspace takes over a channel they were the last owner
+of; a channel nobody else was in is left without a member), the last-owner
+rules count only members still active in the workspace, the unused invites
+the user created are withdrawn (a demotion withdraws those above the new
+role), each as a `workspace.invite.revoked` event with a `reason`, and an
+invite whose creator is no longer an active member admits nobody while one
+above its creator's current role grants that role instead.
+
 **An OIDC sign-in trusts a provider email only when the provider has checked
 it, and a member's typed-in address can no longer steer a colleague's first
 sign-in.** Any member could set their email to an address nobody held yet;

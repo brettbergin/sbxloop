@@ -687,6 +687,23 @@ member leaves their client with no capability and revokes its refresh
 tokens. The refresh tokens are revoked in the same database transaction as
 the membership change, so either both happen or neither does.
 
+Removing or deactivating a member also ends every standing they had:
+
+- They are taken out of every channel. A private channel they were in stays
+  hidden after a later invite until someone adds them again. Where they were
+  a channel's last owner, its longest-standing member still in the workspace
+  becomes the owner; a channel nobody else was in is left without a member.
+- The invites they created and nobody had used yet are withdrawn. Demoting a
+  member withdraws the unused invites they created above the new role. Each
+  withdrawal is a `workspace.invite.revoked` event whose `reason` is
+  `creator_removed`, `creator_deactivated` or `creator_demoted`.
+
+An invite stands only while its creator does: one whose creator is no longer
+an active member admits nobody (`403 invite_invalid`), and one above its
+creator's current role grants that role instead. An invite a plain operator
+client created (`created_by` of `client:<id>`) is not measured against a
+membership.
+
 An invite's token appears only in the creation response; the daemon keeps
 its SHA-256. `ttl_hours` defaults to 72 and may be 1 to 720. An invite with
 an `email` admits only a registration with that email, compared without
@@ -732,7 +749,8 @@ The user must be an active workspace member (`404 user_not_found`). Posting a
 current member with an explicit `role` other than theirs changes that role in
 place and answers `200`; with no `role`, or the role they already have, it is
 `409 already_channel_member`. The last channel owner cannot step down (`409 last_channel_owner`), nor leave or be removed while anyone else remains: make
-another member an owner first. Changes record `collaboration.member.added`,
+another member an owner first. Only channel members still active in the
+workspace count, as another owner or as someone left behind. Changes record `collaboration.member.added`,
 `collaboration.member.updated` and `collaboration.member.removed` events with
 `{channel_id, user_id}`.
 
