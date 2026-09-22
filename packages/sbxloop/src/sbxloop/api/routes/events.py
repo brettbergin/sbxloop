@@ -150,7 +150,27 @@ async def sse_frames(
     opened_as_member = auth.member is not None
     last_check = ctx.clock()
     last_ping = asyncio.get_running_loop().time()
+
+    async def access_allowed() -> bool:
+        nonlocal last_check, viewer
+        now = ctx.clock()
+        if now - last_check < ACCESS_RECHECK_S:
+            return True
+        last_check = now
+        try:
+            fresh = await ctx.call(resolve_token, ctx, token)
+        except Problem:
+            return False
+        if not stream_still_allowed(fresh, opened_as_member=opened_as_member):
+            return False
+        viewer = fresh.member
+        return True
+
     while not ctx.stopping.is_set():
+        # Check before reading even when the previous page had a backlog.
+        if not await access_allowed():
+            yield _CLOSED_ACCESS_REVOKED
+            return
 
         def read(start: int = cursor, member: Member | None = viewer) -> tuple[Page[EventOut], int]:
             return follow(
@@ -165,23 +185,16 @@ async def sse_frames(
 
         page, resume = await ctx.call(read)
         for event in page.data:
+            # A client can pause at any yield; recheck the deadline before
+            # sending another buffered frame when it resumes.
+            if not await access_allowed():
+                yield _CLOSED_ACCESS_REVOKED
+                return
             yield _frame(event)
             last_ping = asyncio.get_running_loop().time()
         cursor = resume
         if page.has_more:
             continue
-        now = ctx.clock()
-        if now - last_check >= ACCESS_RECHECK_S:
-            last_check = now
-            try:
-                fresh = await ctx.call(resolve_token, ctx, token)
-            except Problem:
-                yield _CLOSED_ACCESS_REVOKED
-                return
-            if not stream_still_allowed(fresh, opened_as_member=opened_as_member):
-                yield _CLOSED_ACCESS_REVOKED
-                return
-            viewer = fresh.member
         if asyncio.get_running_loop().time() - last_ping >= PING_EVERY_S:
             last_ping = asyncio.get_running_loop().time()
             yield ": ping\n\n"

@@ -57,6 +57,8 @@ API_TABLES = (
     "api_clients",
     "api_refresh_tokens",
     "api_token_revocations",
+    "api_oidc_sessions",
+    "api_oidc_logouts",
     "api_public_ids",
     "api_steering",
     "api_artifacts",

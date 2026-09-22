@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import math
 import os
 import threading
 import urllib.error
@@ -40,6 +41,8 @@ JWKS_REFETCH_MIN_S = 10.0
 #: After a failed discovery, requests are answered from the failure this
 #: long: an unreachable provider does not tie up a thread per request.
 DISCOVERY_RETRY_S = 30.0
+LOGOUT_MAX_AGE_S = 300
+LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
 
 
 class HttpRequest(Protocol):
@@ -149,6 +152,18 @@ class Identity:
     email_verified: bool
     name: str | None
     groups: tuple[str, ...]
+    sid: str | None = None
+    issued_at: float = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Logout:
+    issuer: str
+    subject: str | None
+    sid: str | None
+    jti: str
+    issued_at: float
+    replay_until: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +209,7 @@ def _json_object(body: bytes) -> dict[str, Any] | None:
 def _time(value: Any) -> float | None:
     """A NumericDate claim as a float; None when it is not one."""
     if isinstance(value, int | float) and not isinstance(value, bool):
-        return float(value)
+        return float(value) if math.isfinite(value) else None
     return None
 
 
@@ -424,6 +439,76 @@ class OidcProvider:
             raise OidcError("id_token_without_subject")
         return claims
 
+    def validate_logout_token(self, token: str) -> Logout:
+        """Verify an OIDC Back-Channel Logout 1.0 token before touching any session.
+
+        The original standard permits no exp (as used by Authentik); a five
+        minute iat window always bounds acceptance. When exp exists it is
+        checked as well. Replay ids remain durable for the entire window.
+        """
+        discovery = self.discovery()
+        try:
+            header = jwt.get_unverified_header(token)
+        except jwt.PyJWTError as exc:
+            raise OidcError("logout_token_malformed") from exc
+        algorithm = header.get("alg")
+        if not isinstance(algorithm, str) or algorithm not in self.config.algorithms:
+            raise OidcError("logout_token_algorithm_refused")
+        if header.get("typ") not in (None, "JWT", "logout+jwt"):
+            raise OidcError("logout_token_type_refused")
+        key = self._signing_key(discovery, header.get("kid"), algorithm)
+        try:
+            claims = jwt.decode(
+                token,
+                key.key,
+                algorithms=[algorithm],
+                audience=self.config.client_id,
+                issuer=discovery.issuer,
+                options={
+                    "require": ["iss", "aud", "iat", "jti", "events"],
+                    "verify_exp": False,
+                    "verify_iat": False,
+                    "verify_nbf": False,
+                },
+            )
+        except (jwt.PyJWTError, ValueError, TypeError) as exc:
+            raise OidcError("logout_token_invalid") from exc
+        now, leeway = self.clock(), self.config.leeway_s
+        issued = _time(claims.get("iat"))
+        if issued is None or issued > now + leeway or issued + LOGOUT_MAX_AGE_S + leeway <= now:
+            raise OidcError("logout_token_issued_at")
+        for field, earliest in (("exp", False), ("nbf", True)):
+            if field not in claims:
+                continue
+            value = _time(claims[field])
+            if value is None or (value - leeway > now if earliest else value + leeway <= now):
+                raise OidcError("logout_token_time_invalid")
+        if "nonce" in claims:
+            raise OidcError("logout_token_nonce_forbidden")
+        events = claims["events"]
+        if not isinstance(events, dict) or not isinstance(events.get(LOGOUT_EVENT), dict):
+            raise OidcError("logout_token_event_invalid")
+        for field in ("sub", "sid", "jti"):
+            if field in claims and (
+                not isinstance(claims[field], str) or not claims[field].strip()
+            ):
+                raise OidcError("logout_token_identifier_invalid")
+        subject, sid = claims.get("sub"), claims.get("sid")
+        if subject is None and sid is None:
+            raise OidcError("logout_token_without_session")
+        # An explicit authorized party must be this client; multiple audiences
+        # are allowed by the logout standard and do not require azp.
+        if "azp" in claims and claims["azp"] != self.config.client_id:
+            raise OidcError("logout_token_authorized_party")
+        return Logout(
+            discovery.issuer,
+            subject,
+            sid,
+            claims["jti"],
+            issued,
+            issued + LOGOUT_MAX_AGE_S + leeway,
+        )
+
     def exchange(self, *, code: str, code_verifier: str, redirect_uri: str, nonce: str) -> Identity:
         """Redeem ``code`` and return who signed in; raises :class:`OidcError`."""
         config = self.config
@@ -435,6 +520,9 @@ class OidcProvider:
         groups = _groups(claims.get(config.groups_claim))
         if config.allowed_groups and not set(groups) & set(config.allowed_groups):
             raise OidcNotAllowed("not_in_allowed_groups")
+        sid = claims.get("sid")
+        if sid is not None and (not isinstance(sid, str) or not sid.strip()):
+            raise OidcError("id_token_session_invalid")
         return Identity(
             issuer=discovery.issuer,
             subject=str(claims["sub"]),
@@ -443,6 +531,8 @@ class OidcProvider:
             email_verified=claims.get("email_verified") is True,
             name=_string(claims.get(config.name_claim)),
             groups=groups,
+            sid=sid,
+            issued_at=float(claims["iat"]),
         )
 
 

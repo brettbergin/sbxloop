@@ -142,6 +142,13 @@ def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
     assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
 
 
+def test_local_auth_policy_is_documented_with_its_compatible_default() -> None:
+    assert Config.model_validate({}).api.local_auth_enabled is True
+    assert "# local_auth_enabled = true" in DEFAULT_CONFIG_TOML
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
+    assert "`[api] local_auth_enabled`" in guide
+
+
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
     """A bridge's token has to appear in the file an operator actually fills
     in. Generic over the descriptor set, so a fourth service cannot land with
