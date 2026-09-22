@@ -450,6 +450,41 @@ class Repository(ApiModel):
     health: RepoHealth | None = None
 
 
+class DiscoveryCredential(ApiModel):
+    """The credential a discovery listed with: a personal token (``pat``,
+    with the account it belongs to) or a GitHub App installation (``app``;
+    the installation, not a person, so no login)."""
+
+    mode: Literal["pat", "app"]
+    login: str | None = None
+
+
+class AvailableRepository(ApiModel):
+    """A repository the host's forge credential can see: what a
+    person picks from when registering one. ``configured`` says whether
+    it is declared to this daemon already."""
+
+    repository: str
+    forge: str
+    owner: str
+    name: str
+    private: bool = False
+    archived: bool = False
+    default_branch: str | None = None
+    url: str | None = None
+    configured: bool = False
+
+
+class RepositoryDiscovery(ApiModel):
+    workspace_id: str = WORKSPACE_ID
+    forge: str
+    credential: DiscoveryCredential
+    data: list[AvailableRepository]
+    #: True when the forge holds more than the listing walked; the rest is
+    #: not in ``data``.
+    truncated: bool = False
+
+
 class Profile(ApiModel):
     id: str
     name: str

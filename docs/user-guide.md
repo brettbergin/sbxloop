@@ -2170,7 +2170,10 @@ daemon again, refused as `409 unsupervised` when nothing would — the reply
 carries the generation that accepted it, and the daemon is back when
 `/health/ready` reports a new one; starting a daemon that is not running is
 the supervisor's job, never the API's. `POST /v1/repositories/{id}/resume`
-polls a suspended or backing-off repository again now. `GET /v1/schedules`
+polls a suspended or backing-off repository again now.
+`GET /v1/repositories/available` (workspace owner) lists the repositories the
+host's forge credential can see, each marked `configured` when this daemon
+already declares it, so a client offers a list to pick from. `GET /v1/schedules`
 and `/v1/schedules/{name}` show every schedule with its cadence, last and next
 due and who paused it; `POST /v1/schedules/{name}/pause` and `/resume`,
 `POST /v1/schedules` (a declared profile, a free name, exactly one of `every`

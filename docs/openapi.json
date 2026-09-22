@@ -895,6 +895,73 @@
         "title": "AuthorOut",
         "type": "object"
       },
+      "AvailableRepository": {
+        "additionalProperties": false,
+        "description": "A repository the host's forge credential can see: what a\nperson picks from when registering one. ``configured`` says whether\nit is declared to this daemon already.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "private": {
+            "default": false,
+            "title": "Private",
+            "type": "boolean"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "repository",
+          "forge",
+          "owner",
+          "name"
+        ],
+        "title": "AvailableRepository",
+        "type": "object"
+      },
       "BridgeOut": {
         "additionalProperties": false,
         "description": "A chat service this release can bridge, and whether it is set up.",
@@ -2213,6 +2280,36 @@
           "detail"
         ],
         "title": "DetailOut",
+        "type": "object"
+      },
+      "DiscoveryCredential": {
+        "additionalProperties": false,
+        "description": "The credential a discovery listed with: a personal token (``pat``,\nwith the account it belongs to) or a GitHub App installation (``app``;\nthe installation, not a person, so no login).",
+        "properties": {
+          "login": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login"
+          },
+          "mode": {
+            "enum": [
+              "pat",
+              "app"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "DiscoveryCredential",
         "type": "object"
       },
       "EventOut": {
@@ -5177,6 +5274,42 @@
           "workload_label"
         ],
         "title": "Repository",
+        "type": "object"
+      },
+      "RepositoryDiscovery": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/DiscoveryCredential"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AvailableRepository"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "default": "local",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "forge",
+          "credential",
+          "data"
+        ],
+        "title": "RepositoryDiscovery",
         "type": "object"
       },
       "RepositoryResult": {
@@ -11894,6 +12027,61 @@
           }
         },
         "summary": "List Repositories",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/v1/repositories/available": {
+      "get": {
+        "description": "The repositories the host's forge credential can see, each marked\nwith whether it is configured here already: what an owner picks from\nwhen registering one. Read from the forge now, on the host, with the\nsame credential snapshot the connection check uses; ``forge`` defaults\nto ``[vcs] kind``.",
+        "operationId": "available_repositories_v1_repositories_available_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "forge",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "github",
+                    "gitlab",
+                    "gitea"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Forge"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryDiscovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Available Repositories",
         "tags": [
           "catalog"
         ]
