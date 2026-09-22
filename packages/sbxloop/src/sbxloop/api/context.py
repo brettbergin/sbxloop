@@ -902,6 +902,11 @@ class ApiContext:
                     prompt,
                     author=author,
                     author_id=author_id,
+                    # An operator command or config write the turn's tools
+                    # run answers to the person's role (#1274), as a stop
+                    # or a steer from chat does. A turn another agent
+                    # started carries nobody's authority.
+                    principal=principal if source_agent is None else None,
                     via="local",
                     message_id=turn.input_message_id
                     if index == 0

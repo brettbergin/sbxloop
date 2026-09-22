@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**An operator command or config change the concierge runs on a turn a
+person started answers to that person's role.** On a turn that may start
+work (a Code, Workload or Auto intent), `sbx_control` and `set_config` ran
+as the daemon operator whoever asked: a workspace `member` could have the
+agent pause, cancel, merge, release, reset the breaker, restart or grant
+rounds, or change the configuration, and the audit trail named the
+concierge. A turn now carries the principal the API already builds for a
+stop or a steer from chat, `sbx_control` dispatches with it (the control
+service refuses an operator's verb the role does not grant, by name), and
+`set_config` takes `daemon:manage` as the admin routes do; the read verbs
+and the read tools are unchanged. A chat bridge's control channel, which
+the operator restricted, stays fully trusted and says so explicitly; a turn
+with no principal keeps the read verbs alone.
+
 **A saved agent is changed only by the person who saved it, or a workspace
 owner or admin.** `PATCH /v1/agents/{slug}` and
 `POST /v1/agents/{slug}/archive` asked only for `collaboration:write`,
