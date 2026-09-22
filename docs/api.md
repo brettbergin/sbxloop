@@ -891,6 +891,21 @@ under the name they use on that service. A map is only as good as the
 membership behind it: an account removed from the workspace or deactivated
 is unmapped again, and the link's `allow_guests` rule decides afresh.
 
+The link is the authorization. A channel linked to a surface accepts what
+anyone the bridge admits types there, a mapped account or a guest where the
+link allows one, and the turn runs for that person without the `post` check
+a turn started here makes: the channel's owner linked the surface, so
+whoever may post on it may post in the channel, whether or not they could
+open it in Angie. A restart keeps the same rule: an accepted turn whose
+message arrived over a bridge is recovered for its author, mapped or guest,
+rather than dropped because that author cannot read the channel. Mentions
+work as they do here: `@slug` in a linked message targets that agent and
+joins it to the channel, and it is that agent that answers (so `@slug stop`
+reaches it too); a message naming nobody is answered by Angie. When a
+linked message cannot be accepted, the surface hears a refusal only if it
+was worded for people (a channel that is gone, say); any other failure is
+reported as "check the daemon logs" and detailed there alone.
+
 ## Clients and tokens
 
 sbxloop issues its own tokens. A client is registered on the host with the

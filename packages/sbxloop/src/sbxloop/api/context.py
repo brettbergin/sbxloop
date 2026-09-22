@@ -56,7 +56,7 @@ from sbxloop.api.collaboration import (
     guest_user,
 )
 from sbxloop.api.guardrails import Guardrails
-from sbxloop.api.mentions import MentionRouter, addressed_slugs
+from sbxloop.api.mentions import MENTION, MentionRouter, addressed_slugs
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
 from sbxloop.api.turns import TurnCoordinator
@@ -615,22 +615,68 @@ class ApiContext:
         A mapped author answers as themselves. A guest — only where the link
         admits one — has no account, so the turn runs for a stand-in carrying
         the name they use on that service: no preferences to read, and no
-        standing to hand work off with.
+        standing to hand work off with. The message addresses agents exactly
+        as one typed in the channel does: each ``@slug`` (or a team of the
+        author's) is a target that answers, and joins the channel.
         """
         store = self.collaboration
         with self._turn_admission:
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else guest_user(display_name)
+            targets = self.mention_targets(user, content)
+            participants = self.mentioned_agents(content, targets)
             turn, message = store.accept_linked_turn(
                 link,
                 content=content,
                 author_user_id=author_user_id,
                 display_name=display_name,
                 external_message_id=external_message_id,
+                targets=targets,
+                participants=participants,
                 now=self.clock(),
             )
-            member = None if author_user_id is None else store.member_for_user(author_user_id)
-            user = member.user if member is not None else guest_user(display_name)
             self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
         return turn, message
+
+    def mention_targets(
+        self, user: LocalUser, content: str, requested: Sequence[str] = ()
+    ) -> tuple[str, ...]:
+        """The agents a message addresses, in order and once each: every
+        ``requested`` slug and every ``@slug`` in ``content`` that names an
+        addressable agent, with a team of ``user``'s expanded into its
+        addressable agents. A requested selector that names neither is
+        refused as ``unknown_target``; a mention that names neither is
+        simply not an address. Reads the registry and the store, so a
+        request handler runs it through :meth:`call`.
+        """
+        selectors = list(requested)
+        selectors.extend(match.group(1).casefold() for match in MENTION.finditer(content))
+        result: list[str] = []
+        for selector in dict.fromkeys(selectors):
+            if addressable(self.agents.get(selector), selector):
+                result.append(selector)
+                continue
+            team = self.collaboration.get_team(user.id, selector)
+            if team is not None and team.enabled:
+                result.extend(
+                    slug for slug in team.agent_slugs if addressable(self.agents.get(slug), slug)
+                )
+                continue
+            if selector in requested:
+                raise CollaborationError("unknown_target", f"unknown agent or team: {selector}")
+        return tuple(dict.fromkeys(result))
+
+    def mentioned_agents(self, content: str, targets: Sequence[str]) -> tuple[str, ...]:
+        """The agents a turn names, by ``@slug`` or as a target: each joins
+        the channel. A runner turn's mentions count too, though they seed
+        no reply. Reads the registry, so a request handler runs it through
+        :meth:`call`."""
+        slugs: list[str] = []
+        for selector in (*targets, *(m.group(1).casefold() for m in MENTION.finditer(content))):
+            key = selector.strip().casefold()
+            if addressable(self.agents.get(key), key):
+                slugs.append(key)
+        return tuple(dict.fromkeys(slugs))
 
     def start_collaboration_turn(
         self,
