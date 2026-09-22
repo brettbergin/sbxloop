@@ -430,6 +430,35 @@ def test_exception_messages_and_chained_tracebacks_are_preserved(explicit: bool)
     assert all("vars" not in f for v in values for f in v["stacktrace"]["frames"])
 
 
+def test_a_cleanup_warning_does_not_swallow_the_failure_it_interrupted(reports) -> None:
+    """The rollback of a failed provision fails too: ``sbx rm`` times out
+    while the install error is still being handled, so the timeout carries
+    the install error as its implicit context. The cleanup warning is sent
+    first; the ERROR that wraps the install error with ``from`` and carries
+    the operator hint is a different report and must still be sent."""
+
+    def emit(log) -> None:
+        try:
+            try:
+                raise RuntimeError("worker install failed")
+            except RuntimeError as install:
+                try:
+                    raise TimeoutError("sbx rm timed out")
+                except TimeoutError:
+                    log.warning("sandbox.rollback_remove_failed", exc_info=True)
+                raise ValueError("cannot provision the sandbox") from install
+        except ValueError:
+            log.error("github_sandbox.provision_failed", exc_info=True, hint="run sbx login")
+
+    events = reports("diagnostic", emit)
+    assert [(e["level"], e["message"]["message"]) for e in events] == [
+        ("warning", "sandbox.rollback_remove_failed"),
+        ("error", "github_sandbox.provision_failed"),
+    ]
+    assert events[1]["message"]["formatted"] == "github_sandbox.provision_failed: run sbx login"
+    assert [v["type"] for v in events[1]["exception"]["values"]] == ["RuntimeError", "ValueError"]
+
+
 def test_exception_groups_preserve_children() -> None:
     error = ExceptionGroup("Multiple failures", [ValueError("bad task"), OSError("missing file")])
     values = telemetry._exception_event(error)["values"]
