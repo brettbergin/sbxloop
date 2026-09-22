@@ -1016,7 +1016,8 @@ service_memory = "2g"
 # default_role = "member"          # a new person's role: member or admin
 # auto_provision = true            # create an account on first sign-in
 # link_verified_email = false      # link a local account with the same verified
-#                                  # email; only if users cannot edit their email
+#                                  # email (verified on both sides, see the guide);
+#                                  # only if users cannot edit their email
 # request_timeout_s = 10           # each call to the provider
 
 # [concierge]
