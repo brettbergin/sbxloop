@@ -921,7 +921,10 @@ class TestNeeds:
         assert result.state == "failed"
         (refusal,) = self.refused(harness)
         assert refusal["key"] is None
-        assert "deny" in refusal["message"] and "bad.example.com" in refusal["message"]
+        assert refusal["message"] == (
+            "task t1 needs host `*` — a sandbox granted every host cannot keep out "
+            "[policy] deny pattern 'bad.example.com'; name the hosts instead"
+        )
         assert [e for e in harness.events if e.type == "policy.allow"] == []
 
     def test_a_denied_host_is_refused_even_inside_the_profile(

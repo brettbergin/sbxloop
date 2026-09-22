@@ -248,9 +248,10 @@ class TestBounds:
     def test_any_host_is_refused_whenever_anything_is_denied(self) -> None:
         # The sandbox policy is grant-only: a box granted every host cannot
         # keep a denied one out, so `*` fails closed under any deny pattern.
-        reason = egress_rejection("*", ["*"], ["secrets.example.com"])
-        assert reason is not None and "deny" in reason
-        assert "secrets.example.com" in reason
+        assert egress_rejection("*", ["*"], ["secrets.example.com"]) == (
+            "a sandbox granted every host cannot keep out [policy] deny pattern "
+            "'secrets.example.com'; name the hosts instead"
+        )
 
     def test_effective_bounds_include_baseline_and_advertised(self) -> None:
         config = Config.model_validate(
