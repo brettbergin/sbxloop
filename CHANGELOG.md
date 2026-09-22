@@ -15,6 +15,19 @@ peers) by an agent with `can_start` is offered none of the unguarded
 start tools, whatever it declares itself; it keeps every other tool it
 had and is not made read-only.
 
+**A memory a person cannot read is now one they cannot edit, delete or read
+back.** `GET /v1/agents/{slug}/memories` has always left out the memories
+sourced from private channels the caller cannot read, but `PATCH` and
+`DELETE` on one memory checked only that it belonged to the agent in the
+path: a member who came by an id from a channel they had left, or were
+never in, could pin or rewrite that memory, soft-delete it, and read its
+full text back out of the `PATCH` response. Both routes now apply the same
+channel-readability filter the listing does, and a memory the caller may
+not read answers the `404 memory_not_found` an unknown id answers, so the
+refusal never confirms that the memory exists. Owners, admins and plain API
+clients still see and change every memory, and a channel's own members are
+unaffected.
+
 **A run the daemon lands is finished before its follow-ups are filed, so a
 restart during the filing pass leaves nothing parked.** Approving a merge
 gate or a review wait filed the run's follow-up issues between resolving
