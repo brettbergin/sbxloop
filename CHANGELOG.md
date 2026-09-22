@@ -1,5 +1,20 @@
 ## [Unreleased]
 
+**Agent-started work counts its chain depth through chat handoffs, and a
+handoff no longer gets round the agent's own guardrails.** Every work
+tool a chat turn offered an agent with `can_start` was built at depth 0,
+so `[agent_team] max_chain_depth` never refused anything a chain of
+handoffs started, and a peer such an agent handed off to (another
+`can_start` agent, or Angie) kept the concierge's own `create_issue`,
+`label_issue_for_run` and `start_workload`, which check no `can_start`,
+daily cap or chain depth: an agent at its cap could hand off to Angie and
+have the run queued anyway. A handoff peer now starts work one hop deeper
+than the agent that handed off, so `max_chain_depth` counts handoffs as
+the hops they are, and a peer handed off to (directly or through other
+peers) by an agent with `can_start` is offered none of the unguarded
+start tools, whatever it declares itself; it keeps every other tool it
+had and is not made read-only.
+
 **A run the daemon lands is finished before its follow-ups are filed, so a
 restart during the filing pass leaves nothing parked.** Approving a merge
 gate or a review wait filed the run's follow-up issues between resolving
