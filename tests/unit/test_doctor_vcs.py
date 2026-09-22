@@ -83,6 +83,20 @@ class TestCredentialNote:
         assert row.name == "github repo acme/alpha" and row.ok
         assert "credential: fine-grained PAT (long-lived" in row.detail
 
+    def test_the_row_is_named_by_the_repositorys_own_forge(self) -> None:
+        """A GitLab project's row is a "gitlab repo", never a "github repo"
+        (#2255): the name says which forge the token and the probe went to."""
+        config = cfg(
+            vcs={"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
+            github={"repos": [{"repo": "acme/alpha"}, {"repo": "acme/hub", "kind": "github"}]},
+        )
+        rows = repo_checks(
+            config,
+            {"GITLAB_TOKEN": "tok", "GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True),
+        )
+        assert [r.name for r in rows] == ["gitlab repo acme/alpha", "github repo acme/hub"]
+
     def test_an_undetermined_credential_adds_nothing(self) -> None:
         config = cfg(github={"repos": [{"repo": "acme/alpha"}]})
         (row,) = repo_checks(

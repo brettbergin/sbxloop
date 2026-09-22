@@ -9,9 +9,9 @@ the key's own line when there is one, else the run of comment lines
 directly above it. A key the parser cannot pair gets nothing — never an
 invented sentence; the caller falls back to the type summary.
 
-Keys are the example's dotted form (``github.repos.repo`` for a
-``[[github.repos]]`` entry); :func:`doc_for` strips an editor path's indices
-so ``github.repos[1].repo`` finds it.
+Keys are the example's dotted form (``vcs.repos.repo`` for a
+``[[vcs.repos]]`` entry); :func:`doc_for` strips an editor path's indices
+so ``vcs.repos[1].repo`` finds it.
 """
 
 from __future__ import annotations

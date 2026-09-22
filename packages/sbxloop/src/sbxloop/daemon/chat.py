@@ -2364,7 +2364,7 @@ class ChatBridge(ABC):
             text += f"\n⚠ {_one_line(report.reason, 300)}"
         # The item's own repository, not the daemon's first one: with several
         # configured, the card must name where this run actually landed.
-        repo = item.repo or self.config.github.repo
+        repo = item.repo or self.config.primary_repo
         if unanswered:
             text += (
                 f"\n⚠ {len(unanswered)} steering message(s) were not answered before the run ended"

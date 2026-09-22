@@ -248,11 +248,11 @@ class ConfigScreen(ConsoleScreen):
         if config is None:
             return
         rows = []
-        for index, entry in enumerate(config.github.repo_list()):
-            effective = config.github.effective_repo(entry.repo) or entry
+        for index, entry in enumerate(config.repo_list()):
+            effective = config.effective_repo(entry.repo) or entry
             rows.append(
                 (
-                    f"github.repos[{index}]",
+                    f"vcs.repos[{index}]",
                     (
                         entry.repo,
                         "yes" if entry.enabled else "no",
@@ -336,7 +336,7 @@ class ConfigScreen(ConsoleScreen):
         self.edit_key(key)
 
     def action_add_key(self) -> None:
-        """A key the resolved view has no row for: a new ``[[github.repos]]``
+        """A key the resolved view has no row for: a new ``[[vcs.repos]]``
         entry, an environment variable, a registry."""
         if self._refuse_read_only():
             return
@@ -348,7 +348,7 @@ class ConfigScreen(ConsoleScreen):
         self.app.push_screen(
             TextPromptScreen(
                 "add a key",
-                "The dotted path to set — github.repos[2].repo, sandbox.env.RAILS_ENV. "
+                "The dotted path to set — vcs.repos[2].repo, sandbox.env.RAILS_ENV. "
                 "An index one past the end appends an entry.",
                 placeholder="section.key",
             ),
@@ -412,11 +412,22 @@ class ConfigScreen(ConsoleScreen):
             return
         current = self.file_text()
         parts = configkeys.parse_path(edit.path)
+        # A repository key on a file still spelt [[github.repos]] migrates
+        # the file first (#2255), the same as the editor every other surface
+        # writes through, so the edit lands where the loader reads it.
+        base, moved = configtoml.current_spelling(current, parts)
+        if moved:
+            self.app.notify(
+                f"legacy repository entries ({', '.join(moved)}) move under [[vcs.repos]], "
+                "comments kept",
+                title=edit.path,
+                timeout=15,
+            )
         try:
             text = (
-                configtoml.unset_value(current, parts)
+                configtoml.unset_value(base, parts)
                 if edit.unset
-                else configtoml.set_value(current, parts, edit.value)
+                else configtoml.set_value(base, parts, edit.value)
             )
         except ValueError as exc:
             self.last_verdict = f"{edit.path}: {exc}"

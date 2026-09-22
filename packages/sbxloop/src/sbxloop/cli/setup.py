@@ -81,13 +81,12 @@ def _env_name(label: str, current: str) -> str:
 
 
 def _repo_key(text: str) -> tuple[str, str]:
-    repos, has_repos = configtoml.file_value(text, ("github", "repos"))
-    legacy, has_legacy = configtoml.file_value(text, ("github", "repo"))
+    """The first ``[[vcs.repos]]`` entry's key and what it says now; the
+    legacy spelling has been migrated before this is asked (#2255)."""
+    repos, has_repos = configtoml.file_value(text, ("vcs", "repos"))
     if has_repos and isinstance(repos, list) and repos:
-        return "github.repos[0].repo", str(repos[0].get("repo", ""))
-    if has_legacy:
-        return "github.repo", str(legacy)
-    return "github.repos[0].repo", ""
+        return "vcs.repos[0].repo", str(repos[0].get("repo", ""))
+    return "vcs.repos[0].repo", ""
 
 
 def _chat_default(text: str) -> str:
@@ -247,10 +246,15 @@ def run_setup(home: SbxloopHome, *, console: Console) -> None:
                 "implemented yet.[/]"
             )
 
+    # A file still on the legacy spelling is moved to [[vcs.repos]] first
+    # (#2255), so the repository is written where the loader expects it.
+    try:
+        config_before, _moved = configtoml.migrate_repos(config_before)
+    except configtoml.ConfigWriteError as exc:
+        raise SetupError(f"setup was not saved: {exc}") from exc
     repo_key, repo_default = _repo_key(config_before)
     settings[repo_key] = _required("Repository (owner/name)", repo_default)
-    if repo_key.startswith("github.repos["):
-        settings[repo_key.rsplit(".", 1)[0] + ".kind"] = vcs
+    settings[repo_key.rsplit(".", 1)[0] + ".kind"] = vcs
     secret_updates[token_env] = _secret(
         f"{vcs.title()} token", token_env, existing_secrets.get(token_env)
     )

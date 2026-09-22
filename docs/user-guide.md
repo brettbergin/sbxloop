@@ -2512,9 +2512,14 @@ whose `origin` it actually matches; every other repository is refused at
 `doctor`/start rather than run from the wrong tree.
 
 A single legacy `[github] repo` keeps working unchanged and is normalised
-internally into a one-entry repo list; migrate by moving it (and its
-`deliver_base` / `create_repo` / `create_public`) into one `[[vcs.repos]]`
-entry, and `[[github.repos]]` entries by renaming the table. Everything under
+internally into a one-entry repo list, and `[[github.repos]]` entries load as
+`[[vcs.repos]]` ones. **`sbxloop config migrate`** rewrites either spelling in
+place — the entries and their `[vcs.repos.*]` sub-tables move, every comment
+stays, the previous file is kept as a backup — and `sbxloop setup` does the
+same before it writes a repository. `sbxloop doctor` names each repository's
+row by its own forge (`gitlab repo group/project`, `github repo owner/name`),
+and `sbxloop config repos` shows the forge and the token variable each entry
+resolves to. Everything under
 `[[vcs.repos]]` is **per repository**; the daemon-wide guardrails — the
 daily run cap, the per-item retry cap, the consecutive-failure circuit breaker
 and the concurrency cap — stay global to the daemon. Work items are keyed by

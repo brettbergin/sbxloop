@@ -237,7 +237,7 @@ def gh_credential_status(
 ) -> GhCredentialStatus:
     """Describe the credential :meth:`Provisioner.gh_credential` would pick.
 
-    ``token_env`` is a repository's own ``[[github.repos]] token_env``,
+    ``token_env`` is a repository's own ``[[vcs.repos]] token_env``,
     which — as in resolution — is an explicit per-repo PAT choice and wins
     over the ambient PAT/App decision.
     """
@@ -761,7 +761,7 @@ class Provisioner:
         if self.agent_backend() != "openai":
             return {}
         endpoints = [self._endpoint(None)]
-        endpoints += [self._endpoint(entry.repo) for entry in self.config.github.repos]
+        endpoints += [self._endpoint(entry.repo) for entry in self.config.vcs.repos]
         return {endpoint.policy_host: endpoint for endpoint in endpoints}
 
     def agent_files(self, repo: str | None = None) -> dict[str, str]:
@@ -812,7 +812,7 @@ class Provisioner:
 
         Resolution order:
 
-        - a repository's own ``[[github.repos]] token_env`` is an explicit
+        - a repository's own ``[[vcs.repos]] token_env`` is an explicit
           per-repo choice and always wins (a PAT, as before);
         - otherwise the ambient credential set decides: GH_TOKEN /
           GITHUB_TOKEN → PAT mode; GITHUB_APP_ID +
@@ -920,8 +920,8 @@ class Provisioner:
         remote: it falls back to the daemon-wide credentials instead.
         """
         if repo is not None:
-            return self.config.github.effective_repo(repo)
-        return self.config.github.default_repo()
+            return self.config.effective_repo(repo)
+        return self.config.default_repo()
 
     def github_repo_env(self, repo: str | None = None) -> dict[str, str]:
         """Remote configuration for the github-ops sandbox.
@@ -1056,12 +1056,12 @@ class Provisioner:
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
-        entry = self.config.github.find_repo(repo)
+        entry = self.config.find_repo(repo)
         if entry is not None:
             return entry.repo
         if repo:
             return repo
-        return self.config.github.repo
+        return self.config.primary_repo
 
     def _resolve_workspace(self, run_id: str, repo: str | None = None) -> Path:
         """Where this fresh run works (see :meth:`_resolve_workspace_source`)."""
@@ -1095,7 +1095,7 @@ class Provisioner:
         source = self.config.workspace_for_repo(run_repo)
         if source is None:
             configured = self.config.sandbox.workspace is not None or any(
-                entry.workspace is not None for entry in self.config.github.repos
+                entry.workspace is not None for entry in self.config.vcs.repos
             )
             if run_repo is not None and (configured or mode == "clone"):
                 # A workspace is configured somewhere, but none of it belongs
@@ -1187,7 +1187,7 @@ class Provisioner:
         matches = hostgit.origin_matches_repo(source, repo)
         if matches is True:
             return
-        if matches is None and not self.config.github.multi_repo:
+        if matches is None and not self.config.multi_repo:
             return
         if matches is None:
             actual = origin or "no origin remote"
@@ -1202,7 +1202,7 @@ class Provisioner:
         raise ProvisionError(
             f"{detail}, but this run is for {repo}; refusing to build {repo} "
             "from a tree that is not demonstrably its own. Point that "
-            "repository's [[github.repos]] entry at its own workspace (or "
+            "repository's [[vcs.repos]] entry at its own workspace (or "
             "move [sandbox] workspace into the matching entry)"
         )
 
@@ -1286,7 +1286,7 @@ class Provisioner:
             raise ProvisionError(
                 f"no workspace is configured for {repo}, and cloning it from "
                 f"{url} failed: {exc}. {why}, or configure a workspace for this "
-                "repository in its [[github.repos]] entry"
+                "repository in its [[vcs.repos]] entry"
             ) from exc
         self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
         self._populate_submodules(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
@@ -1448,7 +1448,7 @@ class Provisioner:
         ``token_env`` that is unset, both a PAT and App credentials — is
         raised here exactly as it would be for the github sandbox, so the
         run fails naming the fix instead of at the remote."""
-        entry = self.config.github.effective_repo(repo)
+        entry = self.config.effective_repo(repo)
         if self.forge_kind(repo) != "github":
             name = self.config.vcs_token_env_for(repo)
             if name and self.env.get(name):
@@ -1614,7 +1614,7 @@ class Provisioner:
         # otherwise, configured or not.
         # A tool run never gets one: its sinks are chat and the artifact
         # directory, and it has no agent to hand a GitHub token to.
-        github_enabled = self.config.github.enabled and (
+        github_enabled = self.config.vcs.enabled and (
             kind == "code" or (kind == "workload" and self._workload_needs_github())
         )
         creds = self.config.credentials_named(

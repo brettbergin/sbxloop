@@ -90,7 +90,7 @@ def sandbox_resource_checks(config: Config) -> list[Check]:
                 f"{resources.cpus} CPUs, {resources.memory} memory per VM (requested)",
             )
         )
-    for repo in config.github.repos:
+    for repo in config.vcs.repos:
         if repo.cpus is not None or repo.memory is not None:
             resources = config.sandbox_resources_for("agent", repo.repo)
             checks.append(
@@ -363,9 +363,11 @@ def repo_checks(
     the verdict of the others.
     """
     rows: list[Check] = []
-    for entry in config.github.repo_list():
-        effective = config.github.effective_repo(entry.repo) or entry
-        name = f"github repo {entry.repo}"
+    for entry in config.repo_list():
+        effective = config.effective_repo(entry.repo) or entry
+        # Named by the repository's own forge (#2255): the token and the
+        # probe below went there, not to GitHub.
+        name = f"{config.vcs_kind_for(entry.repo)} repo {entry.repo}"
         if not entry.enabled:
             rows.append(
                 Check(name, True, "disabled in sbxloop.toml — not polled, not run", hard=False)
@@ -571,7 +573,7 @@ class WorkspaceOriginMismatch:
         return (
             f"workspace {self.path} is a checkout of {self.origin_repo}, not {self.repo} — "
             f"runs for {self.repo} would be built from another repository's tree; "
-            f"move [sandbox] workspace into the matching [[github.repos]] entry, or set "
+            f"move [sandbox] workspace into the matching [[vcs.repos]] entry, or set "
             f'workspace = "..." on the {self.repo} entry'
         )
 
@@ -589,7 +591,7 @@ def workspace_origin_mismatches(config: Config) -> list[WorkspaceOriginMismatch]
     from sbxloop import hostgit
 
     mismatches: list[WorkspaceOriginMismatch] = []
-    for entry in config.github.enabled_repos():
+    for entry in config.enabled_repos():
         path = config.workspace_for_repo(entry.repo)
         if path is None:
             if entry.workspace is not None:
@@ -622,7 +624,7 @@ def workspace_checks(config: Config) -> list[Check]:
     """Where each enabled repository's dedicated checkout is: the operator's
     own, the home's (cloned by the daemon on first use), or nowhere yet."""
     checks: list[Check] = []
-    for entry in config.github.enabled_repos():
+    for entry in config.enabled_repos():
         path = config.workspace_for_repo(entry.repo)
         default = config.default_workspace_for_repo(entry.repo)
         if path is not None:
@@ -1007,7 +1009,7 @@ def registry_credential_checks(config: Config, env: dict[str, str]) -> list[Chec
     ]
     scopes.extend(
         (f"{entry.repo} registries", [r.auth_env for r in entry.registries if r.auth_env])
-        for entry in config.github.repos
+        for entry in config.vcs.repos
         if entry.registries is not None
     )
     names = sorted({name for _scope, listed in scopes for name in listed})
@@ -1193,8 +1195,8 @@ def daemon_intake_checks(config: Config, stored: Sequence[Any] = ()) -> list[Che
     (`daemon.no_repository`); that is a soft row, since a CLI-only host
     never starts one."""
     sources: list[str] = []
-    if config.github.enabled:
-        repos = ", ".join(r.repo for r in config.github.repo_list()) or str(config.github.repo)
+    if config.vcs.enabled:
+        repos = ", ".join(r.repo for r in config.repo_list()) or str(config.primary_repo)
         sources.append(f"labeled issues of {repos}")
     backend = config.chat_backend
     if backend is not None and config.concierge.enabled:
@@ -1291,7 +1293,7 @@ def collect_checks(
         # (openai) binds the same credential to another host
         agent_hosts = dict.fromkeys(
             host
-            for repo in (None, *(entry.repo for entry in config.github.repos))
+            for repo in (None, *(entry.repo for entry in config.vcs.repos))
             for host in backend_for(config).token_hosts(config, repo)
         )
         for host in agent_hosts:
@@ -1464,9 +1466,9 @@ def collect_checks(
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
     # both at once, or a partial App set, is a named failure (#568).
-    if config.github.enabled:
+    if config.vcs.enabled:
         cred = gh_credential_status(env)
-        configured = ", ".join(r.repo for r in config.github.repo_list()) or str(config.github.repo)
+        configured = ", ".join(r.repo for r in config.repo_list()) or str(config.primary_repo)
         checks.append(
             Check(
                 "github credentials",
@@ -1630,7 +1632,7 @@ def collect_checks(
         )
 
     # Model policy is a local diagnostic, not a paid capability probe.
-    for model_repo in (None, *(entry.repo for entry in config.github.repos)):
+    for model_repo in (None, *(entry.repo for entry in config.vcs.repos)):
         for phase, choice in model_plan(config, repo=model_repo).items():
             if model_repo is not None and not choice.source.startswith("github.repos["):
                 continue
@@ -1920,7 +1922,7 @@ def doctor_report(
     boxes: dict[str, DaemonGithub] = {}
     probe_repo = (
         sandbox_repo_probe(config, cli, boxes=boxes)
-        if config.github.enabled and (probe or deep)
+        if config.vcs.enabled and (probe or deep)
         else None
     )
     try:

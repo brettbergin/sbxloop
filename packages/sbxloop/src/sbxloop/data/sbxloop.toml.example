@@ -282,7 +282,7 @@ service_memory = "2g"
 # pair it with `auth_user` in a 0600 ~/.netrc. pypi and maven make the
 # registry THE source (point them at a virtual/group repository that proxies
 # the public index); npm with `scope` serves that scope only. A
-# [[github.repos]] entry may set its own `registries` list, which replaces
+# [[vcs.repos]] entry may set its own `registries` list, which replaces
 # this one.
 # [[registries]]
 # kind = "npm"                          # npm | pypi | go | cargo | maven | nuget | gem | generic
@@ -552,7 +552,7 @@ service_memory = "2g"
 # Everything in an entry is PER REPOSITORY; the [daemon] guardrails (daily
 # run cap, per-item attempt cap, circuit breaker, one run at a time) stay
 # daemon-wide and are shared across all of them. `sbxloop run --repo
-# owner/repo` picks one per run. The older spelling, [[github.repos]] (or
+# owner/repo` picks one per run. The older spelling, [[vcs.repos]] (or
 # a single `repo` under [github]), still loads and is read as this list.
 # [[vcs.repos]]
 # Run-agent resource overrides; omitted values inherit [sandbox].

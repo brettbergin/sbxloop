@@ -66,7 +66,7 @@ class TestWorkspaceOriginMismatch:
         assert "brettbergin/entrygraph" in row.detail
         assert "brettbergin/sbxloop" in row.detail
         assert str(ws) in row.detail
-        assert "[[github.repos]]" in row.detail
+        assert "[[vcs.repos]]" in row.detail  # the remedy names the current spelling (#2255)
 
     def test_single_repo_legacy_workspace_passes(self, workdir: Path) -> None:
         ws = make_checkout(workdir / "repo", "brettbergin/sbxloop")

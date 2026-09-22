@@ -320,9 +320,10 @@ def test_example_mentions_every_key_the_config_model_knows() -> None:
     assert not missing, f"keys absent from sbxloop.toml.example: {missing}"
 
 
-def test_example_documents_both_github_forms() -> None:
+def test_example_documents_the_repo_entry_and_the_legacy_form() -> None:
     text = EXAMPLE.read_text()
-    assert "[[github.repos]]" in text
+    assert "[[vcs.repos]]" in text
+    # The single `[github] repo` is documented as the legacy form (#2255).
     assert re.search(r"^# repo = \"you/your-repo\"", text, re.MULTILINE)
     for key in ("deliver_base", "enabled", "token_env", "trigger_label", "labels", "workspace"):
         assert re.search(rf"^#\s*{key} = ", text, re.MULTILINE), key

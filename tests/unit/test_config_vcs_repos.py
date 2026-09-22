@@ -85,6 +85,15 @@ class TestDeclaredUnderVcs:
         assert cfg.vcs.repos == [] and cfg.repo_list() == []
         assert not cfg.github.enabled and cfg.primary_repo is None
         assert cfg.default_repo() is None
+        assert cfg.vcs.enabled is False
+
+    def test_the_forge_is_on_once_a_repository_is_declared(self, tmp_path: Path) -> None:
+        # `vcs.enabled` is the forge-neutral "a repository is configured"
+        # every consumer reads (#2255); the GitHub section's answers the same.
+        cfg = _load(tmp_path, TWO)
+        assert cfg.vcs.enabled is True and cfg.github.enabled is True
+        legacy = _load(tmp_path, '[github]\nrepo = "o/r"\n')
+        assert legacy.vcs.enabled is True
 
 
 class TestLegacySpelling:
