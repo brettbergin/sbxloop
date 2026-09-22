@@ -116,6 +116,24 @@ def is_chat_id(value: str) -> bool:
     return value.startswith(CHAT_PREFIX) and len(value) > len(CHAT_PREFIX)
 
 
+#: Run kinds whose item's source key is the asking chat message's id. A
+#: ``code`` run is keyed by the issue that asked instead.
+CHAT_SOURCE_KINDS: frozenset[str] = frozenset({"workload", "tool"})
+
+
+def chat_source_message_id(run_kind: str, source_key: str) -> str | None:
+    """The chat message an item's source key names, when one made the ask.
+
+    A workload or tool run a chat turn asked for is keyed by that message,
+    optionally with a suffix after a colon. Every other kind is keyed by an
+    issue, a schedule or an inbox file and names no message, so a caller
+    that needs one falls back rather than guessing.
+    """
+    if run_kind not in CHAT_SOURCE_KINDS:
+        return None
+    return source_key.split(":", 1)[0].strip() or None
+
+
 def schedule_item_id(name: str, due: str) -> str:
     """The work item id for one tick of a schedule: its name and the
     minute it was due (``2026-09-05T07:00Z``)."""
@@ -239,6 +257,7 @@ def normalize_item_id(value: str) -> str:
 __all__ = [
     "API_PREFIX",
     "CHAT_PREFIX",
+    "CHAT_SOURCE_KINDS",
     "DEFAULT_FORGE",
     "FORGE_PREFIXES",
     "GH_PREFIX",
@@ -247,6 +266,7 @@ __all__ = [
     "GhKind",
     "api_item_id",
     "chat_item_id",
+    "chat_source_message_id",
     "format_gh_id",
     "has_gh_prefix",
     "is_api_id",

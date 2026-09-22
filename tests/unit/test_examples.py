@@ -86,7 +86,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "# allow_insecure_endpoint = ",
         "# api = ",
         "# reasoning_effort = ",
-        "# [github.repos.openai]",
+        "# [vcs.repos.openai]",
     ):
         assert key in DEFAULT_CONFIG_TOML, key
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text()
@@ -97,7 +97,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "`[agent.openai] allow_insecure_endpoint`",
         "`[agent.openai] api`",
         "`[agent.openai] reasoning_effort`",
-        "`[github.repos.openai] base_url`",
+        "`[vcs.repos.openai] base_url`",
     ):
         assert key in guide, key
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
@@ -320,9 +320,10 @@ def test_example_mentions_every_key_the_config_model_knows() -> None:
     assert not missing, f"keys absent from sbxloop.toml.example: {missing}"
 
 
-def test_example_documents_both_github_forms() -> None:
+def test_example_documents_the_repo_entry_and_the_legacy_form() -> None:
     text = EXAMPLE.read_text()
-    assert "[[github.repos]]" in text
+    assert "[[vcs.repos]]" in text
+    # The single `[github] repo` is documented as the legacy form (#2255).
     assert re.search(r"^# repo = \"you/your-repo\"", text, re.MULTILINE)
     for key in ("deliver_base", "enabled", "token_env", "trigger_label", "labels", "workspace"):
         assert re.search(rf"^#\s*{key} = ", text, re.MULTILINE), key
@@ -535,12 +536,15 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             continue  # a multi-line value (the exclude list); covered below
         if section in ("registries", "credentials", "workloads", "schedules", "mcp", "agents"):
             continue  # array-of-tables entries load as whole blocks, below
-        if section == "github.repos":
-            doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
-        elif section == "github.repos.agent_models":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
-        elif section == "github.repos.openai":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
+        if section in ("vcs.repos", "github.repos"):
+            top = section.split(".")[0]
+            doc: dict[str, Any] = {top: {"repos": [{"repo": "you/your-repo", **parsed}]}}
+        elif section in ("vcs.repos.agent_models", "github.repos.agent_models"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
+        elif section in ("vcs.repos.openai", "github.repos.openai"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
         elif section == "agent.models":
             doc = {"agent": {"models": parsed}}
         elif section == "agent.openai":
@@ -767,6 +771,73 @@ def test_example_memory_section_documents_the_defaults() -> None:
         "prompt_budget_chars",
     }
     assert Config.model_validate({"memory": block}).memory == Config().memory
+
+
+def test_example_agent_team_section_documents_the_defaults() -> None:
+    """The commented `[agent_team]` block, uncommented whole, loads and
+    equals the model's defaults: the example never advertises a chain depth,
+    a per-agent cap or a value for what a run says in its channel that the
+    daemon does not actually apply."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[agent_team]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "max_chain_depth",
+        "max_agent_runs_per_day",
+        "chronicle",
+        "max_posts_per_run",
+        "progress_interval_s",
+    }
+    assert Config.model_validate({"agent_team": block}).agent_team == Config().agent_team
+
+
+def test_example_collaboration_section_documents_the_defaults() -> None:
+    """The commented `[collaboration]` block, uncommented whole, loads and
+    equals the model's defaults, so the guardrail example never advertises
+    a cap the daemon does not apply."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[collaboration]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "max_chain_depth",
+        "window_s",
+        "channel_turns_per_window",
+        "agent_turns_per_window",
+        "pair_cooldown_s",
+        "ambient",
+        "ambient_window_messages",
+        "ambient_max_per_hour",
+    }
+    assert Config.model_validate({"collaboration": block}).collaboration == Config().collaboration
+
+
+def test_example_documents_the_ambient_model_as_an_opt_in() -> None:
+    """`[collaboration] ambient_model` ships unset, so the classifier reuses
+    the concierge's model until an operator names a cheaper one. It is shown
+    outside the defaults block with a value that loads."""
+    text = DEFAULT_CONFIG_TOML
+    section = text[text.index("# [collaboration]") :]
+    match = re.search(r'^# ambient_model = "([^"]+)"', section, re.MULTILINE)
+    assert match is not None, "[collaboration] ambient_model is not in the example"
+    assert Config().collaboration.ambient_model is None
+    loaded = Config.model_validate({"collaboration": {"ambient_model": match.group(1)}})
+    assert loaded.collaboration.ambient_model == match.group(1)
 
 
 def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:

@@ -87,7 +87,9 @@ from sbxloop.ghids import (
     API_PREFIX,
     CHAT_PREFIX,
     SCHED_PREFIX,
+    chat_source_message_id,
     format_gh_id,
+    is_chat_id,
     normalize_item_id,
     try_parse_gh_id,
 )
@@ -864,6 +866,21 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         chain_depth=int(row.chain_depth or 0),
         revision=int(row.revision or 0),
     )
+
+
+def _message_link(item_id: str, run_kind: str, source_key: str) -> str | None:
+    """The chat message this item's key names, for the indexed link the
+    chat projection joins on (revision 0032).
+
+    Only a chat ask has one: its key is the asking message's id, with an
+    optional suffix after a colon naming which participant or target of
+    that message the work belongs to. Work keyed by an issue, a schedule
+    or an inbox file names no message and is linked by its channel, so it
+    stores nothing here rather than a prefix that could collide.
+    """
+    if not is_chat_id(item_id):
+        return None
+    return chat_source_message_id(run_kind, source_key)
 
 
 #: The ``daemon_state`` key prefix of a chat turn's admission note.
@@ -1781,6 +1798,7 @@ class DaemonStore:
                     profile=item.profile,
                     recipe=item.recipe,
                     recipe_target=item.recipe_target,
+                    message_id=_message_link(item_id, item.kind, item.source_key),
                     origin_agent=item.origin_agent,
                     parent_item_id=item.parent_item_id,
                     chain_depth=item.chain_depth,
@@ -2208,6 +2226,20 @@ class DaemonStore:
             row = session.scalars(select(WorkItemRow).where(_id_where(item_id))).first()
             return _row_to_item(row) if row else None
 
+    def get_many(self, item_ids: Sequence[str]) -> dict[str, WorkItem]:
+        """The items for ``item_ids``, keyed by the id asked for, in one
+        query. Ids are matched exactly: this serves readers that already
+        hold the id **as stored** (a projection that selected it from the
+        table), so it does not need :meth:`get`'s either-spelling lookup,
+        and an id with no row is simply absent from the result.
+        """
+        wanted = list(dict.fromkeys(item_ids))
+        if not wanted:
+            return {}
+        with self._read() as session:
+            rows = session.scalars(select(WorkItemRow).where(WorkItemRow.item_id.in_(wanted))).all()
+            return {str(row.item_id): _row_to_item(row) for row in rows}
+
     def next_queued(
         self,
         now: float,
@@ -2291,6 +2323,30 @@ class DaemonStore:
                     select(WorkItemRow).where(WorkItemRow.state == "running")
                 )
             ]
+
+    def channel_live_work(self, channel_id: str) -> tuple[list[str], list[str]]:
+        """``(running run ids, queued item ids)`` for one channel's work.
+
+        What a channel-wide stop acts on. Narrow on purpose: three columns
+        of the few live rows, keyed off the state index, rather than
+        :meth:`items`, which is unbounded, sorts on ``created_at`` and
+        hydrates every item's body to answer a question about one channel.
+        """
+        running: list[str] = []
+        queued: list[str] = []
+        with self._read() as session:
+            rows = session.execute(
+                select(WorkItemRow.item_id, WorkItemRow.state, WorkItemRow.run_id).where(
+                    WorkItemRow.state.in_(("running", "queued")),
+                    WorkItemRow.channel_id == channel_id,
+                )
+            ).all()
+        for item_id, state, run_id in rows:
+            if state == "running" and run_id:
+                running.append(str(run_id))
+            elif state == "queued":
+                queued.append(str(item_id))
+        return running, queued
 
     def items(self, states: Sequence[ItemState] | None = None) -> list[WorkItem]:
         """Every known item (optionally filtered by state), oldest first —
@@ -2806,6 +2862,19 @@ class DaemonStore:
                     select(func.count())
                     .select_from(RunResumeRow)
                     .where(RunResumeRow.resumed_at >= ts)
+                )
+                or 0
+            )
+
+    def resumes_for_run(self, run_id: str) -> int:
+        """How many times ``run_id`` was resumed (a provider recovery is
+        the same segment carrying on, and is not recorded as one)."""
+        with self._read() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(RunResumeRow)
+                    .where(RunResumeRow.run_id == run_id)
                 )
                 or 0
             )

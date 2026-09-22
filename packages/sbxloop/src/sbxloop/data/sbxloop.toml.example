@@ -282,7 +282,7 @@ service_memory = "2g"
 # pair it with `auth_user` in a 0600 ~/.netrc. pypi and maven make the
 # registry THE source (point them at a virtual/group repository that proxies
 # the public index); npm with `scope` serves that scope only. A
-# [[github.repos]] entry may set its own `registries` list, which replaces
+# [[vcs.repos]] entry may set its own `registries` list, which replaces
 # this one.
 # [[registries]]
 # kind = "npm"                          # npm | pypi | go | cargo | maven | nuget | gem | generic
@@ -394,6 +394,45 @@ service_memory = "2g"
 # max_item_chars = 1000            # one memory's text is cut to this length
 # prompt_budget_chars = 4000       # the most a memory block may add to a prompt
 
+# [agent_team]
+# What agents may start on their own. An agent whose `[[agents]]` entry
+# declares `can_start` is offered `start_run` and `file_issue`; these two
+# bounds keep that from becoming a spiral. Depth 0 is work a person asked
+# for, so the first run an agent starts is depth 1; set max_chain_depth = 0
+# to stop agent-started work without editing every agent. Both bounds
+# count every start, an issue filed without queueing included, from the
+# moment it is made rather than from when a poll discovers it.
+# max_chain_depth = 2              # how deep a chain of agent-started work may go
+# max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+#
+# What a run says in the channel that asked for it. Each post is made
+# under the name of the agent that did the work: the plan by the planner,
+# each finished task by its agent, the verdict by the critic, the delivery
+# and any notice by the lead. `quiet` keeps only what ends a run; `off`
+# posts nothing. The delivery and a terminal notice are posted whatever
+# the cap says.
+# chronicle = "normal"             # normal | quiet | off
+# max_posts_per_run = 12           # the most one run says, deliveries and notices aside
+# progress_interval_s = 120.0      # progress is coalesced to at most one this often
+
+# [collaboration]
+# Naming an agent in an agent's own reply addresses it: a follow-up turn is
+# queued for it. These bounds keep a pair of agents from answering each
+# other forever. The channel's silence and the token budget apply too.
+# max_chain_depth = 4              # agent-started turns allowed after one human turn
+# window_s = 600                   # the window the rate caps count within
+# channel_turns_per_window = 20    # agent turns one channel may take in that window
+# agent_turns_per_window = 6       # agent turns one agent may take there in that window
+# pair_cooldown_s = 60             # how long an agent waits before addressing the same agent again
+# ambient = false                  # let a participant in `ambient` mode speak unprompted
+# ambient_window_messages = 5      # recent messages the prefilter and the classifier read
+# ambient_max_per_hour = 6         # how often one ambient agent may speak in a channel
+
+# The relevance classifier runs once per ambient participant per message
+# that gets past the interest prefilter, so it wants a cheap model. It is
+# unset by default, which reuses the concierge's:
+# ambient_model = "gpt-4o-mini"
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need
@@ -471,11 +510,12 @@ service_memory = "2g"
 # deny = []
 
 # [vcs]
-# The version-control backend: which forge the repositories live on.
+# The version-control backend: which forge the repositories live on, and
+# the repositories themselves (the [[vcs.repos]] entries below).
 # "github" and "gitlab" answer a run in full (on GitLab a delivery is one
 # commits-API changeset, and a merge train only where the project has one);
 # "gitea" loads, and `sbxloop doctor` reports it as not yet implemented.
-# Anything else is refused at load. A `[[github.repos]]` entry may name its
+# Anything else is refused at load. A `[[vcs.repos]]` entry may name its
 # own `kind`. Without this section `[github]` is read as kind = "github",
 # and the loader says so once.
 # kind = "github"
@@ -487,7 +527,7 @@ service_memory = "2g"
 # The host variable the forge token is read from (a name; the value lives
 # in secrets.env). Unset: GITLAB_TOKEN for "gitlab", GITEA_TOKEN for
 # "gitea"; for "github" the credential is GH_TOKEN/GITHUB_TOKEN or the App
-# installation, and a [[github.repos]] entry's own token_env still wins.
+# installation, and a [[vcs.repos]] entry's own token_env still wins.
 # token_env = "GITLAB_TOKEN"
 #
 # The same three keys for a self-managed GitLab — a project access token
@@ -500,28 +540,93 @@ service_memory = "2g"
 # kind = "gitea"
 # api_url = "https://gitea.example.com/api/v1"
 # token_env = "GITEA_TOKEN"
+#
+# THE REPOSITORIES sbxloop works with, one entry each, whatever forge they
+# live on. With none declared the forge is off: no forge sandbox is
+# provisioned, no token is required, and a run stops after its gate with
+# the work in the workspace. With one or more, the daemon polls every
+# enabled entry for the trigger label and routes each run — clone, branch,
+# pull request, review, CI, merge, issue comments — to the repository its
+# work item came from; every run that passes its gate opens a pull request
+# there and carries it through review, CI and merge (see [landing]).
+# Everything in an entry is PER REPOSITORY; the [daemon] guardrails (daily
+# run cap, per-item attempt cap, circuit breaker, one run at a time) stay
+# daemon-wide and are shared across all of them. `sbxloop run --repo
+# owner/repo` picks one per run. The older spelling, [[vcs.repos]] (or
+# a single `repo` under [github]), still loads and is read as this list.
+# [[vcs.repos]]
+# Run-agent resource overrides; omitted values inherit [sandbox].
+# cpus = 6
+# Run-agent memory override; omitted inherits [sandbox] memory.
+# memory = "12g"
+# repo = "you/your-repo"           # owner/name; on GitLab, group/subgroup/project
+# kind = "github"                  # the forge this repository lives on; unset uses [vcs]'s
+# workspace = "/path/to/checkout"  # this repo's host checkout; unset falls
+#                                  # back to [sandbox] workspace when that
+#                                  # checkout belongs to this repository
+# deliver_base = "main"            # base branch; unset uses the repo's default
+# create_repo = false              # create the repository when missing (probed up front, so a
+#                                  # typo'd repo fails the run before any work; needs a token
+#                                  # allowed to create repos)
+# create_public = false            # created repos are private unless flipped
+# pr_title_template = "feat: {title}"  # naming overrides; unset uses [github]'s
+# commit_message_template = "{title}"  # the delivered commit's message; unset uses [github]'s
+# branch_prefix = "bot/"           # what the run id is appended to; unset uses [github]'s
+# bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
+# reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
+# review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
+# env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
+# registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
+# apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
+# setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
+# verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
+# [vcs.repos.agent_models]
+# Sparse per-key overrides over [agent.models]; omit to inherit. The same
+# eight phase keys are supported. `list-models --repo you/your-repo` shows them.
+# decompose = "auto"           # the planner's model for this repository
+# build = "auto"               # the builder's
+# review = "auto"              # the self-review's
+# steer = "auto"               # the in-flight steer's
+# reauthor_verify = "auto"     # the verify re-author's
+# operator_plan = "auto"       # the workload planner's
+# operator_execute = "auto"    # the workload executor's
+# operator_judge = "auto"      # the workload judge's
+# [vcs.repos.openai]
+# Sparse per-repository overrides over [agent.openai] for a repository whose
+# code must stay on a private endpoint; omit a key to inherit. The endpoint
+# only — api_key_env is one per host.
+# base_url = "http://private-vllm:8000/v1"
+# request_timeout_s = 900      # per request, seconds; unset uses [agent.openai]'s
+# max_retries = 2              # retries per request; unset uses [agent.openai]'s
+# allow_insecure_endpoint = true  # allow a plain-http or self-signed endpoint here
+# api = "chat"                 # auto settles against this repository's own base_url
+# reasoning_effort = "low"     # overrides [agent.openai] reasoning_effort here
+# [[vcs.repos]]
+# repo = "you/other-repo"
+# enabled = false              # registered but not polled
+# token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
+# trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+# in_progress_label = "loop:wip" # every lifecycle label can be renamed per repo:
+# failed_label = "loop:failed"   # in_progress, failed, completed, blocked, gated
+# completed_label = "loop:done"  # applied when the pull request merges
+# blocked_label = "loop:blocked" # the loop could not land the PR; a human looks
+# gated_label = "loop:gated"     # parked behind the opt-in merge gate
+# workload_label = "loop:report" # queues the issue as a workload run, not a code run
+# labels = ["team:core"]       # extra labels for issues/PRs in this repo
+# `sbxloop init-repo you/other-repo` creates the labels (colored, described).
 
 # [github]
-# The GitHub integration. Unset (the default) disables GitHub entirely:
-# no github sandbox is provisioned, GH_TOKEN is not required, and a run
-# stops after its gate with the work in the workspace.
-#
-# TWO FORMS, mutually exclusive:
-#   1. the legacy single `repo` below — one repository, still supported
-#      unchanged;
-#   2. the `[[github.repos]]` array further down — one entry per repository.
-# Migrate by moving `repo` and its delivery settings (`deliver_base`,
-# `create_repo`, `create_public`) into one `[[github.repos]]` entry and
-# deleting the single `repo` key.
-#
-# Set `repo` to the ONE repository sbxloop works with: every run that passes
-# its gate opens a pull request there and carries it through review, CI and
-# merge (see [landing]). GH_TOKEN needs contents:write + pull_requests:write
-# on it. `sbxloop run --repo owner/repo` overrides this per run.
-# repo = "you/your-repo"
-# deliver_base = "main"   # base branch; unset uses the repo's default
-# Create `repo` when it does not exist (probed up front, so a typo'd repo
-# fails the run before any work; needs a token allowed to create repos).
+# The GitHub backend's own settings: where GitHub is, how the loop names
+# what it writes there, and the identity and reviewers it acts with. A
+# repository is declared under [[vcs.repos]] above; the single `repo` here
+# is the legacy way to declare one and still loads (as one [[vcs.repos]]
+# entry carrying the delivery settings beside it). GH_TOKEN needs
+# contents:write + pull_requests:write on every repository.
+# repo = "you/your-repo"  # legacy: one repository, read as a [[vcs.repos]] entry
+# deliver_base = "main"   # base branch for every repository; an entry's own wins
+# Create the repository when it does not exist (probed up front, so a
+# typo'd repo fails the run before any work; needs a token allowed to
+# create repos). An entry's own setting wins.
 # create_repo = false
 # create_public = false   # created repos are private unless flipped
 # Issue number this run resolves ("Closes #N" in the PR body). Set per run by
@@ -531,7 +636,7 @@ service_memory = "2g"
 # NAMING what the loop writes. Placeholders: {title} (the plan's PR title,
 # matched to the repository's commit-subject style; falls back to the run's
 # outcome), {outcome}, {run_id}, {repo}. Every one is overridable per
-# repository in a `[[github.repos]]` entry. The defaults are what the loop
+# repository in a `[[vcs.repos]]` entry. The defaults are what the loop
 # always wrote — except on a repository that lints titles as conventional
 # commits (commitlint, action-semantic-pull-request), where the default
 # title becomes the plan's `type(scope): summary` alone; a template set
@@ -566,68 +671,6 @@ service_memory = "2g"
 # served from github.com even for GHES). FIELD-UNVERIFIED against a GHES.
 # api_url = "https://api.github.com"
 # api_url = "https://ghe.example.com/api/v3"
-#
-# Several repositories: declare them as an array of tables instead of the
-# single `repo` above. The daemon polls every enabled entry for the trigger
-# label and routes each run — clone, branch, PR, review, CI, merge, issue
-# comments — to the repository its work item came from. Everything here is
-# PER REPOSITORY; the [daemon] guardrails (daily run cap, per-item attempt
-# cap, circuit breaker, one run at a time) stay daemon-wide and are shared
-# across all of them.
-# [[github.repos]]
-# Run-agent resource overrides; omitted values inherit [sandbox].
-# cpus = 6
-# Run-agent memory override; omitted inherits [sandbox] memory.
-# memory = "12g"
-# repo = "you/your-repo"
-# kind = "github"                  # the forge this repository lives on; unset uses [vcs]'s
-# workspace = "/path/to/checkout"  # this repo's host checkout; unset falls
-#                                  # back to [sandbox] workspace when that
-#                                  # checkout belongs to this repository
-# deliver_base = "main"            # base branch; unset uses the repo's default
-# create_repo = false              # create the repository when missing
-# create_public = false            # created repos are private unless flipped
-# pr_title_template = "feat: {title}"  # naming overrides; unset uses [github]'s
-# commit_message_template = "{title}"
-# branch_prefix = "bot/"
-# bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
-# reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
-# review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
-# env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
-# registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
-# apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
-# setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
-# verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
-# [github.repos.agent_models]
-# Sparse per-key overrides over [agent.models]; omit to inherit. The same
-# eight phase keys are supported. `list-models --repo you/your-repo` shows them.
-# decompose = "auto"
-# build = "auto"
-# review = "auto"
-# steer = "auto"
-# reauthor_verify = "auto"
-# operator_plan = "auto"
-# operator_execute = "auto"
-# operator_judge = "auto"
-# [github.repos.openai]
-# Sparse per-repository overrides over [agent.openai] for a repository whose
-# code must stay on a private endpoint; omit a key to inherit. The endpoint
-# only — api_key_env is one per host.
-# base_url = "http://private-vllm:8000/v1"
-# request_timeout_s = 900
-# max_retries = 2
-# allow_insecure_endpoint = true
-# api = "chat"                 # auto settles against this repository's own base_url
-# reasoning_effort = "low"     # overrides [agent.openai] reasoning_effort here
-# [[github.repos]]
-# repo = "you/other-repo"
-# enabled = false              # registered but not polled
-# token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
-# trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
-# in_progress_label = "loop:wip" # every lifecycle label can be renamed per repo:
-# failed_label = "loop:failed"   # in_progress, failed, completed, blocked, gated
-# labels = ["team:core"]       # extra labels for issues/PRs in this repo
-# `sbxloop init-repo you/other-repo` creates the labels (colored, described).
 
 # [landing]
 # What happens after the tasks are built: the PR opens as a draft, the run
@@ -658,7 +701,8 @@ service_memory = "2g"
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
 # retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human
-# ci_poll_interval_s = 60
+# ci_poll_interval_s = 60    # the longest wait between polls of the forge (CI, undraft, mergeability, merge)
+# ci_poll_min_s = 10         # the first wait on one of those; it doubles each time up to ci_poll_interval_s
 # ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI" — after a delivery, and again
 #                            # at landing for a head no poll has seen (a resume, a merge-gate approve, an update-branch).
 #                            # Calibrated to GitHub Actions' check-run registration latency; raise it for CI that
@@ -773,6 +817,8 @@ service_memory = "2g"
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
+# warm_pairs = 0                  # sandbox sets kept booted and installed ahead of dispatch (0-4)
+# warm_ttl_s = 21600              # a ready warm set older than this is removed and replaced
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # daily_token_budget = 2000000   # input+output tokens per day across runs and chat turns; unset: no budget
 # max_attempts_per_item = 2
@@ -994,7 +1040,7 @@ service_memory = "2g"
 #                                  # one on your explicit yes and restart to apply it
 #                                  # (set_config); false removes both. The chat sections
 #                                  # and this gate are never changed from chat regardless
-# config_locked = ["policy", "mcp", "credentials", "registries", "github.repos.token_env", "telemetry.dsn_env"]
+# config_locked = ["policy", "mcp", "credentials", "registries", "vcs.kind", "vcs.api_url", "vcs.token_env", "vcs.repos.kind", "vcs.repos.token_env", "agents", "github.repos.kind", "github.repos.token_env", "telemetry.dsn_env"]
 #                                  # dotted prefixes chat may read but not change — egress,
 #                                  # tool grants and credential names by default (`*` is
 #                                  # one segment); remove one here to allow it from chat

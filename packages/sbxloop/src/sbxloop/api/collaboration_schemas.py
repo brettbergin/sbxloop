@@ -284,6 +284,10 @@ class ConnectionOut(ApiModel):
     auth_type: Literal["oauth2", "api_key", "token", "credentials"]
     status: Literal["connected", "expired", "error", "disconnected"]
     masked_credentials: dict[str, str]
+    configured: bool = False
+    active: bool = False
+    restart_required: bool = False
+    settings: dict[str, str] = Field(default_factory=dict)
     scopes: str | None = None
     token_expires_at: str | None = None
     last_used_at: str | None = None
@@ -296,6 +300,14 @@ class ConnectionMutation(ApiModel):
     service_type: str | None = None
     credentials: dict[str, str] = Field(default_factory=dict)
     display_name: str | None = None
+
+
+class ConnectionConfigure(ApiModel):
+    """Only known service settings and write-only credentials are accepted."""
+
+    settings: dict[str, str] = Field(default_factory=dict)
+    credentials: dict[str, str] = Field(default_factory=dict)
+    activate: bool = True
 
 
 class ConnectionTestOut(ApiModel):
@@ -359,6 +371,9 @@ class ChannelOut(ApiModel):
     visibility: ChannelVisibility = "private"
     created_by: str | None = None
     silenced_until: float | None = None
+    #: Messages past the reader's last read sequence. Null for a caller
+    #: with no channel membership to measure against.
+    unread_count: int | None = None
     #: The caller's role in the channel; ``null`` when not a member.
     my_role: ChannelRoleName | None = None
 
@@ -409,7 +424,9 @@ class ArtifactRefOut(ApiModel):
 
 class ChannelWorkOut(ApiModel):
     item_id: str
-    turn_id: str
+    #: The turn the work hangs on; null for a run a channel asked for
+    #: outside any turn of its own.
+    turn_id: str | None = None
     agent_slug: str | None
     title: str
     kind: str
@@ -425,12 +442,92 @@ class ChannelWorkOut(ApiModel):
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
+class ChannelArtifactPage(ApiModel):
+    """Every file a channel's messages carry."""
+
+    data: list[ArtifactRefOut]
+
+
 class AuthorOut(ApiModel):
     """Who wrote a message: a person, an agent, or sbxloop itself."""
 
     kind: Literal["human", "agent", "system"]
     id: str | None = None
     display_name: str | None = None
+
+
+BridgeBackendName = Literal["discord", "slack", "mattermost"]
+
+
+class MessageOriginOut(ApiModel):
+    """The bridge surface a message arrived on, for a message that did."""
+
+    backend: str
+    surface_id: str
+    external_message_id: str | None = None
+
+
+class BridgeOut(ApiModel):
+    """A chat service this release can bridge, and whether it is set up."""
+
+    backend: BridgeBackendName
+    configured: bool
+    label: str
+
+
+class BridgePage(ApiModel):
+    data: list[BridgeOut]
+
+
+class ChannelLinkCreate(ApiModel):
+    """Link a surface of a chat service to this channel.
+
+    ``allow_guests`` admits people on that surface who have linked no
+    account: their messages are stored under the name they use there.
+    """
+
+    backend: BridgeBackendName
+    surface_id: str = Field(min_length=1, max_length=200)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=200)
+    allow_guests: bool = False
+
+
+class ChannelLinkOut(ApiModel):
+    id: str
+    channel_id: str
+    backend: BridgeBackendName
+    surface_id: str
+    thread_id: str | None = None
+    allow_guests: bool = False
+    created_by: str | None = None
+    created_at: str
+    active: bool = True
+
+
+class ChannelLinkPage(ApiModel):
+    data: list[ChannelLinkOut]
+
+
+class LinkCodeOut(ApiModel):
+    """A code to type on a bridge, once, to prove an account is yours."""
+
+    code: str
+    expires_at: str
+
+
+class ExternalIdentityOut(ApiModel):
+    backend: BridgeBackendName
+    external_user_id: str
+    display_name: str | None = None
+    verified_at: str
+
+
+class ExternalIdentityPage(ApiModel):
+    data: list[ExternalIdentityOut]
+
+
+#: What an ``agent_update`` a run posted is.
+PostKindName = Literal["plan", "progress", "review", "delivery", "reply", "notice"]
 
 
 class MessageOut(ApiModel):
@@ -446,6 +543,13 @@ class MessageOut(ApiModel):
     work: ChannelWorkOut | None = None
     reactions: list[str] = Field(default_factory=list)
     author: AuthorOut | None = None
+    #: Files this message carries, readable by anyone who can read the
+    #: channel (feature ``collaboration.message_artifacts``).
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    #: Where the message arrived from, when it came over a bridge.
+    origin: MessageOriginOut | None = None
+    #: Set on the ``agent_update`` messages a run posts; null otherwise.
+    post_kind: PostKindName | None = None
 
 
 class ReactionSet(ApiModel):
@@ -458,10 +562,15 @@ class TurnCreate(ApiModel):
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)
-    intent: Literal["conversation", "delegate", "code", "workload"] = "conversation"
+    intent: Literal["conversation", "delegate", "code", "workload", "auto"] = "conversation"
 
 
 class ParticipantOut(ApiModel):
+    """One agent's slot in a turn. ``assignees`` is set on the first slot of
+    a turn that may start managed work: the run roles the turn's mentions
+    declare, as ``role -> agent slug``, which admission uses to assign the
+    run."""
+
     agent_slug: str | None
     status: str
     error: str | None = None
@@ -469,6 +578,7 @@ class ParticipantOut(ApiModel):
     parent_index: int | None = None
     request: str | None = None
     read_only: bool = False
+    assignees: dict[str, str] | None = None
 
 
 class ChannelParticipantOut(ApiModel):
@@ -510,6 +620,35 @@ class TurnOut(ApiModel):
     author_id: str | None = None
     trigger: str | None = None
     parent_turn_id: str | None = None
+    intent: str | None = None
+    #: How many agent-started turns separate this one from the human turn
+    #: that started the chain; zero for a turn a person asked for.
+    chain_depth: int = 0
+    #: The run this turn steered instead of answering (S-A11); null for an
+    #: ordinary turn, so an old client reads what it always did.
+    steered_run_id: str | None = None
+
+
+class ChannelSilence(ApiModel):
+    """How long the channel's agents stay quiet; null lifts the silence."""
+
+    until: float | None = None
+
+
+class ChannelReadUpdate(ApiModel):
+    """How far the caller has read this channel."""
+
+    sequence: int = Field(ge=0)
+
+
+class ChannelStopOut(ApiModel):
+    """What a stop actually stopped."""
+
+    cancelled_turns: list[str] = Field(default_factory=list)
+    cancelled_runs: list[str] = Field(default_factory=list)
+    #: Work items the channel queued that had not started, abandoned.
+    cancelled_items: list[str] = Field(default_factory=list)
+    silenced_until: float | None = None
 
 
 class TurnAccepted(ApiModel):

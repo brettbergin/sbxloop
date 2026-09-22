@@ -152,6 +152,19 @@ class TestBakeHappyPath:
         # copilot runtime pre-cache ran under the installed interpreter
         assert [c for c in fake_sbx.invocations("exec") if "copilot" in c]
 
+    def test_bake_stops_the_scratch_sandbox_before_saving(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        """sbx refuses to save a running sandbox as a template (field, sbx
+        0.43: "is running and must be stopped before saving"), so the bake
+        stops the scratch box once the manifest is in, then saves it."""
+        script_install(fake_sbx)
+        bake_template(cli, config, name=BOX)
+        calls = fake_sbx.invocations()
+        save = ["template", "save", BOX, DEFAULT_TEMPLATE_REF]
+        assert ["stop", BOX] in calls
+        assert calls.index(["stop", BOX]) < calls.index(save)
+
     def test_bake_applies_agent_network_allows_and_no_secrets(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
     ) -> None:

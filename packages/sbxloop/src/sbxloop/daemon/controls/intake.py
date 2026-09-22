@@ -61,6 +61,12 @@ class IssueAdmission:
     lead: str | None = None
     roles: Mapping[str, str] = field(default_factory=dict)
     channel_id: str | None = None
+    #: Set when an agent asked for this work itself (S-A12): who asked,
+    #: what it came out of, and how deep the chain is. A surface that is
+    #: not an agent leaves all three alone.
+    origin_agent: str | None = None
+    parent_item_id: str | None = None
+    chain_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +80,9 @@ class WorkloadAdmission:
     lead: str | None = None
     roles: Mapping[str, str] = field(default_factory=dict)
     channel_id: str | None = None
+    origin_agent: str | None = None
+    parent_item_id: str | None = None
+    chain_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +149,14 @@ def with_assignment_request(
         update["lead_agent"] = lead
     if roles:
         update["assignment_json"] = requested_roles_json(roles)
+    origin = (request.origin_agent or "").strip() or None
+    if origin is not None:
+        # Only an agent-started admission says any of this, and it says all
+        # of it together: a depth with no agent would count a chain nobody
+        # is in.
+        update["origin_agent"] = origin
+        update["parent_item_id"] = (request.parent_item_id or "").strip() or None
+        update["chain_depth"] = max(0, request.chain_depth)
     return item.model_copy(update=update) if update else item
 
 
@@ -254,7 +271,7 @@ def _tool_item(
         (target,) = resolve_targets(config, repo=repo, url=url)
     except (ConfigError, ValueError) as exc:
         raise ControlError("invalid_argument", str(exc)) from exc
-    entry = config.github.find_repo(target)
+    entry = config.find_repo(target)
     return WorkItem(
         item_id=item_id,
         source_key=item_id.partition(":")[2],
@@ -276,7 +293,7 @@ def admit_issue(loop: Any, request: IssueAdmission) -> WorkItem:
     """The item the GitHub source builds for the issue, labelled for
     ``run_kind``; refusals as :class:`ControlError`."""
     config: Config = loop.config
-    entry = config.github.find_repo(request.repository)
+    entry = config.find_repo(request.repository)
     if entry is None:
         raise ControlError("unknown_target", f"{request.repository} is not a configured repository")
     if not entry.enabled:
@@ -338,4 +355,7 @@ def upsert(loop: Any, item: WorkItem, *, by: str | None) -> tuple[WorkItem, bool
         fresh=fresh,
         title=stored.title[:80],
     )
+    if fresh:
+        # The row is in; the loop need not sit out its poll interval.
+        loop.wake()
     return stored, fresh

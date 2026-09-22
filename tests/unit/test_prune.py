@@ -76,14 +76,27 @@ class TestClassification:
         assert verdict.orphan
         assert verdict.role == "github"
 
-    def test_unknown_run_is_orphan_with_multi_host_honesty(self, store: StateStore) -> None:
+    def test_unknown_run_is_kept_when_owner_cannot_be_proven(self, store: StateStore) -> None:
         (verdict,) = classify_sandboxes([info("sbxloop-rabc12345-agent")], store)
-        assert verdict.orphan
+        assert not verdict.orphan
         assert verdict.run_id == "rabc12345"
         assert verdict.role == "agent"
         assert verdict.run_state is None
         assert verdict.age_s is None
         assert "this state DB" in verdict.reason
+
+    def test_another_homes_run_is_never_pruned(self, store: StateStore, tmp_path: Path) -> None:
+        from sbxloop.paths import SbxloopHome
+        from sbxloop.sbx.naming import run_name
+
+        foreign = run_name(SbxloopHome(tmp_path / "other"), "rabc12345", "agent")
+        store.create_run("rabc12345", "x")
+        store.set_run_state("rabc12345", "completed")
+        (verdict,) = classify_sandboxes(
+            [info(foreign)], store, min_age_s=0, home=SbxloopHome(tmp_path / "own")
+        )
+        assert not verdict.orphan
+        assert "another" in verdict.reason
 
     def test_terminal_run_orphaned_only_past_min_age(self, store: StateStore) -> None:
         store.create_run("rabc12345", "x")
@@ -252,10 +265,13 @@ class TestPruneCommand:
     def test_unknown_sandbox_pruned_with_caveat(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         StateStore(SbxloopHome(workdir / ".sbxloop").state_db)  # empty DB
         cli = SbxCLI(binary=str(fake_sbx.binary))
-        cli.create(SandboxSpec(name="sbxloop-rzzzzzzzz-agent", role="agent", workspace=workdir))
+        from sbxloop.sbx.naming import run_name
+
+        name = run_name(SbxloopHome(workdir / ".sbxloop"), "rzzzzzzzz", "agent")
+        cli.create(SandboxSpec(name=name, role="agent", workspace=workdir))
         result = runner.invoke(app, ["sandbox", "prune"])
         assert result.exit_code == 0, result.output
-        assert "another checkout" in result.output or "working copy" in result.output
+        assert "owned by this home" in result.output
         forced = runner.invoke(app, ["sandbox", "prune", "--force"])
         assert forced.exit_code == 0, forced.output
         assert cli.ls() == []
@@ -279,8 +295,14 @@ class TestDoctorOrphans:
     ) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         StateStore(SbxloopHome(workdir / ".sbxloop").state_db)  # empty DB → unknown sandbox
+        from sbxloop.sbx.naming import run_name
+
         SbxCLI(binary=str(fake_sbx.binary)).create(
-            SandboxSpec(name="sbxloop-rzzzzzzzz-agent", role="agent", workspace=workdir)
+            SandboxSpec(
+                name=run_name(SbxloopHome(workdir / ".sbxloop"), "rzzzzzzzz", "agent"),
+                role="agent",
+                workspace=workdir,
+            )
         )
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0, result.output  # soft warning, not a failure

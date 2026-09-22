@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import re
 import time
+from collections.abc import Collection
 
 from pydantic import BaseModel, ConfigDict
 
@@ -25,8 +26,10 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
 from sbxloop.ids import is_run_id
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxInfo, SandboxRole
+from sbxloop.sbx.naming import instance_id, is_managed_name
 
 # A run in a terminal state has already had (or never needed) its teardown:
 # any of its sandboxes still present are leaked. The resumable terminal
@@ -39,6 +42,10 @@ DEFAULT_MIN_AGE_S = 3600.0
 
 _VCS_NAME_KINDS = "|".join(VCS_KINDS)
 _NAME_RE = re.compile(rf"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|service|{_VCS_NAME_KINDS})$")
+_NEW_NAME_RE = re.compile(
+    rf"^sbxl-(?P<instance>[0-9a-f]{{8}})-(?P<run>[^-]+)-run-"
+    rf"(?P<role>agent|credential-service|vcs-(?:{_VCS_NAME_KINDS}))$"
+)
 
 # Sandboxes the daemon owns for its whole lifetime (not tied to a run):
 # the VCS-ops box and the concierge box. Never pruned here — the daemon
@@ -81,20 +88,31 @@ def classify_sandboxes(
     min_age_s: float = DEFAULT_MIN_AGE_S,
     include_kept: bool = False,
     now: float | None = None,
+    warm_run_ids: Collection[str] = (),
+    home: SbxloopHome | None = None,
 ) -> list[SandboxVerdict]:
-    """Classify every ``sbxloop-*`` sandbox against the state DB.
+    """Classify sbxloop sandboxes against the state DB and home identity.
 
-    Non-sbxloop sandboxes are never considered. Names that carry the prefix
-    but do not match the ``sbxloop-<run>-<role>`` scheme (future taxonomies:
-    warm-pool standby, etc.) are reported but never marked orphaned.
+    Other sandboxes are never considered. Unrecognized names with a managed
+    prefix are reported but never marked orphaned. ``warm_run_ids`` are the daemon's warm sets
+    (#47): sandboxes standing by under a run id no run has taken yet, which
+    the state DB cannot know about and prune must leave alone.
     """
     now = time.time() if now is None else now
     verdicts: list[SandboxVerdict] = []
     for info in infos:
-        if not info.name.startswith("sbxloop-"):
+        if not is_managed_name(info.name):
             continue
         verdicts.append(
-            _classify_one(info.name, store, min_age_s=min_age_s, include_kept=include_kept, now=now)
+            _classify_one(
+                info.name,
+                store,
+                min_age_s=min_age_s,
+                include_kept=include_kept,
+                now=now,
+                warm_run_ids=warm_run_ids,
+                home=home,
+            )
         )
     return verdicts
 
@@ -106,21 +124,40 @@ def _classify_one(
     min_age_s: float,
     include_kept: bool,
     now: float,
+    warm_run_ids: Collection[str] = (),
+    home: SbxloopHome | None = None,
 ) -> SandboxVerdict:
-    if name.startswith(DAEMON_OWNED_PREFIXES):
+    if name.startswith(DAEMON_OWNED_PREFIXES) or re.match(r"^sbxl-[0-9a-f]{8}-daemon-", name):
         return SandboxVerdict(
             name=name,
             reason="daemon-owned sandbox (VCS-ops / concierge); not touched — "
             "`sbxloop sandbox rm` removes it explicitly",
         )
-    match = _NAME_RE.match(name)
+    new_match = _NEW_NAME_RE.match(name)
+    if new_match is not None and (home is None or new_match.group("instance") != instance_id(home)):
+        return SandboxVerdict(name=name, reason="belongs to another or unknown sbxloop home")
+    match = new_match or _NAME_RE.match(name)
     if match is None or not is_run_id(match.group("run")):
         return SandboxVerdict(
             name=name,
             reason="unrecognized sbxloop naming scheme; not touched",
         )
     run_id, suffix = match.group("run"), match.group("role")
-    role = "github" if suffix in VCS_KINDS else suffix
+    role = (
+        "github"
+        if suffix in VCS_KINDS or suffix.startswith("vcs-")
+        else "service"
+        if suffix == "credential-service"
+        else suffix
+    )
+    if run_id in warm_run_ids:
+        return SandboxVerdict(
+            name=name,
+            run_id=run_id,
+            role=role,
+            reason="warm sandbox set standing by for the next run (`[daemon] warm_pairs`); "
+            "not touched — the daemon retires it itself",
+        )
 
     try:
         run = store.get_run(run_id)
@@ -129,8 +166,12 @@ def _classify_one(
             name=name,
             run_id=run_id,
             role=role,
-            orphan=True,
-            reason="unknown to this state DB (may belong to another working copy)",
+            orphan=new_match is not None,
+            reason=(
+                "owned by this home but unknown to its state DB"
+                if new_match is not None
+                else "unknown to this state DB (may belong to another working copy); not pruned"
+            ),
         )
 
     if run.kept_reason is not None and not include_kept:
@@ -248,6 +289,13 @@ def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole, config: Config
     remove_run_sandbox_secrets(cli, name, role, config)
 
 
-def count_orphans(cli: SbxCLI, store: StateStore) -> int:
+def count_orphans(
+    cli: SbxCLI,
+    store: StateStore,
+    warm_run_ids: Collection[str] = (),
+    *,
+    home: SbxloopHome | None = None,
+) -> int:
     """Orphan-candidate count with default thresholds (doctor's view)."""
-    return sum(1 for v in classify_sandboxes(cli.ls(), store) if v.orphan)
+    verdicts = classify_sandboxes(cli.ls(), store, warm_run_ids=warm_run_ids, home=home)
+    return sum(1 for v in verdicts if v.orphan)

@@ -2,7 +2,7 @@
 them (#630).
 
 The daemon's seven lifecycle labels (`[daemon] *_label`, per-repo overrides
-on `[[github.repos]]`) and the follow-up label (`[landing] followup_label`)
+on `[[vcs.repos]]`) and the follow-up label (`[landing] followup_label`)
 are ordinary repository labels: GitHub attaches an unknown label name to an
 issue without creating it, so a repository that was never set up shows the
 loop's states as bare text. ``sbxloop init-repo`` creates them, idempotently

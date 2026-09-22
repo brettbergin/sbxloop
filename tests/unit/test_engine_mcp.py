@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from sbxloop.sbx.naming import run_name
 from sbxloop_worker.serviceops import FAKE_ENV
 from tests.conftest import FakeSbx
 from tests.unit.test_engine import HAPPY_TASK, Harness, task, taskgraph
@@ -61,7 +62,7 @@ def test_builder_mcp_uses_only_service_jobs_and_does_not_grant_generic_http(
     assert all(job["mcp_servers"] == [] for job in jobs)
     assert sum(any(t["name"] == tool for t in job["host_tools"]) for job in jobs) == 1
     assert all(all(t["name"] != "call_service" for t in job["host_tools"]) for job in jobs)
-    service = fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+    service = fake_sbx.sandbox_fs(run_name(harness.home, run_id, "service"))
     service_jobs = [
         json.loads(p.read_text()) for p in (service / "home/agent/.sbxloop/jobs").iterdir()
     ]

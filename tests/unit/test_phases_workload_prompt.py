@@ -99,3 +99,19 @@ def test_without_a_profile_the_planner_is_told_to_declare_no_needs() -> None:
     assert "This run has no workload profile" in text
     assert "Declare no needs" in text
     assert "Profile `" not in text
+
+
+def test_a_profile_that_runs_tasks_at_once_tells_the_planner_to_keep_files_apart() -> None:
+    """`[budgets] max_parallel_tasks` above 1 shares one workspace between
+    tasks running at the same time; `depends_on` is the planner's own word
+    and certifies nothing about files, so the planner is told."""
+    config = _config(
+        workloads=[{"name": "research", "budgets": {"max_parallel_tasks": 3}}],
+        workload={"default": "research"},
+    )
+    text = _plan_prompt(config)
+    assert "up to 3 tasks run at the same time" in text
+    assert "its own output files" in text
+    assert "never have two tasks edit the same file" in text
+    serial = _config(workloads=[{"name": "research"}], workload={"default": "research"})
+    assert "run at the same time" not in _plan_prompt(serial)

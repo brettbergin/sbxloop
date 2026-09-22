@@ -48,6 +48,7 @@ class HostToolBroker:
         handler: HostToolHandler,
         *,
         max_workers: int = 4,
+        deliver: Callable[[str, HostToolResponse], bool] | None = None,
     ) -> None:
         if not job.host_tools_dir:
             raise ValueError("HostToolBroker needs a job with host_tools_dir")
@@ -55,6 +56,12 @@ class HostToolBroker:
         self.job = job
         self.handler = handler
         self.tools_dir = job.host_tools_dir
+        # A faster road for the response than `sbx cp` (the resident
+        # worker's stdin): tried first, the copy when it answers False.
+        self._deliver = deliver
+        # The resident worker removes the job's tools directory itself;
+        # the client clears this when the job runs there.
+        self.cleanup_in_sandbox = True
         self._max_workers = max_workers
         self._pool: ThreadPoolExecutor | None = None
         self._lock = threading.Lock()
@@ -115,6 +122,8 @@ class HostToolBroker:
         self._write(response)
 
     def _write(self, response: HostToolResponse) -> None:
+        if self._deliver is not None and self._deliver(self.job.job_id, response):
+            return
         path = f"{self.tools_dir}/{response.call_id}.json"
         try:
             self.sandbox.write_text(path, response.model_dump_json())
@@ -136,5 +145,6 @@ class HostToolBroker:
             pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
-        with contextlib.suppress(SbxError):
-            self.sandbox.exec(["rm", "-rf", self.tools_dir])
+        if self.cleanup_in_sandbox:
+            with contextlib.suppress(SbxError):
+                self.sandbox.exec(["rm", "-rf", self.tools_dir])

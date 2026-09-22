@@ -203,7 +203,7 @@ class TestPrune:
         from sbxloop.engine.store import StateStore
         from sbxloop.sbx.models import SandboxSpec
 
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(load_config().paths.state_db)
         store.create_run("rabc12345", "an outcome")
         store.set_run_state("rabc12345", "failed")
         cli = SbxCLI(binary=str(fake_sbx.binary))

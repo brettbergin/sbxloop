@@ -69,7 +69,7 @@ def policy_view(config: Config) -> PolicyView:
         "(empty — tasks may only use the baseline and well-known registries)"
     )
     deny = ", ".join(config.policy.deny) or "(none)"
-    github = ", ".join(github_policy_allows(config)) if config.github.enabled else None
+    github = ", ".join(github_policy_allows(config)) if config.vcs.enabled else None
     service: str | None = None
     credentialed = config.credentialed_registries_for()
     if credentialed:

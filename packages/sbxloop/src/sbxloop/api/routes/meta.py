@@ -51,7 +51,9 @@ FEATURES: tuple[str, ...] = (
     "collaboration.preferences",
     "collaboration.workflows",
     "collaboration.connections.read",
+    "collaboration.connections.manage",
     "collaboration.message_artifacts",
+    "collaboration.channel_artifacts",
     "collaboration.message_authors",
     "agents.registry",
     "agents.memory",
@@ -60,6 +62,14 @@ FEATURES: tuple[str, ...] = (
     "collaboration.participants",
     "collaboration.channel_members",
     "events.scoped",
+    "collaboration.bridges",
+    "agents.initiative",
+    "collaboration.lead_orchestrator",
+    "collaboration.run_progress",
+    "collaboration.channel_stop",
+    "collaboration.silence",
+    "collaboration.read_state",
+    "collaboration.mention_steering",
 )
 
 

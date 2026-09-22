@@ -1,11 +1,18 @@
 """WorkerClient: install the worker into a sandbox and run jobs through it.
 
-Two transports:
+Three transports:
 
 - **stream** (default): one blocking ``sbx exec`` per job; the worker mirrors
   its JSONL events to stdout, which the host parses line-by-line and
   republishes on the EventBus. The result file is fetched afterwards with
   ``cp`` — stdout is telemetry, the result file is the outcome.
+- **resident**: one ``sbx exec`` per sandbox runs ``sbxloop_worker serve``;
+  jobs go in on its stdin, events and results come back on its stdout
+  (``sbxloop.worker.resident``). Every sbx call costs about a second of
+  backend round trip, so this saves two to three of them per job and one
+  per host-tool response. Needs per-job stdin delivery (``job_env``), which
+  is the provisioner's proof that this sbx passes exec stdin through; a
+  client without it, or whose server never reports ready, streams as before.
 - **poll**: the worker is launched detached (``nohup ... &``); the host tails
   the in-sandbox events file by byte offset every ``poll_interval`` seconds.
   Fallback for environments where long-running exec streams are unreliable.
@@ -52,8 +59,9 @@ from sbxloop.sbx.sandbox import (
     Sandbox,
 )
 from sbxloop.worker.hosttools import HostToolBroker, HostToolHandler
+from sbxloop.worker.resident import ResidentWorker
 from sbxloop.worker.wheel import resolve_worker_wheel
-from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
+from sbxloop_worker.protocol import Event, EventTypes, HostToolResponse, JobRequest, JobResult
 
 # Wheels must keep their canonical filename when staged: pip validates the
 # name-version-python-abi-platform structure of the FILENAME itself and
@@ -327,6 +335,21 @@ class WorkerClient:
         self._brokers: dict[str, HostToolBroker] = {}
         self.provider_recovery: ProviderRecovery | None = None
         self._model_context: dict[str, dict[str, str | None]] = {}
+        # The resident transport's server for this sandbox, started on the
+        # first job that can use it; `_resident_broken` remembers a server
+        # that never reported ready, so the client streams from then on
+        # rather than paying the wait on every job.
+        self._resident: ResidentWorker | None = None
+        self._resident_broken = False
+
+    def close(self) -> None:
+        """Release what the client holds in the sandbox: the resident worker,
+        when one runs. Jobs in flight are cancelled by the server on its
+        way out. Safe to call more than once, or never (a removed sandbox
+        ends the server too)."""
+        resident, self._resident = self._resident, None
+        if resident is not None:
+            resident.close()
 
     # -- install -----------------------------------------------------------
 
@@ -1155,7 +1178,7 @@ class WorkerClient:
         if tool_handler is not None:
             if job.host_tools_dir is None:
                 job = job.model_copy(update={"host_tools_dir": f"{TOOLS_DIR}/{job.job_id}"})
-            broker = HostToolBroker(self.sandbox, job, tool_handler)
+            broker = HostToolBroker(self.sandbox, job, tool_handler, deliver=self._deliver_tool)
             self._brokers[job.job_id] = broker
             try:
                 return self._submit_as(job, identity)
@@ -1176,6 +1199,9 @@ class WorkerClient:
         job_path = f"{JOBS_DIR}/{job.job_id}.json"
         events_path = f"{EVENTS_DIR}/{job.job_id}.jsonl"
         result_path = f"{RESULTS_DIR}/{job.job_id}.json"
+        resident = self._resident_worker()
+        if resident is not None:
+            return self._submit_resident(job, resident, events_path, result_path)
         self.sandbox.write_text(job_path, job.model_dump_json())
 
         argv = [
@@ -1255,6 +1281,82 @@ class WorkerClient:
             duration_s=round(time.monotonic() - started, 1),
         )
         return result
+
+    # -- resident transport ------------------------------------------------
+
+    def _resident_worker(self) -> ResidentWorker | None:
+        """The sandbox's resident worker, started if need be; None when this
+        client does not use one (another transport, no stdin delivery, or a
+        server that could not be started)."""
+        if self.transport != "resident" or self.job_env is None or self._resident_broken:
+            return None
+        resident = self._resident
+        if resident is not None and resident.alive:
+            return resident
+        resident = ResidentWorker(self)
+        try:
+            resident.start()
+        except WorkerError as exc:
+            # Nothing in the VM answered: fall back to one exec per job for
+            # the rest of this client's life, and say so once.
+            self._resident_broken = True
+            log.warning(
+                "worker.resident_unavailable",
+                sandbox=self.sandbox.name,
+                role=self.role,
+                error=str(exc)[:500],
+            )
+            return None
+        self._resident = resident
+        return resident
+
+    def _submit_resident(
+        self, job: JobRequest, resident: ResidentWorker, events_path: str, result_path: str
+    ) -> JobResult:
+        broker = self._brokers.get(job.job_id)
+        if broker is not None:
+            # The server removes the job's tools directory when the job
+            # ends; the broker need not spend an exec on it.
+            broker.cleanup_in_sandbox = False
+        started = time.monotonic()
+        log.info(
+            "worker.job_submit",
+            job=job.job_id,
+            kind=job.kind,
+            sandbox=self.sandbox.name,
+            role=self.role,
+            transport="resident",
+            timeout_s=job.timeout_s,
+            cwd=job.cwd,
+        )
+        resident.refresh_env()
+        deadline = time.monotonic() + job.timeout_s + self.grace_s
+        result = resident.submit(
+            job, events_path=events_path, result_path=result_path, deadline=deadline
+        )
+        log.info(
+            "worker.job_done",
+            job=job.job_id,
+            kind=job.kind,
+            sandbox=self.sandbox.name,
+            status=result.status,
+            error=result.error.message[:200] if result.error is not None else None,
+            exit_code=result.exit_code,
+            duration_s=round(time.monotonic() - started, 1),
+        )
+        return result
+
+    def _deliver_tool(self, job_id: str, response: HostToolResponse) -> bool:
+        """Hand a host-tool response to the resident worker running the job;
+        False when the job is not on one (the broker copies the file)."""
+        resident = self._resident
+        if resident is None or not resident.alive or job_id not in resident.pending:
+            return False
+        try:
+            resident.deliver_tool(job_id, response)
+        except WorkerError:
+            return False
+        return True
 
     def _env_payload(self) -> str | None:
         """The `export KEY=VALUE` lines to pipe into this job's launch, or

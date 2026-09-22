@@ -11,7 +11,6 @@ picked up transparently.
 
 from __future__ import annotations
 
-import hashlib
 import threading
 import time
 from collections.abc import Callable
@@ -34,6 +33,7 @@ from sbxloop.events import EventBus
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import daemon_vcs_name, legacy_daemon_vcs_name
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.vcs.backends import backend_for
@@ -44,10 +44,6 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-DAEMON_SANDBOX_PREFIX = "sbxloop-daemon"
-# Backwards-compatible export for callers that identify the default GitHub
-# box. Non-GitHub boxes use ``DAEMON_SANDBOX_PREFIX`` plus their forge kind.
-SANDBOX_NAME_PREFIX = f"{DAEMON_SANDBOX_PREFIX}-github"
 # Ops issued from the daemon (not from a run) carry this run id in events.
 DAEMON_RUN_ID = "daemon"
 # The kind is a config value; prose written for a person names the product.
@@ -60,14 +56,8 @@ REPROVISION_MIN_INTERVAL_S = 300.0
 
 
 def sandbox_name_for(home: SbxloopHome, kind: VcsKind = "github") -> str:
-    """Per-instance sandbox name. The name used to be fixed, and
-    ``remove_stale`` deletes a same-named sandbox before provisioning: a second
-    daemon on the same host (another home) killed
-    the first's github sandbox (#254). Two daemons sharing one home
-    would also share a run store, which nothing supports, so the home is
-    the instance identity."""
-    digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
-    return f"{DAEMON_SANDBOX_PREFIX}-{kind}-{digest}"
+    """Per-instance forge-operations sandbox name."""
+    return daemon_vcs_name(home, kind)
 
 
 def generation_name(base: str, generation: int) -> str:
@@ -115,6 +105,9 @@ class DaemonGithub:
         # and moves on when the backend will not give a generation back.
         self._base_name = name or sandbox_name_for(config.paths, kind)
         self.name = self._base_name
+        self._legacy_base_name = (
+            legacy_daemon_vcs_name(config.paths, kind) if name is None else None
+        )
         # Generations this process gave up on: a removal that failed, a
         # create the backend refused. Never retried in this process; the
         # next daemon start tries the base name again.
@@ -126,7 +119,13 @@ class DaemonGithub:
             ()
             if name is not None
             else tuple(
-                sandbox_name_for(config.paths, other) for other in VCS_KINDS if other != kind
+                candidate
+                for other in VCS_KINDS
+                if other != kind
+                for candidate in (
+                    sandbox_name_for(config.paths, other),
+                    legacy_daemon_vcs_name(config.paths, other),
+                )
             )
         )
         self._previous_forges_cleared = False
@@ -160,7 +159,13 @@ class DaemonGithub:
         (:meth:`_clear_previous_forges`).
         """
         listed = [
-            info.name for info in self.sbx.ls() if is_generation_of(info.name, self._base_name)
+            info.name
+            for info in self.sbx.ls()
+            if is_generation_of(info.name, self._base_name)
+            or (
+                self._legacy_base_name is not None
+                and is_generation_of(info.name, self._legacy_base_name)
+            )
         ]
         if not listed:
             log.debug("github_sandbox.no_stale", sandbox=self._base_name)
@@ -379,7 +384,9 @@ class DaemonGithub:
                 job_env=self.provisioner.job_env("github", self.repo, sandbox=sandbox),
             )
             if self.install_workers:
-                client.install(extras="")
+                # A baked template (`[sandbox] template`) carries the worker:
+                # probe it instead of running the ladder on every provision.
+                client.install(extras="", expect_prebaked=bool(self.config.sandbox.template))
             clients.append(client)
 
         started = time.monotonic()
@@ -395,7 +402,7 @@ class DaemonGithub:
         except SbxloopError as exc:
             # ProvisionError, WorkerError, SbxError alike: one daemon-level
             # error, and nothing left behind. The prose names the configured
-            # forge: under GitLab this box is sbxloop-daemon-gitlab-..., and
+            # forge: under GitLab this box ends in daemon-vcs-gitlab, and
             # a report that said "GitHub" sent its reader to the wrong place.
             forge = _FORGE_NAMES.get(self.kind, self.kind)
             if caused_by_sbx_auth(exc):

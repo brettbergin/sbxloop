@@ -58,8 +58,11 @@ def test_setup_explains_and_writes_each_integration(tmp_path: Path) -> None:
     assert config.discord.channel_id == 123456789
     assert config.vcs.kind == "github"
     assert config.vcs.api_url == "https://api.github.com"
-    assert config.github.repos[0].repo == "acme/widgets"
-    assert config.github.repos[0].kind == "github"
+    assert config.vcs.repos[0].repo == "acme/widgets"
+    assert config.vcs.repos[0].kind == "github"
+    # Written as the current spelling (#2255), not the legacy one.
+    written = _home(tmp_path).config_toml.read_text()
+    assert "[[vcs.repos]]" in written and "\n[[github.repos]]" not in written
 
     secrets = dotenv_values(_home(tmp_path).secrets_env)
     assert secrets["OPENAI_API_KEY"] == "agent-secret"
@@ -162,8 +165,12 @@ def test_setup_updates_existing_files_in_place(tmp_path: Path) -> None:
     assert config.agent.backend == "claude"
     assert config.slack.channel_id == "C9876ZYXWV"
     assert config.vcs.kind == "gitlab"
-    assert config.github.repos[0].repo == "new/repo"
-    assert config.github.repos[0].kind == "gitlab"
+    assert config.vcs.repos[0].repo == "new/repo"
+    assert config.vcs.repos[0].kind == "gitlab"
+    # The legacy [[github.repos]] entry the file carried was migrated in
+    # place (#2255), so the file now says [[vcs.repos]] and nothing else.
+    written = home.config_toml.read_text()
+    assert written.count("[[vcs.repos]]") == 1 and "\n[[github.repos]]" not in written
     secrets = dotenv_values(home.secrets_env)
     assert secrets["ANTHROPIC_API_KEY"] == "replacement-agent"
     assert secrets["SLACK_BOT_TOKEN"] == "replacement-bot"

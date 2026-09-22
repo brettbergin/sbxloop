@@ -5,7 +5,7 @@ creates the lifecycle labels on first attach with a random color and no
 description — a repository the daemon was pointed at but never set up
 shows the loop's states as unexplained colored noise. This creates the seven
 lifecycle labels (`[daemon] *_label`, with the repository's
-`[[github.repos]]` renames applied) and the follow-up label, each with a
+`[[vcs.repos]]` renames applied) and the follow-up label, each with a
 color and a description, and leaves existing ones alone. Works against any
 forge the repository resolves to (`Config.vcs_kind_for`), not only GitHub.
 Idempotent: run it again after renaming a label in config. ``doctor``
@@ -43,7 +43,7 @@ def init_repo(config: Config, cli: SbxCLI, repo: str, *, console: Console) -> bo
         console.print(f"[bold red]not a repository:[/] {repo!r} — expected owner/name")
         return False
     forge = _FORGE_NAMES.get(kind, kind)
-    entry = config.github.find_repo(repo)
+    entry = config.find_repo(repo)
     specs = lifecycle_specs(config.labels_for(repo), config.landing.followup_label)
     box = DaemonGithub(
         config,

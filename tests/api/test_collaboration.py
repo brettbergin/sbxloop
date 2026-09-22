@@ -14,6 +14,10 @@ from sbxloop.daemon.concierge import ConciergeReply
 class FakeConcierge:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.resets: list[str | None] = []
+
+    def reset_session(self, session_key: str | None = None) -> None:
+        self.resets.append(session_key)
 
     def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
         self.calls.append({"text": text, **kwargs})
@@ -349,16 +353,17 @@ def test_workflow_definitions_keep_angie_crud_contract(api: Any) -> None:
     assert api.client.delete(f"/v1/workflows/{workflow['id']}", headers=headers).status_code == 204
 
 
-def test_connections_report_operator_configuration_without_accepting_secrets(api: Any) -> None:
+def test_connections_report_operator_configuration_without_accepting_legacy_secrets(
+    api: Any,
+) -> None:
     headers = bearer(register(api))
     services = api.client.get("/v1/connections/services", headers=headers)
     assert services.status_code == 200
     assert {value["key"] for value in services.json()} >= {"github", "slack", "discord"}
     catalog = {value["key"]: value for value in services.json()}
-    for forge in ("gitlab", "gitea"):
-        assert catalog[forge]["available"] is False
-        assert catalog[forge]["unavailable_reason"]
-        assert catalog[forge]["fields"] == []
+    assert catalog["gitlab"]["available"] is True
+    assert catalog["gitlab"]["fields"]
+    assert catalog["gitea"]["available"] is False
     configured = api.client.get("/v1/connections", headers=headers)
     assert configured.status_code == 200
     assert all(value["masked_credentials"] for value in configured.json())
@@ -371,3 +376,124 @@ def test_connections_report_operator_configuration_without_accepting_secrets(api
     )
     assert rejected.status_code == 409
     assert rejected.json()["code"] == "operator_managed_connection"
+
+
+def test_connections_read_actual_vcs_and_do_not_claim_unchecked_bridges(api: Any) -> None:
+    headers = bearer(register(api))
+    home = api.ctx.config.paths
+    home.config_toml.parent.mkdir(parents=True, exist_ok=True)
+    home.config_toml.write_text(
+        '[vcs]\nkind = "gitlab"\napi_url = "https://gitlab.example.com/api/v4"\n'
+        '[github]\nrepo = "o/r"\n[discord]\nchannel_id = 123456\n'
+        '[chat]\nbackend = "discord"\n',
+        encoding="utf-8",
+    )
+    home.secrets_env.write_text(
+        "GITLAB_TOKEN=example\nDISCORD_BOT_TOKEN=example\n", encoding="utf-8"
+    )
+    response = api.client.get("/v1/connections", headers=headers)
+    assert response.status_code == 200, response.text
+    values = {entry["id"]: entry for entry in response.json()}
+    assert values["gitlab"]["configured"] is True
+    assert values["gitlab"]["status"] == "disconnected"
+    assert values["discord"]["status"] == "disconnected"
+    assert "GITLAB_TOKEN=example" not in response.text
+    assert "DISCORD_BOT_TOKEN=example" not in response.text
+
+
+def test_owner_can_save_and_remove_a_chat_connection(api: Any) -> None:
+    headers = bearer(register(api))
+    saved = api.client.put(
+        "/v1/connections/mattermost",
+        headers=headers,
+        json={
+            "settings": {
+                "url": "https://chat.example.com",
+                "channel_id": "abcdefghijklmnopqrstuvwxyz",
+            },
+            "credentials": {"bot_token": "secret-value"},
+            "activate": True,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["configured"] is True
+    assert saved.json()["restart_required"] is True
+    assert saved.json()["status"] == "disconnected"
+    assert "secret-value" not in saved.text
+    home = api.ctx.config.paths
+    assert "secret-value" in home.secrets_env.read_text("utf-8")
+    assert 'backend = "mattermost"' in home.config_toml.read_text("utf-8")
+    removed = api.client.delete("/v1/connections/mattermost", headers=headers)
+    assert removed.status_code == 204, removed.text
+    assert "secret-value" not in home.secrets_env.read_text("utf-8")
+    after = api.client.get("/v1/connections", headers=headers).json()
+    mattermost = next(entry for entry in after if entry["id"] == "mattermost")
+    assert mattermost["configured"] is False
+    assert mattermost["restart_required"] is True
+    assert mattermost["masked_credentials"]["bot_token"] == "missing"
+
+
+def test_owner_can_select_and_save_gitlab(api: Any) -> None:
+    headers = bearer(register(api))
+    response = api.client.put(
+        "/v1/connections/gitlab",
+        headers=headers,
+        json={
+            "settings": {"api_url": "https://gitlab.example.com/api/v4"},
+            "credentials": {"personal_access_token": "private-gitlab-token"},
+            "activate": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["configured"] is True
+    assert response.json()["status"] == "disconnected"
+    assert response.json()["restart_required"] is True
+    assert "private-gitlab-token" not in response.text
+    home = api.ctx.config.paths
+    assert 'kind = "gitlab"' in home.config_toml.read_text("utf-8")
+    assert 'api_url = "https://gitlab.example.com/api/v4"' in home.config_toml.read_text("utf-8")
+    assert "private-gitlab-token" in home.secrets_env.read_text("utf-8")
+
+
+def test_connection_write_refuses_host_overrides(api: Any, monkeypatch: Any) -> None:
+    headers = bearer(register(api))
+    monkeypatch.setenv("SBXLOOP_VCS__KIND", "github")
+    overridden = api.client.put(
+        "/v1/connections/gitlab",
+        headers=headers,
+        json={"settings": {"api_url": "https://gitlab.example.com/api/v4"}},
+    )
+    assert overridden.status_code == 409
+    assert overridden.json()["code"] == "external_connection_setting"
+    monkeypatch.delenv("SBXLOOP_VCS__KIND")
+
+    monkeypatch.setenv("GITLAB_TOKEN", "host-token")
+    external_secret = api.client.put(
+        "/v1/connections/gitlab",
+        headers=headers,
+        json={"credentials": {"personal_access_token": "managed-token"}},
+    )
+    assert external_secret.status_code == 409
+    assert external_secret.json()["code"] == "external_connection"
+    assert "managed-token" not in external_secret.text
+
+
+def test_connection_write_rejects_non_owner_and_unknown_fields(api: Any) -> None:
+    headers = bearer(register(api))
+    bad = api.client.put(
+        "/v1/connections/discord",
+        headers=headers,
+        json={"settings": {"unknown": "value"}, "credentials": {"bot_token": "secret"}},
+    )
+    assert bad.status_code == 422
+    assert "secret" not in bad.text
+
+    machine = api.bearer(frozenset({"collaboration:read", "collaboration:write"}))
+    forbidden = api.client.put(
+        "/v1/connections/discord",
+        headers=machine,
+        json={"settings": {"channel_id": "123456"}, "credentials": {"bot_token": "secret"}},
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.json()["code"] == "forbidden_role"
+    assert "secret" not in forbidden.text

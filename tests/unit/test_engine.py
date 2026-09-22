@@ -45,6 +45,7 @@ from sbxloop.errors import (
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import run_name
 from sbxloop.vcs.github.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.verifylint import project_gate
 from tests.conftest import FakeSbx
@@ -210,7 +211,7 @@ class Harness:
     def agent_jobs(self, run_id: str) -> list[dict[str, Any]]:
         """Every job request the agent sandbox received (keep_sandboxes runs
         only — teardown removes the fs the job files live in)."""
-        fs = self.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        fs = self.fake_sbx.sandbox_fs(run_name(self.home, run_id, "agent"))
         return [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
 
 
@@ -811,7 +812,7 @@ class TestTaskEgress:
         harness.script([taskgraph(task("t1", egress=SAAS_EGRESS)), *HAPPY_TASK])
         result = harness.engine(policy={"allow": ["api.example-saas.com"]}).start("saas task")
         assert result.state == "completed"
-        agent = f"sbxloop-{result.run_id}-agent"
+        agent = run_name(harness.home, result.run_id, "agent")
         assert [
             "allow",
             "network",
@@ -923,7 +924,7 @@ class TestKeepOnFailure:
         result = engine.start("doomed outcome")
 
         assert result.state == "failed"
-        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+        assert result.kept_sandboxes == [run_name(harness.home, result.run_id, "agent")]
         assert harness.sandboxes_left() == result.kept_sandboxes
         assert engine.store.get_run(result.run_id).kept_reason == "debug"
         keep_events = [e for e in harness.events if e.type == "run.keep"]
@@ -979,7 +980,7 @@ class TestKeepOnFailure:
         engine = harness.engine(keep_sandboxes=True)
         result = engine.start("kept run")
         assert engine.store.get_run(result.run_id).kept_reason == "manual"
-        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+        assert result.kept_sandboxes == [run_name(harness.home, result.run_id, "agent")]
 
 
 class TestRunWorkspace:
@@ -1322,7 +1323,7 @@ class TestLanguageResolution:
             "go vet ./... && go test ./..."
         )
         # ...and the agent sandbox was created able to fetch the Go tarball
-        agent = f"sbxloop-{result.run_id}-agent"
+        agent = run_name(harness.home, result.run_id, "agent")
         allows = [
             p[2]
             for p in harness.fake_sbx.policies()
@@ -1483,8 +1484,9 @@ class TestPrebakedTemplate:
         # (`python3 -c`) and the jobs still run against the fake sandbox, and
         # so does the workspace mount probe — with a configured workspace a
         # swallowed probe is a provisioning failure, not harvest mode.
-        harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c set --;", passthrough=True)
-        harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c", returncode=0)
+        agent = run_name(harness.home, run_id, "agent")
+        harness.fake_sbx.script(f"exec {agent} sh -c set --;", passthrough=True)
+        harness.fake_sbx.script(f"exec {agent} sh -c", returncode=0)
         result = engine.start("use the baked template on a go repo", run_id=run_id)
 
         assert result.state == "completed"

@@ -24,6 +24,7 @@ from sbxloop.engine.service import ServiceOps
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import ConfigError, ProvisionError, ServiceOpsError
 from sbxloop.events import EventBus, HostEventTypes
+from sbxloop.sbx.naming import run_name
 from sbxloop.worker.hosttools import HostToolCall
 from sbxloop_worker.protocol import EventTypes
 from sbxloop_worker.serviceops import CATALOGUE_ENV, FAKE_ENV
@@ -104,7 +105,10 @@ class TestCredentialedRun:
         # the service one is the only extra); they provision on parallel
         # threads, so in no fixed order. None survive the run.
         created = {c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")}
-        assert created == {f"sbxloop-{run_id}-agent", f"sbxloop-{run_id}-service"}
+        assert created == {
+            run_name(harness.home, run_id, "agent"),
+            run_name(harness.home, run_id, "service"),
+        }
         assert harness.sandboxes_left() == []
 
         # The request left the service sandbox for the pinned host with the
@@ -155,7 +159,7 @@ class TestCredentialedRun:
         assert "api.weather.example.com" in build["prompt"]
         assert "Services you may call" not in decompose["prompt"]
         # The service sandbox itself only ever saw the fixed op.
-        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+        fs = harness.fake_sbx.sandbox_fs(run_name(harness.home, run_id, "service"))
         kinds = {
             json.loads(p.read_text())["kind"] for p in (fs / "home/agent/.sbxloop/jobs").iterdir()
         }
@@ -174,7 +178,7 @@ class TestCredentialedRun:
         run_id = engine.store.list_runs()[0].run_id
 
         (announce,) = [e for e in harness.events if e.type == "sandbox.service_credentials"]
-        assert announce.data["name"] == f"sbxloop-{run_id}-service"
+        assert announce.data["name"] == run_name(harness.home, run_id, "service")
         assert announce.data["envs"] == ["WEATHER_API_KEY"]
         assert announce.data["delivery"] in ("stdin", "env-file")
         assert "WEATHER_API_KEY" in announce.data["message"]
@@ -189,7 +193,7 @@ class TestCredentialedRun:
         service_rules = [
             rule
             for rule in harness.fake_sbx.policies()
-            if f"sbxloop-{run_id}-service" in rule and rule[1] == "network"
+            if run_name(harness.home, run_id, "service") in rule and rule[1] == "network"
         ]
         assert service_rules
         assert {rule[2] for rule in service_rules} == {"api.weather.example.com"}
@@ -293,7 +297,7 @@ class TestUncredentialedRun:
         run_id = engine.store.list_runs()[0].run_id
         assert engine.store.get_run(run_id).credentials == []
         created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
-        assert created == [f"sbxloop-{run_id}-agent"]
+        assert created == [run_name(harness.home, run_id, "agent")]
         assert not [e for e in harness.events if e.type == "sandbox.service_credentials"]
 
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
@@ -411,7 +415,7 @@ class TestCredentialedRegistryRun:
         clone = result.workspace
         assert clone is not None
         assert Path(calls[0]["cwd"]).resolve() == clone.resolve()
-        service_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+        service_fs = harness.fake_sbx.sandbox_fs(run_name(harness.home, run_id, "service"))
         service_jobs = [
             json.loads(p.read_text()) for p in (service_fs / "home/agent/.sbxloop/jobs").iterdir()
         ]
@@ -420,7 +424,7 @@ class TestCredentialedRegistryRun:
         assert not (service_fs / "home/agent/.npmrc").exists()
         assert not (service_fs / "home/agent/.sbxloop/deps").exists()
         assert not list((service_fs / "home/agent/.sbxloop/results").glob("*.artifact"))
-        agent_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        agent_fs = harness.fake_sbx.sandbox_fs(run_name(harness.home, run_id, "agent"))
         (copied,) = list((agent_fs / "tmp").rglob("left-pad.tgz"))
         assert copied.read_bytes() == artifact
         (request,) = requests_sent(fake_service)
@@ -552,7 +556,7 @@ class TestCredentialedRegistryRun:
         rules = {
             rule[2]
             for rule in harness.fake_sbx.policies()
-            if f"sbxloop-{run_id}-service" in rule and rule[1] == "network"
+            if run_name(harness.home, run_id, "service") in rule and rule[1] == "network"
         }
         assert {"api.weather.example.com", "npm.example.com", "registry.npmjs.org"} <= rules
 

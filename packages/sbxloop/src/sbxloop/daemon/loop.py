@@ -46,7 +46,9 @@ from sbxloop.agents.assignment import (
     RunRole,
     plan_assignment,
 )
+from sbxloop.agents.chronicle import RunChronicle
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
+from sbxloop.agents.posts import ChannelPoster, RunArtifacts
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
@@ -56,7 +58,13 @@ from sbxloop.daemon.controls.generation import (
     new_generation_id,
 )
 from sbxloop.daemon.controls.operations import OperationStore, reconcile_operations
-from sbxloop.daemon.controls.results import CancelOutcome, ControlError, ResumeOutcome
+from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.results import (
+    CancelOutcome,
+    ControlError,
+    ResumeOutcome,
+    SteerOutcome,
+)
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -112,7 +120,7 @@ from sbxloop.errors import (
     SbxloopError,
     StateError,
 )
-from sbxloop.events import Event, EventBus
+from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
 from sbxloop.ghids import (
     is_api_id,
@@ -131,6 +139,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
+from sbxloop.sbx.warm import Warmer
 
 log = get_logger(__name__)
 
@@ -248,6 +257,14 @@ class CancelRequest(NamedTuple):
     operation_id: str | None = None
 
 
+class MentionTarget(NamedTuple):
+    """A live run an ``@agent`` mention could be about, and the tasks in it
+    bound to that agent which are still in flight (S-A11)."""
+
+    run_id: str
+    task_ids: tuple[str, ...]
+
+
 class RunHandle:
     """A run in flight: what shutdown, a control and a frontend need to
     reach, and what the loop needs to settle it once its thread ends."""
@@ -362,6 +379,7 @@ class DaemonLoop:
         github: DaemonGithub | None = None,
         worker_python: str | None = None,
         install_workers: bool | None = None,
+        poster: ChannelPoster | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -371,6 +389,10 @@ class DaemonLoop:
         self.clock = clock
         self.started_at = clock()
         self.frontend = frontend
+        # How a run linked to a channel posts into it (S-P17). The API
+        # listener supplies one; a daemon without the API has none, and a
+        # run then reports through its events alone.
+        self.poster = poster
         # The daemon's own gh-ops box: what the gate-approve path merges
         # with. None only in tests that never approve.
         self.github = github
@@ -387,6 +409,12 @@ class DaemonLoop:
         # at dispatch, the same one its run gets; a test may set it.
         self.memory: MemoryBlocks | None = None
         self._stop = threading.Event()
+        # What ends the wait between ticks early: a stop, and `wake()`, the
+        # signal that something queued work from outside the tick (the
+        # concierge's `start_workload`, an API admission). Cleared just
+        # before each tick, so a wake that lands mid-tick is never lost:
+        # the next wait returns at once and that tick finds the row.
+        self._wake = threading.Event()
         # An operator's `stop`: unlike a signal, it lets a landing the
         # daemon is completing finish before the process exits.
         self._graceful = False
@@ -436,6 +464,19 @@ class DaemonLoop:
         self._source_failures = 0
         self._source_next_poll = 0.0
         self._last_gc: float | None = None
+        # Warm sandbox sets (#47): kept ready by a thread of their own when
+        # `[daemon] warm_pairs` asks for them; a fresh dispatch takes one.
+        self._warmer: Warmer | None = (
+            Warmer(
+                config,
+                self.sbx,
+                worker_python=self.worker_python,
+                install_workers=self.install_workers is not False,
+            )
+            if config.daemon.warm_pairs > 0 and self.sbx is not None
+            else None
+        )
+        self._warm_thread: threading.Thread | None = None
         # Schedules live in the store (#818); a `[[schedules]]` entry still
         # in sbxloop.toml is imported once, at first sight (the first tick
         # or schedule command, so its grid anchors where it always did),
@@ -500,7 +541,7 @@ class DaemonLoop:
         standing in for an item that names none."""
         repo = self._item_repo(item)
         if repo is None:
-            default = self.config.github.default_repo()
+            default = self.config.default_repo()
             repo = default.repo if default is not None else None
         return repo
 
@@ -630,6 +671,7 @@ class DaemonLoop:
         and any landing in progress, then let ``run_forever`` return."""
         self._graceful = True
         self._stop.set()
+        self._wake.set()
 
     # -- restart (#969) ------------------------------------------------------------
 
@@ -893,6 +935,8 @@ class DaemonLoop:
         *,
         by: str | None = None,
         expected_revision: int | None = None,
+        task_id: str | None = None,
+        agent_slug: str | None = None,
     ) -> str:
         """Hand an instruction to the run in flight (#1038): the same
         ``post_user_message`` a chat thread uses, so the agent pauses at
@@ -903,13 +947,23 @@ class DaemonLoop:
         when it is a tool run (nothing to steer), or when
         ``expected_revision`` is not the run's — all judged under the
         current-run lock, so the run cannot end between the check and the
-        hand-over."""
+        hand-over.
+
+        ``task_id`` addresses one task lane, so the instruction is answered
+        by that task rather than by whichever lane reaches a boundary first;
+        ``agent_slug`` names the agent that was mentioned, and the answer
+        comes back in its persona (S-A11). Neither is validated here: the
+        engine holds the task board and the run's assignment, and falls back
+        to run-level steering in its own default voice for a target it does
+        not have."""
         with self._current_lock:
             handle = self._runs.get(run_id)
             if handle is not None:
                 check_eligibility("steer", Subject(run_kind=handle.item.kind, is_current=True))
                 self._check_revision(run_id, expected_revision)
-                message_id = handle.engine.post_user_message(text)
+                message_id = handle.engine.post_user_message(
+                    text, task_id=task_id, agent_slug=agent_slug
+                )
         if handle is None:
             try:
                 record = self.store.get_run(run_id)
@@ -926,8 +980,139 @@ class DaemonLoop:
             by=by or "operator",
             message=message_id,
             chars=len(text),
+            task=task_id,
+            agent=agent_slug,
         )
         return message_id
+
+    # -- mentions ------------------------------------------------------------------
+
+    def live_runs_for_agent(self, channel_id: str, agent_slug: str) -> list[MentionTarget]:
+        """Every run in flight for ``channel_id`` that ``agent_slug`` works
+        on, with the tasks bound to that agent which are still in flight.
+
+        Read under the current-run lock so a run cannot finish between
+        being listed and being steered.
+        """
+        targets: list[MentionTarget] = []
+        with self._current_lock:
+            handles = list(self._runs.values())
+        for handle in handles:
+            if (handle.item.channel_id or "") != channel_id:
+                continue
+            if not is_planned_assignment(handle.item.assignment_json):
+                continue
+            assert handle.item.assignment_json is not None
+            try:
+                assignment = AgentAssignment.from_json(handle.item.assignment_json)
+            except ValueError:
+                continue
+            if agent_slug not in assignment.agents:
+                continue
+            # The admission snapshot names roles, not tasks: who does each
+            # task is written by the engine once it has planned them, so
+            # read it back from there, as the engine's own resume does.
+            try:
+                assignees = self.store.task_assignees(handle.run_id)
+            except SbxloopError:
+                assignees = {}
+            tasks = assignment.with_tasks(assignees).tasks
+            live = [
+                task_id
+                for task_id, slug in tasks.items()
+                if slug == agent_slug and self._task_in_flight(handle.run_id, task_id)
+            ]
+            targets.append(MentionTarget(run_id=handle.run_id, task_ids=tuple(live)))
+        return targets
+
+    def _task_in_flight(self, run_id: str, task_id: str) -> bool:
+        """Whether ``task_id`` is a task this run is still working on."""
+        try:
+            tasks = self.store.get_tasks(run_id)
+        except SbxloopError:
+            return False
+        return any(task.spec.id == task_id and not task.terminal for task in tasks)
+
+    def live_runs_in_channel(self, channel_id: str) -> list[str]:
+        """Every run in flight that answers to ``channel_id``."""
+        with self._current_lock:
+            return [
+                handle.run_id
+                for handle in self._runs.values()
+                if (handle.item.channel_id or "") == channel_id
+            ]
+
+    def stop_channel(
+        self,
+        channel_id: str,
+        principal: Principal,
+        *,
+        agent_slug: str | None = None,
+    ) -> list[str]:
+        """Cancel the runs a channel's ``/stop`` means, and say which (S-A11).
+
+        ``agent_slug`` narrows it to the runs that agent works on, which is
+        what an exact ``@agent stop`` asks for. Every cancel goes through
+        :class:`ControlService`, so a stop from chat is recorded as the same
+        operation a stop from the API is -- there is one way to cancel a
+        run, whichever surface asked.
+
+        A run that refuses (it settled between being listed and being
+        cancelled) is left out rather than failing the whole stop: the
+        person asked for the channel to stop, not for a transaction.
+        """
+        from sbxloop.daemon.controls.service import ControlService, require
+
+        # Refused as a whole, before anything is listed: a person who may
+        # not cancel a run may not cancel a channel's worth of them.
+        require(principal, "runs:control")
+        if agent_slug is None:
+            run_ids = self.live_runs_in_channel(channel_id)
+        else:
+            run_ids = [t.run_id for t in self.live_runs_for_agent(channel_id, agent_slug)]
+        service = ControlService(self)
+        stopped: list[str] = []
+        for run_id in run_ids:
+            try:
+                service.cancel_run(principal, run_id)
+            except ControlError as exc:
+                log.info("channel.stop_refused", channel=channel_id, run=run_id, why=exc.message)
+                continue
+            stopped.append(run_id)
+        log.info("channel.stopped", channel=channel_id, agent=agent_slug, runs=stopped)
+        return stopped
+
+    def route_mention(
+        self,
+        channel_id: str,
+        agent_slug: str,
+        text: str,
+        principal: Principal,
+    ) -> SteerOutcome | None:
+        """Steer the run an ``@agent`` mention in ``channel_id`` is about
+        (S-A11), or None when the mention is not about live work.
+
+        One run, one target: when exactly one task in that run is bound to
+        the agent and still in flight, the instruction goes to that task's
+        lane; otherwise it goes to the run, which is where steering has
+        always landed. Several live runs in one channel name the agent is
+        the same ambiguity — there is no "the" run to steer — so the
+        mention is left to be an ordinary turn.
+        """
+        targets = self.live_runs_for_agent(channel_id, agent_slug)
+        if len(targets) != 1:
+            return None
+        target = targets[0]
+        task_id = target.task_ids[0] if len(target.task_ids) == 1 else None
+        from sbxloop.daemon.controls.service import ControlService
+
+        return ControlService(self).steer(
+            principal,
+            target.run_id,
+            text,
+            task_id=task_id,
+            agent_slug=agent_slug,
+        )
 
     def _check_revision(self, run_id: str, expected: int | None) -> None:
         if expected is None:
@@ -1325,6 +1510,7 @@ class DaemonLoop:
         in-flight engine to cancel, wait briefly. Stable across runs — it
         looks up the current engine at call time."""
         self._stop.set()
+        self._wake.set()
         handles = self.runs
         if not handles:
             log.info("daemon.quiesce", run=None)
@@ -1411,6 +1597,11 @@ class DaemonLoop:
             # Every run in flight, oldest first.
             "runs": [{**h.snapshot(), "repo": h.item.repo} for h in handles],
             "max_concurrent_runs": self.config.daemon.max_concurrent_runs,
+            "warm": (
+                {"ready": len(self._warmer.ready()), "target": self._warmer.target}
+                if self._warmer is not None
+                else None
+            ),
             "queued": len(self.dstore.queued()),
             "runs_today": self.dstore.runs_started_since(day_start),
             "runs_today_resets_at": day_end,
@@ -1485,9 +1676,11 @@ class DaemonLoop:
         )
         self._release_request_rejection_hold()
         self._report_restart()
+        self._start_warmer()
         ticks = 0
         try:
             while not self._stop.is_set():
+                self._wake.clear()
                 started = time.monotonic()
                 result = self.tick()
                 ticks += 1
@@ -1509,9 +1702,10 @@ class DaemonLoop:
         """Wait for the next poll. With runs in flight the wait ends as soon
         as one of them finishes, so its slot is refilled (and its item
         settled) without sitting out the poll interval, and an operator
-        override from another process is noticed within a second."""
+        override from another process is noticed within a second. A
+        ``wake()`` (work queued from outside the tick) ends it at once."""
         if not self.runs:
-            self._stop.wait(timeout)
+            self._wake.wait(timeout)
             return
         deadline = time.monotonic() + timeout
         while not self._stop.is_set():
@@ -1522,7 +1716,55 @@ class DaemonLoop:
             left = deadline - time.monotonic()
             if left <= 0:
                 return
-            self._stop.wait(min(1.0, left))
+            if self._wake.wait(min(1.0, left)):
+                return
+
+    def wake(self) -> None:
+        """Something queued work from outside the tick: end the wait between
+        ticks now rather than at the next poll interval. Cheap and
+        idempotent; a wake with nothing to run costs one empty tick."""
+        self._wake.set()
+
+    # -- warm sandbox sets (#47) ------------------------------------------------
+
+    def _start_warmer(self) -> None:
+        warmer = self._warmer
+        if warmer is None or self._warm_thread is not None:
+            return
+        self._warm_thread = threading.Thread(
+            target=warmer.run_forever,
+            args=(self._stop,),
+            kwargs={"paused": lambda: self.paused, "run_finished": self._warm_run_finished},
+            name="sbxloop-warmer",
+            daemon=True,
+        )
+        self._warm_thread.start()
+        log.info("warm.started", target=warmer.target, ttl_s=warmer.ttl_s)
+
+    def _claim_warm(self, item: WorkItem) -> str | None:
+        """A warm set's run id for a fresh run of ``item``, or None: no pool,
+        nothing ready, or a tool run (its recipe stages the workspace the
+        sandbox must mount, which no warm set has)."""
+        if self._warmer is None or item.recipe is not None or item.kind == "tool":
+            return None
+        try:
+            return self._warmer.claim()
+        except Exception:
+            log.warning("warm.claim_failed", item=item.item_id, exc_info=True)
+            return None
+
+    def _warm_run(self, run_id: str) -> bool:
+        """Whether ``run_id`` was taken from the warm pool."""
+        return self._warmer is not None and self._warmer.is_claimed(run_id)
+
+    def _warm_run_finished(self, run_id: str) -> bool | None:
+        """For the warmer's sweep: whether a claimed set's run has ended;
+        None when no run of that id exists (yet)."""
+        try:
+            run = self.store.get_run(run_id)
+        except StateError:
+            return None
+        return run.state in TERMINAL_RUN_STATES
 
     def drain(self) -> tuple[tuple[str, TickOutcome], ...]:
         """Wait for every run in flight to end and settle each one; what
@@ -1592,7 +1834,33 @@ class DaemonLoop:
         idle = self._dispatch_gate(now, first=True)
         if idle is not None:
             return idle
-        discovered = self._discover(now) + self._fire_schedules(now)
+        # What is already queued (a chat ask, an API admission, a schedule's
+        # tick, an issue an earlier poll found) runs before the forge is
+        # polled: the poll is seconds of sandbox execs, and a person's ask
+        # does not wait behind it (field: 17-137s from ask to dispatch).
+        # Schedules are the store's own clock, cheap and due on every tick,
+        # so they fire first and their items join the same pass.
+        fired = self._fire_schedules(now)
+        result = self._dispatch_pass(now, discovered=fired)
+        if result.launched and self._serial:
+            # One item per tick, settled before the tick returns; the next
+            # tick follows at once and polls then.
+            return result
+        discovered = fired + self._discover(now)
+        if discovered == fired:
+            return result
+        if result.launched and (self._stop.is_set() or self._dispatch_gate(now) is not None):
+            return result._replace(discovered=discovered)
+        again = self._dispatch_pass(now, discovered)
+        if not result.launched:
+            return again
+        if not again.launched:
+            return result._replace(discovered=discovered)
+        return result._replace(discovered=discovered, launched=result.launched + again.launched)
+
+    def _dispatch_pass(self, now: float, discovered: int) -> TickResult:
+        """Start queued items while there is room for them (one, when runs
+        are serial); the tick's result when nothing more can start."""
         limit = self.config.daemon.max_concurrent_runs
         launched: list[str] = []
         outcome: TickOutcome | None = None
@@ -2476,11 +2744,44 @@ class DaemonLoop:
         )
         return item.model_copy(update={"assignment_json": text})
 
+    def _chronicle(
+        self, item: WorkItem, run_id: str, item_config: Config | None = None
+    ) -> RunChronicle | None:
+        """The chronicle telling ``run_id``'s story in the channel that asked
+        for ``item``, or None when nobody asked. The poster the API listener
+        supplies also lists a run's files; one that does not simply posts
+        without them. A resumed segment is numbered by the resumes the run
+        has had, so a stop it reaches is said even when an earlier segment
+        stopped the same way."""
+        posts: object = self.poster
+        return RunChronicle.for_item(
+            self.poster,
+            _item_assignment(item),
+            item,
+            item_config or self._item_config(item),
+            self.clock,
+            artifacts=posts if isinstance(posts, RunArtifacts) else None,
+            resumes=self.dstore.resumes_for_run(run_id) if self.poster is not None else 0,
+        )
+
+    def _chronicle_landed(
+        self, item: WorkItem | None, run_id: str, pr: int | None, url: str | None
+    ) -> None:
+        """A parked run a person approved has merged, outside its engine:
+        tell its channel, as the engine's own merge would have."""
+        if item is None:
+            return
+        chronicle = self._chronicle(item, run_id)
+        if chronicle is not None:
+            chronicle.on_event(Event.now(HostEventTypes.RUN_MERGED, run_id, pr=pr, url=url))
+
     def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
         now = self.clock()
-        run_id = resume_run_id or new_run_id()
+        # A fresh run takes a warm set's id when one is ready (#47), so its
+        # provisioning finds the sandboxes already booted and installed.
+        run_id = resume_run_id or self._claim_warm(item) or new_run_id()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self._assign(self.dstore.get(item.item_id) or item, now)
@@ -2511,6 +2812,12 @@ class DaemonLoop:
         bus.subscribe(event_log_subscriber)
         # What the run's agents report spending is charged to the pool.
         bus.subscribe(self.usage_pool.subscriber(getattr(item, "channel_id", None)))
+        # What the run does is told in the channel that asked for it, under
+        # the names of the agents doing it. A resume re-attaches it: the
+        # posts a run already made are keyed, so nothing is said twice.
+        chronicle = self._chronicle(item, run_id, item_config)
+        if chronicle is not None:
+            bus.subscribe(chronicle.on_event)
         engine = LoopEngine(
             item_config,
             store=self.store,
@@ -2833,7 +3140,7 @@ class DaemonLoop:
         # `[github]` says — there is no pull request to merge.
         workload = item.kind != "code"
         landed = state == "merged" or (
-            state == "completed" and (workload or not self.config.github.enabled)
+            state == "completed" and (workload or not self.config.vcs.enabled)
         )
         self._resolve_publish_gate(item, run_id, released=landed, now=now, state=state)
         if landed:
@@ -2871,7 +3178,7 @@ class DaemonLoop:
                 attempt=item.attempts,
             )
             return "done"
-        if state == "blocked" or (state == "completed" and self.config.github.enabled):
+        if state == "blocked" or (state == "completed" and self.config.vcs.enabled):
             reason = (
                 (result.reason if result is not None else None)
                 or ("run ended completed without landing" if state == "completed" else None)
@@ -3061,7 +3368,7 @@ class DaemonLoop:
         self.dstore.create_merge_gate(
             run_id,
             item.item_id,
-            item.repo or self.config.github.repo or "",
+            item.repo or self.config.primary_repo or "",
             pr_number,
             pr_url,
             record.branch if record is not None else report.branch,
@@ -3189,7 +3496,7 @@ class DaemonLoop:
             self._deliver_report(fresh)
             self._frontend_finished(item, report)
             return "blocked"
-        repo = item.repo or self.config.github.repo or ""
+        repo = item.repo or self.config.primary_repo or ""
         # What the base wants, from the run's own record of the park — or,
         # a person's draft hold (#677), what they want: the PR marked
         # ready, no approval count.
@@ -3285,7 +3592,7 @@ class DaemonLoop:
         for who in [
             item.requested_by,
             *self.dstore.run_watchers(run_id),
-            *self.config.review_notify_for(item.repo or self.config.github.repo or ""),
+            *self.config.review_notify_for(item.repo or self.config.primary_repo or ""),
         ]:
             if who and who not in notify:
                 notify.append(who)
@@ -3528,6 +3835,7 @@ class DaemonLoop:
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            self._chronicle_landed(fresh, run_id, hold.pr_number, hold.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} {how} · PR #{hold.pr_number}",
@@ -3767,6 +4075,7 @@ class DaemonLoop:
                 self._deliver_report(fresh)
             if item is not None:
                 self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
+            self._chronicle_landed(fresh or item, run_id, gate.pr_number, gate.pr_url or None)
             self._notice(
                 "run.done",
                 f"🎉 {item_id} merged after approval by {by} · PR #{gate.pr_number}",
@@ -4035,7 +4344,7 @@ class DaemonLoop:
         if repo is None:
             parsed = try_parse_gh_id(item.item_id)
             repo = parsed.repo if parsed is not None else None
-        if repo is not None and self.config.github.find_repo(repo) is None:
+        if repo is not None and self.config.find_repo(repo) is None:
             log.warning("run.unknown_item_repo", item=item.item_id, repo=repo)
             return None
         return repo
@@ -4070,7 +4379,12 @@ class DaemonLoop:
                 "deliver_closes": issue if item.kind == "code" else None,
             }
         )
-        update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
+        update: dict[str, Any] = {
+            "github": gh,
+            # The declared list follows the section's view (#2255).
+            "vcs": self.config.vcs.model_copy(update={"repos": list(gh.repos)}),
+            "keep_on_failure": False,
+        }
         if item.kind == "workload" and issue is not None:
             # The workload's issue sink answers on the issue that asked
             # (#760) rather than filing a new one.
@@ -4201,11 +4515,23 @@ class DaemonLoop:
         and every chat ask posted a refresh failure. The first-use clone
         stays keyed on the item's own repository; a repo-less item never
         starts one.
+
+        On a daemon with several repositories a repo-less item refreshes
+        nothing: no repository means no credential, and the checkout would
+        otherwise fall back to the primary repository's, fetched anonymously
+        -- a private forge answered with a username prompt and every chat ask
+        or scheduled workload posted a refresh failure.
         """
         resolved = repo
         if resolved is None:
-            default = self.config.github.default_repo()
+            default = self.config.default_repo()
             resolved = default.repo if default is not None else None
+            if resolved is None and self.config.enabled_repos():
+                log.info(
+                    "workspace.refresh_skipped",
+                    reason="the item names no repository and several are configured",
+                )
+                return
         if resolved is not None and resolved in self._live_repos():
             # Another run is working from this checkout right now: moving
             # it under that run's feet is not ours to do. The next run
@@ -4318,9 +4644,8 @@ class DaemonLoop:
         body = _MARKER_RE.sub("", item.body).strip()
         if body:
             parts.append(body)
-        origin = (
-            f"GitHub issue #{item.source_key} in {self._item_repo(item) or self.config.github.repo}"
-        )
+        where = self._item_repo(item) or self.config.primary_repo
+        origin = f"GitHub issue #{item.source_key} in {where}"
         if item.url:
             origin += f" ({item.url})"
         provenance = f"---\nThis work item came from: {origin}."
@@ -4358,7 +4683,7 @@ class DaemonLoop:
         marker-stamped comments are left out."""
         if self.github is None:
             return UNKNOWN_IDENTITY
-        repo = self._item_repo(item) or self.config.github.repo
+        repo = self._item_repo(item) or self.config.primary_repo
         if repo is None:
             return UNKNOWN_IDENTITY
         try:
@@ -4407,6 +4732,7 @@ class DaemonLoop:
         return engine.start(
             self.outcome_text(item),
             run_id=run_id,
+            warm=self._warm_run(run_id),
             repo=self._item_repo(item),
             prior_branch=prior.branch if prior else None,
             prior_pr=prior.pr_number if prior else None,
@@ -4902,7 +5228,9 @@ class DaemonLoop:
             pass
         vcs_kind = self.config.vcs_kind_for(repo)
         for role in roles:
-            for name in sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind):
+            for name in sandbox_name_candidates(
+                run_id, role, vcs_kind=vcs_kind, home=self.config.paths
+            ):
                 try:
                     remove_run_sandbox(self.sbx, name, role, self.config)
                     self._notice(
@@ -4921,8 +5249,8 @@ class DaemonLoop:
     def _any_credentialed_registries(self) -> bool:
         """Whether any repo this daemon runs for fetches through a service
         sandbox (#766)."""
-        repos: list[str | None] = [r.repo for r in self.config.github.repos] or [
-            self.config.github.repo
+        repos: list[str | None] = [r.repo for r in self.config.vcs.repos] or [
+            self.config.primary_repo
         ]
         return any(self.config.credentialed_registries_for(repo) for repo in repos)
 

@@ -1,6 +1,345 @@
 ## [Unreleased]
 
+**The docs say where a repository is declared.** Third part of #2255: the
+deployment guide, the console guide, the architecture map and the user guide
+describe `[[vcs.repos]]` as the one place a repository is declared, name the
+legacy spellings as such, and point at `sbxloop config migrate`.
+
+**Every surface reads the repositories from where they are declared, and
+the legacy spelling can be rewritten in place.** Second part of #2255: the
+daemon, the engine, the concierge, the doctor, the console and the CLI read
+the repository list through the forge-neutral accessors instead of the GitHub
+section, so nothing downstream names GitHub for a repository on another
+forge. `sbxloop doctor` names a repository's row by its own forge (`gitlab repo group/project`), `sbxloop config repos` shows each entry's forge and
+token variable, and the console's repository pane addresses entries as
+`vcs.repos[i]`. `sbxloop config migrate` moves `[[github.repos]]` entries, or
+a single `[github] repo` with its delivery settings, under `[[vcs.repos]]`
+with every comment kept and the previous file backed up; a file that declares
+repositories under both is refused, never merged. `sbxloop setup` runs the
+same migration before it writes a repository, so it always writes the current
+spelling. Messages and hints name `[[vcs.repos]]`.
+
+**A repository is declared under `[[vcs.repos]]`, whatever forge it lives
+on.** The repository list moves from the GitHub section to the forge section
+(#2255): `[[vcs.repos]]` carries the same entries and keys `[[github.repos]]`
+did, and `[github]` keeps only the GitHub backend's own settings (where GitHub
+is, naming, identity, reviewers). The legacy spelling, `[[github.repos]]` or a
+single `[github] repo`, still loads, folded into the same list with one notice
+(`config.repos_legacy`); a file that declares repositories under both, and not
+the same ones, is refused by name. The GitHub section's view of the list is
+rebuilt from the declared one on every load, a run's narrowing goes through
+`Config.for_repo` so both stay in step in the persisted config, and a stored
+config from an earlier release loads unchanged. Validation errors name
+`vcs.repos[]`; the config editor's model keys and the concierge's default lock
+list cover the new path (the forge, its API root and every credential name are
+locked; a repository's own delivery settings are not). The example config and
+the user guide document the new spelling.
+
+**Files delivered into a conversation are now the whole channel's to read, and
+a long channel keeps a summary of what fell out of its history.** A work
+result's files are attached to the message in the same transaction that writes
+it and served on `MessageOut.artifacts`. `GET /v1/channels/{id}/artifacts` and
+`GET /v1/channels/{id}/artifacts/{artifact_id}/content` serve them to anyone
+who can read the channel, without `artifacts:read`; the run artifact routes are
+unchanged. A chat turn's history lines now name the sequence, the author, the
+message kind and the files each message carried, and a trimmed history opens
+with the channel's latest summary, written after a turn settles by one
+tool-less call on the concierge's model. Agents answering in a channel get
+`read_channel_artifact`, which reads a file that channel can see -- for
+read-only roles too -- refuses one from anywhere else, truncates with a marker
+naming the next offset, and never hands back bytes that are not text. Each
+channel is summarised in a session of its own, so no channel's transcript is
+resumed into another's summary; the summary covers exactly the messages the
+model was shown, and is written whenever the history window trims, on the
+character budget as well as the message count. Compaction runs on its own
+thread with a bounded wait, so a slow model never holds a channel's turn lane.
+Once a channel has a summary it is rewritten per batch (50 messages or 20,000
+characters fallen out), not per turn; only the newest summary row is kept, and
+the call's usage is charged to the channel it summarises. Shutting down abandons a summary
+the model has not answered and waits for one that is writing, so no compaction
+touches the store after it closes.
+The channel content route serves the channel's own files and nothing else: a
+catalogued file of a run the channel started but never delivered there, such as
+a code run's checkout, is `404` like any other id from elsewhere.
+
 ### Added
+
+- **Warm sandbox sets: `[daemon] warm_pairs`.** Field (db, 2026-09-19): a
+  run spent 57 to 94 seconds between dispatch and its first model call
+  booting microVMs and installing the worker, every run. The daemon now
+  keeps that many sets ready (agent box plus forge box, booted, workers
+  installed) under run ids nobody has used yet, and a fresh run takes one:
+  provisioning finds its sandboxes in the inventory and skips the create and
+  the install ladder, the way a provider recovery reuses a surviving pair.
+  Nothing about a run's names, paths or cleanup changes. A set is keyed by a
+  fingerprint of what shaped it (version, template, backend, toolchains,
+  resources, forge, secret strategy); one from another configuration, older
+  than `warm_ttl_s`, or missing a sandbox is retired rather than handed out.
+  The registry (`state/daemon/warm-sets.json`) survives restarts, `status`
+  reports `warm`, and `sbxloop sandbox prune` leaves warm sets alone. Off by
+  default. The daemon's forge box also probes a baked template now instead
+  of running the install ladder on every provision.
+
+- **A resident worker per sandbox: `worker_transport = "resident"`.** Every
+  `sbx exec` and `sbx cp` costs about a second of round trip through the
+  sandbox backend whatever it runs (field, db 2026-09-19: `exec true` 1.15s,
+  `cp` of a one-line file 1.1s), and the stream transport paid three of them
+  per job plus one per host-tool response: 11,897 forge-op jobs at 2.8s mean
+  over five days, a concierge turn's 9s floor, ~3s on every phase of a run.
+  `python -m sbxloop_worker serve` is started once per sandbox with one
+  exec; the host writes each job to its stdin and reads the job's events and
+  result back on its stdout, and a tool response rides the same stdin, so a
+  job costs no sbx call at all. Each job still runs in a forked child with
+  the same runner, events file and result file; a cancel signals the child's
+  own process group. Credentials take the road per-job stdin delivery already
+  uses, once before the first job and again when they change, and are never
+  at rest in the VM. The transport needs that stdin delivery (the
+  `exec-stdin-env` verdict); a client without it, or whose server never
+  reports ready, streams as before. Opt-in for this release; the host still
+  initiates everything and the server listens on nothing
+  (`docs/worker-protocol.md`).
+
+- **`sbxloop users merge --from A --into B` folds one person's second
+  account into their first.** A provider that sends no verified email cannot
+  be linked to an existing local account, so the first sign-in through it
+  creates a separate one. The command (a dry run without `--yes`) moves that
+  account's channels, memberships, messages, turns, teams, preferences (the
+  target's value wins a clash), workflows, agent memories, invites and
+  bridge identities to the target in one immediate transaction, keeps the
+  stronger workspace role, moves the provider identity onto the target so
+  both the password and the provider sign in to it, and deactivates the
+  source with its refresh tokens revoked. `CollaborationStore.merge_users`
+  does the work; it records `collaboration.user.merged` with the two ids.
+
+- **A channel can have a window onto Slack, Discord or Mattermost.** A
+  bridge surface linked to a channel stops routing to the daemon-wide
+  concierge: what people type there becomes a turn in that channel, with
+  its own history and the agents in it, credited to whoever's account the
+  author is mapped to. People map themselves once, with
+  `POST /v1/users/me/identities/link-code` and `!sbx link <code>` typed on
+  the bridge; `GET` and `DELETE /v1/users/me/identities` show and undo it.
+  An author nobody has mapped is refused with a short reply, unless the
+  link was created with `allow_guests`, in which case the message is stored
+  as a person with no account under the name they use there; an account
+  that has since left the workspace, or been deactivated, counts as
+  unmapped again, so revoking someone's access here revokes it on the
+  bridge too. Outbound, every message appended to a linked channel is
+  posted to each linked surface under a `**name**` header, never back to
+  the surface it arrived on, so two services mirror each other without
+  looping; a failed or cancelled turn's message and one agent's request to
+  another travel that way as well, so an ask that fails is answered on the
+  surface it came from. `GET /v1/bridges` lists the services and whether
+  one is configured here, and `GET`, `POST` and
+  `DELETE /v1/channels/{id}/links` manage a channel's links (creating one
+  takes managing the channel and a workspace owner or admin, and a run's
+  thread cannot be linked; a Discord thread is linked as a surface of its
+  own). A guest's turn that a daemon restart interrupts before it starts
+  resumes for the guest, never for the channel's owner. Messages gain `origin`, naming the surface a message arrived
+  on. Linking a surface grants nobody operator powers: a link cannot widen
+  where `!sbx` runs, so on a linked surface that is not the control channel
+  the only command is `!sbx link`, and every other one is refused with a
+  note saying where it does run. Commands on the control channel,
+  run-thread steering and an unlinked surface behave exactly as before.
+  Advertised as `collaboration.bridges`.
+
+- **Steer one task, or one agent, by naming it; stop a channel from chat.**
+  Every instruction used to go into one mailbox and be answered by whichever
+  task lane reached a phase boundary first, in the run's own steering voice,
+  so with several lanes in flight "steer the builder working on t2" could be
+  answered by the lane working on t1. `POST /v1/runs/{id}/steering` now takes
+  an optional `task_id`, which puts the instruction in that task's own
+  mailbox so that lane answers it, and an optional `agent_slug`, which makes
+  the answer come back in that agent's persona and with its model; the run's
+  `chat.reply` event carries both. A task that ends with instructions still
+  waiting hands them to the run rather than dropping them. In a channel, a
+  mention of an agent already working live work there is taken as direction
+  for that run instead of a fresh answer, and the turn records
+  `steered_run_id`; the mention has to be unambiguous, or it stays an
+  ordinary turn. Only a person's own mention steers: an agent another agent
+  hands off to answers the request it was handed. Stopping stays explicit:
+  `/stop`, `/cancel` or exactly `@agent stop` cancels that channel's runs
+  through the same control service the API's cancel uses. It takes the rule
+  `POST /v1/channels/{id}/stop` takes: anyone who may post in the channel
+  may stop the runs that channel asked for, so a plain `member` may stop as
+  well as steer, and the cancel is recorded in their name. Someone who may
+  not post there is told nothing was stopped, and a turn an agent started
+  never stops anything. New capability `collaboration.mention_steering`;
+  revision 0031 adds the turn column. An instruction that names no target is
+  answered exactly as before.
+
+- **Agents can start work and file issues themselves.** An agent whose
+  `[[agents]]` entry declares `can_start` is offered two new tools in a chat
+  turn: `start_run` (a `workload` run, or a `code` run filed as a queued
+  issue) and `file_issue`. Six guardrails run before anything is admitted —
+  the kind must be one the agent declares, the repository must be configured
+  and enabled, the work must sit below `[agent_team] max_chain_depth`, the
+  agent must be under its daily cap (`[[agents]] max_runs_per_day`, else
+  `[agent_team] max_agent_runs_per_day`), the workspace pool must admit
+  another run, and the same ask under the same parent is refused rather than
+  queued twice. The admission runs under a new `Principal.for_agent`, which
+  holds `items:create` and nothing else. Work an agent started carries its
+  channel, the agent, the parent item and the chain depth, and everything it
+  writes to a repository carries an attribution footer and an origin marker
+  that issue discovery reads back, so a chain stays countable across a poll.
+  The marker is the daemon's alone: every marker is stripped out of the body
+  the agent wrote before the daemon appends its own, and the last marker in a
+  body is the one read back, so nothing an agent types can credit another
+  agent or reset the depth its chain is already at. Every start is written to
+  a durable ledger as it is made, so a queued issue counts against the daily
+  cap from the moment it is filed rather than from whenever a poll discovers
+  it, and an ask is refused as a duplicate across turns and restarts, not
+  only within one turn. Filing an issue nobody queued runs nothing, so it
+  needs no `can_start` kind and does not ask the pool, but it answers to the
+  chain depth, the daily cap and the duplicate check like every other start.
+  A queued issue needs `code` in `can_start`; an agent with none can only
+  file one for a person to decide on. An agent offered these tools is not
+  also offered the concierge's own start tools (`create_issue`,
+  `label_issue_for_run`, `start_workload`, `start_entrygraph`,
+  `create_schedule`), which check none of those guardrails, so `start_run`
+  and `file_issue` are the only way it starts work. An issue an agent files
+  from a conversation leaves that channel with the daemon, as the
+  concierge's own filings do, so the code run a poll builds from it reports
+  back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
+  capability `agents.initiative`.
+
+- **A listening agent may speak without being asked.** A channel
+  participant whose `mode` is `ambient` was listed and never heard from: it
+  answered only when named, like every other participant. With the new
+  `[collaboration] ambient = true` it may answer a message nobody addressed
+  to it, through three gates in order. Its `interests` are matched, case
+  insensitively, over the last `ambient_window_messages`; an agent none of
+  whose interests match is dropped there and no model is called for it.
+  What matches passes the mention guardrails with `trigger: "ambient"` —
+  the chain depth, the rate caps, the channel's silence and the token
+  budget — plus `ambient_max_per_hour` for that agent in that channel. What
+  survives gets one short relevance call on `ambient_model` (the
+  concierge's model when unset) that answers RELEVANT or PASS; a PASS posts
+  nothing and records `collaboration.followup.suppressed` with reason
+  `ambient_pass`, and being over the hourly cap records `ambient_cap`. What
+  passes all three becomes a turn whose reply is an ordinary agent
+  message, but the turn carries no authority: it runs read-only, with no
+  actions and no handoff, and the agent is told the message was not a
+  request to it. The relevance call is one-shot and resumes no session, so
+  no earlier verdict colours the next. Each decision is audited once, as its
+  final outcome. An agent never answers its own message; one already
+  answering the turn, or named in the message it would answer, does not
+  also volunteer; and each message is looked at once, by the turn that
+  posted it. `ambient = false`, the default, leaves every channel exactly
+  as it was.
+
+- **Agents address each other, under a person's control.** An agent's
+  reply is prose in a shared channel, so naming another agent in it now
+  addresses that agent: a follow-up turn is accepted for it, carrying
+  `trigger: "mention"`, the replying agent as its author, the reply as its
+  input message and one more `chain_depth`. A mention inside a code fence,
+  an inline code span or a block quote addresses nobody, an agent never
+  addresses itself, and one reply reaches at most four agents. Every
+  follow-up passes the new `[collaboration]` guardrails first — a chain
+  depth (default 4), a per-channel and a per-agent cap within a window
+  (20 and 6 per 10 minutes), a cooldown per ordered pair (60s), the
+  channel's silence and the workspace token budget — and each decision,
+  allowed or refused, records `collaboration.followup.queued` or
+  `collaboration.followup.suppressed` with its reason and never the
+  message text. A follow-up answers as a peer request, never as the
+  person's: the other agent's message is framed as that agent speaking,
+  with read-only tools and no handoff, and an agent still to answer in the
+  same turn is not addressed a second time. `POST /v1/channels/{id}/stop`
+  cancels the channel's turns, the runs its work is executing and the work
+  it queued (`cancelled_items`), for any member who may post, and silences
+  it,
+  `POST /v1/channels/{id}/resume` lifts that, and
+  `PUT /v1/channels/{id}/silence` quiets the agents without cancelling
+  anything; all three need only the right to post, because the person
+  watching is the guard that matters. `PUT /v1/channels/{id}/read` records
+  how far the caller has read, and the channel now reports `unread_count`.
+  Advertised as `collaboration.channel_stop`, `collaboration.silence` and
+  `collaboration.read_state`. `handoff_agent`, the peer request inside one
+  turn, is unchanged.
+
+- **A mention asks an agent to answer, not to queue a run.** Naming an
+  agent in a chat turn used to rewrite the turn's intent to `delegate`,
+  and the agent was told that anything it could not produce in the chat is
+  a workload to queue with one call and no confirmation, so an ask as
+  ordinary as a list came back as a queued run instead of an answer. The
+  caller's intent now survives a mention — a conversation stays a
+  conversation, and the mention still records the agent as a target and
+  joins it to the channel. A conversation that mentions an agent keeps
+  that agent's read tools but not the ones that start managed work
+  (`start_workload`, `start_entrygraph`, `create_schedule`, `create_issue`,
+  `label_issue_for_run`, nor an agent's own `start_run` and `file_issue`
+  whatever its `can_start` declares), so a reply is the only outcome it
+  can have, and the agent says which mode to pick when the ask needs work. Turns that may
+  start work carry the rule that an ask the reply itself can satisfy (a
+  list, an explanation, a short plan, an opinion, a judgement about work
+  already in the channel) is answered inline, with managed work reserved
+  for asks that need execution, external sources, a repository change or
+  a produced file. A turn with no tools at all now points the person at the
+  Code, Workload or Auto mode instead of at a mention. `TurnCreate`
+  also accepts `intent: "auto"` for a client that does not know which it
+  is and wants the lead to decide, advertised as
+  `collaboration.lead_orchestrator`; `TurnOut` now reports the recorded
+  `intent`. On a turn that may start work (`code`, `workload` or `auto`),
+  the mentioned agents that declare a run role are recorded as the first
+  participant's `assignees` (`role -> slug`), which admission assigns the
+  run from. An ask that genuinely needs work is still started without
+  asking for confirmation, and nothing is ever refused as out of scope.
+
+- **A run tells the channel that asked for it what it is doing.** The new
+  `RunChronicle` turns a run's events into short posts under the name of
+  the agent that did the work: the plan by the planner ("Split the ask
+  into 5 tasks"), each task by its agent ("Finished task 2 of 5: ...", or
+  "Task failed: ..." when it broke), the verdict by the critic ("2
+  findings, 1 blocking"), a steering reply by the agent that was asked,
+  and the delivery (with the run's files and the pull request link) or a
+  notice by the lead. Only work that finished is counted, so a failed or
+  skipped task never reads as one more task done. A run publishing to
+  several sinks makes one delivery post, and it is the answer the chat
+  sink carried rather than the line about where a file landed; a run with
+  no chat sink names where its result went instead. Each post names the
+  message that asked for the work, so it joins that turn in a channel
+  running several at once. It is attached to a run whose item names a
+  channel, and re-attached on a resume, where the re-announced roster
+  restores the count of tasks already finished; each post carries a key
+  naming its moment, so a resumed or replayed run says each thing once. A
+  stop belongs to the segment that reached it, so a run an operator
+  resumes that fails again says so again. A merge a person approves at a
+  `[landing] merge_gate` or a review wait is the run's delivery, posted
+  as the engine's own merge would be.
+  `[agent_team] chronicle` (`normal`, `quiet`, `off`),
+  `max_posts_per_run` (12) and `progress_interval_s` (120) bound it:
+  progress is coalesced to one post per interval and a run is capped
+  across its resumes, but the delivery and a terminal notice are always
+  posted. A run no channel
+  asked for posts nothing, and nothing about a run with the built-in team
+  changes.
+
+- **A run can say what it is doing in the channel that asked for it.** A
+  run linked to a channel posts under the name of the agent doing the
+  work: an `agent_update` message with that agent as its author, the kind
+  of post it is (`plan`, `progress`, `review`, `delivery`, `reply` or
+  `notice`) on the new `post_kind` field, and the files it delivered on
+  the work snapshot beside it. Every post names a dedupe key, recorded in
+  the new `channel_run_posts` table, so a replayed or resumed run posts a
+  moment once. A deleted channel receives nothing; a silenced channel
+  drops the running commentary and still hears a `delivery` or a
+  `notice`, because nobody is coming to look. A post hangs on the turn
+  that asked for its work, the same turn the work's result is delivered
+  on, so a run's commentary and its delivery do not split across two; a
+  turn belonging to another channel is never borrowed. A run a channel
+  asked for outside any turn of its own keeps its files all the same:
+  `work.turn_id` is now nullable. A snapshot is shown only if a client
+  can read it back, and one already recorded that this build cannot read
+  hides itself rather than the channel's whole message list. An item
+  admitted with a `channel_id` now belongs to that channel for event
+  visibility too, so a member who can open the channel sees the run's
+  events even when no message there names the work, and a workspace member
+  without `artifacts:read` may list and download the files of a run a
+  channel they can open asked for (anything else answers the same `403` as
+  before). A post of a kind this build does not know is dropped before it
+  is stored, and a stored kind a later build wrote reads back as a null
+  `post_kind`, so one row never fails the channel's message list. Nothing posts yet:
+  this is the contract (`ChannelPoster`) the daemon and engine will use,
+  advertised as `collaboration.run_progress`.
 
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
@@ -360,6 +699,27 @@
 
 ### Changed
 
+- **Sandbox names identify their installation and purpose.** New sandboxes use
+  `sbxl-<instance>-<run>-run-agent`, `-run-vcs-<forge>`, or
+  `-run-credential-service`; daemon boxes end in `-daemon-vcs-<forge>` or
+  `-daemon-chat-concierge`. Existing names remain discoverable for cleanup,
+  and bulk removal and pruning do not claim another home's boxes.
+
+- **Forge polls start short and back off.** Field (db, 2026-09-19): a merge
+  request whose CI went green in two seconds spent three more minutes in
+  60s polls (a settle read, the undraft, the mergeability read, the merge)
+  before it merged, each answered by the forge in seconds. The wait between
+  polls now starts at `[landing] ci_poll_min_s` (10s) and doubles while the
+  same thing is waited on, up to `ci_poll_interval_s` as before; waiting on
+  something else starts over. A slow CI still costs one call a minute.
+
+- **A workload planner is told when its tasks run at the same time.** With
+  `max_parallel_tasks` above 1 (in `[budgets]` or a profile's own
+  `[workloads.budgets]`), independent tasks share one workspace at once, and
+  `depends_on` is the planner's own word: the plan prompt's bounds now say
+  how many run together, that each task gets its own output files, and that
+  two tasks never edit the same file (one depends on the other instead).
+
 - **Chat turns wait in a queue per channel instead of one daemon-wide
   queue.** Accepted product-channel turns now run over a shared pool of
   `[concierge] max_concurrent_turns` workers, so turns in one channel still
@@ -386,6 +746,89 @@
   or a stream's access re-check. The single local user sees no change.
 
 ### Fixed
+
+- **An issue the concierge files or labels is polled for at once.** Field
+  (db, 2026-09-19): a code task asked for in chat was filed as a labelled
+  issue in 11s and then sat 55s until the next forge poll found it. The
+  `create_issue` and `label_issue_for_run` tools now wake the loop, which
+  polls the forge on that tick; the replies say so instead of quoting the
+  poll interval.
+
+- **The chat UI's polling no longer serialises behind reads that grow with a
+  channel's history.** Over five days one daemon served 14,593
+  `GET /v1/channels/{id}/work` at 186 ms mean (915 ms worst) and 14,591
+  `GET .../turns` at 109 ms, peaking at 207 requests a minute from a single
+  browser tab; every one of them runs under the store's one process-wide
+  lock, against the daemon's own writes. Work is now linked to the message
+  that asked for it through an indexed `message_id` on the item row (schema
+  revision 0032, backfilled from `source_key`) instead of a prefix match no
+  index could serve; the items and runs behind a channel's links are read in
+  one query each rather than one per link; the scan for code links is bounded
+  to the same window the messages page carries; a turn's history and a
+  messages page read their authors in one query instead of one per author;
+  the chronology's projection answers "nothing to copy" from a read, so N
+  open tabs no longer cost N write-lock acquisitions a second; and stopping a
+  channel asks the store for that channel's live work rather than listing
+  every item the daemon has ever held.
+
+- **A queued ask no longer waits for the poll interval, or behind the forge
+  poll.** Field (db, 2026-09-19): a chat ask sat 17-137s between the
+  concierge's `start_workload` and `run.dispatch`, because nothing woke the
+  loop from its `poll_interval_s` wait and the tick polled the forge (four
+  cold worker boots, ~11s) before it read the queue. `DaemonLoop.wake()` now
+  ends the wait the moment the concierge or the API intake queues an item,
+  and a tick fires its schedules and dispatches what is already queued before
+  it polls; a poll that finds something dispatches again while slots remain.
+  The concierge's queued reply says "starts it now" rather than "within Ns".
+
+- **`sbxloop bake` completes on sbx 0.43.** `sbx template save` refuses a
+  running sandbox, so the bake failed at its last step on every host with
+  that sbx; it now stops the scratch box first.
+
+- **A conversation that mentions an agent can no longer operate the
+  daemon.** Such a turn may only reply, but it lost only the five tools that
+  start managed work and kept every other host tool, including
+  `sbx_control`, which runs operator commands with full authority. Any
+  member who could post a conversation could have an agent retry, requeue,
+  cancel, merge, release, pause or restart the daemon, change its config
+  with `set_config`, or close and comment on issues. A turn that may only
+  reply now keeps the read tools alone, the same allowlist a reviewer gets,
+  and a call to anything else is refused as an unknown tool.
+
+- **A chat bridge turn waiting behind another no longer holds a concierge
+  worker, so chat cannot deadlock or starve other channels.** A turn took its
+  place in its session's lane and was handed to the pool in two separate
+  steps, then blocked on a pool worker until the turn ahead of it finished.
+  The local console and a configured bridge submit from their own threads
+  into the same default lane, so at `[concierge] max_concurrent_turns = 1`
+  the later turn could take the only worker and wait forever for the earlier
+  one, which never got a worker: the concierge stopped answering until a
+  restart, and every channel's turn lane stalled behind it. At a wider pool,
+  a burst of bridge messages parked every worker, so product-channel turns
+  and summaries waited for the burst to drain. Only a lane's head is now on
+  the pool; the next turn is handed over when it finishes. A turn cancelled
+  while it waits is passed over and no longer counts as pending, and
+  closing the concierge cancels the turns still waiting.
+
+- **A chat ask or scheduled workload no longer fetches the primary
+  repository's checkout anonymously on a daemon with several
+  repositories.** An item that names no repository selected no forge
+  credential, but its checkout still fell back to the primary repository's
+  home clone, so `git fetch origin` ran without a token and a private
+  GitLab answered "could not read Username ... terminal prompts disabled",
+  posted as a `workspace refresh failed` warning on every such run. With
+  several repositories configured, a repo-less item now refreshes nothing
+  and logs `workspace.refresh_skipped` at info. A single-repository daemon
+  still refreshes its one checkout with that repository's credential.
+
+- **`doctor --deep` no longer reports a sandbox reaching the remote API
+  when nothing got through.** The `api-host-unreachable` probe counted any
+  accepted connection as reachable, and sbx accepts connections its
+  network policy then closes unanswered, so on sbx 0.43 it drifted with
+  the API out of reach. It now counts the API as reachable only when the API's own
+  `/health/live` answer comes back, tried directly and through the
+  sandbox's proxy, and it also tries `host.docker.internal` and the
+  `[api] bind` address on `[api] port`, which it never did before.
 
 - **A runner's result in a conversation is credited to Angie.** A code
   or workload turn names no participant, so the `work_result` message and

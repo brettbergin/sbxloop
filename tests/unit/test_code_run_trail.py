@@ -81,6 +81,18 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 def _scrub(value: Any, run_id: str) -> Any:
     if isinstance(value, str):
+        # This fixture tracks phase behavior; the sandbox-name grammar has
+        # its own tests. Keep the pre-rename code trail comparable.
+        value = re.sub(
+            rf"sbxl-[0-9a-f]{{8}}-{re.escape(run_id)}-run-vcs-github",
+            f"sbxloop-{run_id}-github",
+            value,
+        )
+        value = re.sub(
+            rf"sbxl-[0-9a-f]{{8}}-{re.escape(run_id)}-run-agent",
+            f"sbxloop-{run_id}-agent",
+            value,
+        )
         return value.replace(run_id, "<run>")
     if isinstance(value, list):
         return [_scrub(v, run_id) for v in value]

@@ -216,6 +216,29 @@ class TestPoll:
         (done,) = notices(h, "run.done")
         assert "alice, bob" in done.text
 
+    def test_an_approved_review_is_delivered_in_the_channel_that_asked(
+        self, tmp_path: Path
+    ) -> None:
+        """The landing an approving review completes is the run's delivery,
+        told in the channel that asked for the work."""
+        from tests.unit.test_run_chronicle import CHANNEL, FakePoster
+
+        h, fake = review_harness(tmp_path)
+        poster = FakePoster(files=False)
+        h.loop.poster = poster
+        run_id = park(h, channel_id=CHANNEL)
+        fake.reviews_payload = [
+            human_review("alice", "APPROVED", "lgtm", id=1),
+            human_review("bob", "APPROVED", "", id=4),
+        ]
+        h.clock.t += 600
+        h.loop.tick()
+        landed(h, run_id)
+
+        assert [(p.kind, p.channel_id, p.dedupe_key, p.text) for p in poster.posts] == [
+            ("delivery", CHANNEL, f"{run_id}:delivery", f"Merged pull request #9: {PR_URL}")
+        ]
+
     def test_a_request_for_changes_resumes_the_run_for_a_fix(self, tmp_path: Path) -> None:
         h, fake, run_id = self.parked(tmp_path)
         fake.reviews_payload = [

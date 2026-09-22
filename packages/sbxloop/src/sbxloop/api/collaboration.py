@@ -11,16 +11,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
+from sbxloop.agents.posts import POST_KINDS, TERMINAL_POST_KINDS, PostKind
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
-from sbxloop.api.channel_access import ChannelAccess, ChannelRole, Need
+from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
+from sbxloop.api.publicids import run_public_id
 
 # The role names belong to this module's membership contract, so they are
 # re-exported explicitly (``X as X``) for strictly type-checked consumers.
@@ -36,10 +39,16 @@ from sbxloop.daemon.controls.principal import (
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
+    AgentMemoryRow,
+    ChannelLinkRow,
     ChannelMemberRow,
     ChannelParticipantRow,
     ChannelRow,
+    ChannelRunPostRow,
+    ChannelSummaryRow,
+    ExternalIdentityRow,
     LocalUserRow,
+    MessageArtifactRow,
     MessageRow,
     PreferenceRow,
     TeamRow,
@@ -48,6 +57,8 @@ from sbxloop.db.collaboration_models import (
     WorkspaceInviteRow,
     WorkspaceMemberRow,
 )
+from sbxloop.db.daemon_models import WorkItemRow
+from sbxloop.db.event_scope import channel_for_run, turn_for_item
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -61,6 +72,12 @@ MAX_HANDOFFS_PER_RESPONSE = 2
 # -> reviewer -> author -> coordinator. The agents choose the path; this is a
 # circuit breaker, not a workflow definition.
 MAX_HANDOFF_DEPTH = 4
+#: Messages one turn's history may carry, newest first.
+HISTORY_MESSAGES = 200
+#: Characters one turn's history may spend on those messages.
+HISTORY_CHARS = 60_000
+#: How long a bridge identity link code is worth typing.
+LINK_CODE_TTL_S = 600.0
 
 
 class CollaborationError(Exception):
@@ -142,6 +159,9 @@ class Channel:
     silenced_until: float | None = None
     #: The reader's role in the channel, for a read made on someone's behalf.
     my_role: ChannelRole | None = None
+    #: Messages past the reader's last read sequence; None for a reader
+    #: with no membership to track it against (a plain API client).
+    unread_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +191,54 @@ class ChannelParticipant:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactRef:
+    """A file a message carries, by catalog identity. ``run_id`` is the
+    run's public id; the bytes are served by the artifact routes."""
+
+    id: str
+    run_id: str
+    relpath: str
+    media_type: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelSummary:
+    """What a channel said up to ``through_sequence``, in a few sentences."""
+
+    channel_id: str
+    through_sequence: int
+    content: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelLink:
+    """A bridge surface that mirrors a channel."""
+
+    id: str
+    channel_id: str
+    backend: str
+    surface_id: str
+    thread_id: str | None
+    allow_guests: bool
+    created_by: str | None
+    created_at: float
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalIdentity:
+    """Who a local user is on a bridge."""
+
+    backend: str
+    external_user_id: str
+    user_id: str
+    display_name: str | None
+    verified_at: float
+
+
 #: Who a store read or write is made for: a workspace member (or their user
 #: id, resolved to the member), or ``None`` for a plain API client or the
 #: daemon itself, which keep full access.
@@ -192,8 +260,10 @@ class Message:
     work: dict[str, Any] | None = None
     reactions: tuple[str, ...] = ()
     author: Author = SYSTEM_AUTHOR
-    artifacts: tuple[Any, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
     origin: dict[str, Any] | None = None
+    #: What an ``agent_update`` a run posted is; None for every other message.
+    post_kind: PostKind | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +285,19 @@ class Turn:
     parent_turn_id: str | None = None
     source_message_id: str | None = None
     chain_depth: int = 0
+    #: The run this turn steered instead of answering from scratch (S-A11).
+    steered_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTurnRecord:
+    """One agent-authored turn, as the guardrails count it."""
+
+    turn_id: str
+    source_slug: str | None
+    targets: tuple[str, ...]
+    trigger: str
+    created_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +337,54 @@ class Workflow:
     updated_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class MergeReport:
+    """What :meth:`CollaborationStore.merge_users` moved, or would move.
+
+    ``moved`` counts rows per kind, in a stable order. A preference both
+    accounts hold keeps the target's value and is named in
+    ``preference_conflicts``; a team or workflow whose slug the target
+    already uses moves under a new slug, listed as ``(old, new)``.
+    """
+
+    source_id: str
+    source_username: str
+    target_id: str
+    target_username: str
+    dry_run: bool
+    moved: dict[str, int]
+    preference_conflicts: tuple[str, ...]
+    renamed_teams: tuple[tuple[str, str], ...]
+    renamed_workflows: tuple[tuple[str, str], ...]
+    #: The provider identity that moved to the target, if the source had one.
+    identity: tuple[str, str] | None
+    #: The target's workspace role before and after the merge.
+    previous_role: Role | None
+    role: Role
+
+
+#: Workspace roles, weakest first: a merge keeps the stronger of two.
+_ROLE_RANK: dict[str, int] = {"member": 0, "admin": 1, "owner": 2}
+_CHANNEL_ROLE_RANK: dict[str, int] = {"member": 0, "owner": 1}
+
+
+class _DryRun(Exception):
+    """Unwinds a dry-run merge's transaction, carrying what it found."""
+
+    def __init__(self, report: MergeReport) -> None:
+        super().__init__("dry run")
+        self.report = report
+
+
+def _free_slug(taken: set[str], slug: str) -> str:
+    candidate = f"{slug}-merged"
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{slug}-merged{suffix}"
+        suffix += 1
+    return candidate
+
+
 def _user(row: LocalUserRow) -> LocalUser:
     return LocalUser(
         id=str(row.id),
@@ -268,6 +399,23 @@ def _user(row: LocalUserRow) -> LocalUser:
         auth_source=str(row.auth_source or "local"),
         avatar_url=None if row.avatar_url is None else str(row.avatar_url),
         last_seen_at=None if row.last_seen_at is None else float(row.last_seen_at),
+    )
+
+
+def guest_user(display_name: str | None) -> LocalUser:
+    """The stand-in a guest's turn runs for: a name, and nothing else. Its
+    empty id belongs to no member, so every check that reads it refuses."""
+    name = (display_name or "guest").strip() or "guest"
+    return LocalUser(
+        id="",
+        client_id="",
+        username=name,
+        email="",
+        full_name=name,
+        timezone="UTC",
+        active=True,
+        created_at=0.0,
+        updated_at=0.0,
     )
 
 
@@ -304,7 +452,9 @@ def invite_token_hash(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def _channel(row: ChannelRow, my_role: ChannelRole | None = None) -> Channel:
+def _channel(
+    row: ChannelRow, my_role: ChannelRole | None = None, unread_count: int | None = None
+) -> Channel:
     return Channel(
         id=str(row.id),
         workspace_id=str(row.workspace_id),
@@ -319,6 +469,7 @@ def _channel(row: ChannelRow, my_role: ChannelRole | None = None) -> Channel:
         created_by=None if row.created_by is None else str(row.created_by),
         silenced_until=None if row.silenced_until is None else float(row.silenced_until),
         my_role=my_role,
+        unread_count=unread_count,
     )
 
 
@@ -332,18 +483,95 @@ def message_author(role: str, kind: str, agent_slug: str | None, owner_id: str |
     return Author("agent", agent_slug or ANGIE_SLUG)
 
 
-def _human_name(session: Any, user_id: str | None) -> str | None:
+def bridge_origin(
+    backend: str, surface_id: str, external_message_id: str, author_name: str | None = None
+) -> dict[str, Any]:
+    """Where a message that arrived over a bridge came from. ``author_name``
+    rides along for a guest, who has no account to read a name from."""
+    origin: dict[str, Any] = {
+        "backend": backend,
+        "surface_id": surface_id,
+        "external_message_id": external_message_id,
+    }
+    if author_name:
+        origin["author_name"] = author_name
+    return origin
+
+
+def _origin_name(origin: dict[str, Any] | None) -> str | None:
+    if not isinstance(origin, dict):
+        return None
+    name = origin.get("author_name")
+    return str(name) if name else None
+
+
+@dataclass(frozen=True, slots=True)
+class _Directory:
+    """The people and channels a page of messages names, read once.
+
+    Attributing a message asks who wrote it and, when the row records no
+    author, who owns its channel. Asked row by row that is a query per
+    author and a query per channel, under the store's single lock, for
+    every history a turn builds and every messages page the browser polls.
+    :func:`_directory` answers all of them in two queries; a lookup that
+    misses falls back to the row-at-a-time path, so a page is never wrong,
+    only slower.
+    """
+
+    #: User id -> display name, for the ids the page's rows carry.
+    names: Mapping[str, str | None]
+    #: Channel id -> owning user id.
+    owners: Mapping[str, str | None]
+
+
+#: Nothing read ahead: every lookup falls back to its own query.
+_NO_DIRECTORY = _Directory(names={}, owners={})
+
+
+def _directory(session: Any, rows: Sequence[Any]) -> _Directory:
+    """The authors and channel owners ``rows`` name, in one query each."""
+    user_ids = {
+        str(row.author_id)
+        for row in rows
+        if row.author_kind == "human" and row.author_id is not None
+    }
+    names: dict[str, str | None] = {}
+    if user_ids:
+        for user in session.scalars(
+            select(LocalUserRow).where(LocalUserRow.id.in_(sorted(user_ids)))
+        ):
+            names[str(user.id)] = str(user.full_name or user.username)
+    channel_ids = {str(row.channel_id) for row in rows if row.channel_id is not None}
+    owners: dict[str, str | None] = {}
+    if channel_ids:
+        for channel in session.scalars(
+            select(ChannelRow).where(ChannelRow.id.in_(sorted(channel_ids)))
+        ):
+            owners[str(channel.id)] = str(channel.user_id)
+    return _Directory(names=names, owners=owners)
+
+
+def _human_name(
+    session: Any, user_id: str | None, directory: _Directory = _NO_DIRECTORY
+) -> str | None:
     if user_id is None:
         return None
+    if user_id in directory.names:
+        return directory.names[user_id]
     user = session.get(LocalUserRow, user_id)
     if user is None:
         return None
     return str(user.full_name or user.username)
 
 
-def _author(session: Any, kind: str | None, author_id: str | None) -> Author | None:
+def _author(
+    session: Any,
+    kind: str | None,
+    author_id: str | None,
+    directory: _Directory = _NO_DIRECTORY,
+) -> Author | None:
     if kind == "human":
-        return Author("human", author_id, _human_name(session, author_id))
+        return Author("human", author_id, _human_name(session, author_id, directory))
     if kind == "agent":
         return Author("agent", author_id)
     if kind == "system":
@@ -351,7 +579,9 @@ def _author(session: Any, kind: str | None, author_id: str | None) -> Author | N
     return None
 
 
-def _owner_id(session: Any, channel_id: str) -> str | None:
+def _owner_id(session: Any, channel_id: str, directory: _Directory = _NO_DIRECTORY) -> str | None:
+    if channel_id in directory.owners:
+        return directory.owners[channel_id]
     channel = session.get(ChannelRow, channel_id)
     return None if channel is None else str(channel.user_id)
 
@@ -396,6 +626,28 @@ def _access(
 
 def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRole | None:
     return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
+
+
+def _unread(session: Any, channel_id: str, member: Member | None) -> int | None:
+    """Messages after the member's last read sequence. ``None`` when there
+    is no membership to measure against, so a plain API client and a
+    workspace member who has not joined read the same as before."""
+    if member is None:
+        return None
+    row = session.get(ChannelMemberRow, (channel_id, member.user.id))
+    if row is None:
+        return None
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(MessageRow)
+            .where(
+                MessageRow.channel_id == channel_id,
+                MessageRow.sequence > int(row.last_read_sequence or 0),
+            )
+        )
+        or 0
+    )
 
 
 def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
@@ -447,21 +699,164 @@ def _participant_activity(
     )
 
 
-def _message(session: Any, row: MessageRow) -> Message:
+def _channel_link(row: ChannelLinkRow) -> ChannelLink:
+    return ChannelLink(
+        id=str(row.id),
+        channel_id=str(row.channel_id),
+        backend=str(row.backend),
+        surface_id=str(row.surface_id),
+        thread_id=None if row.thread_id is None else str(row.thread_id),
+        allow_guests=bool(row.allow_guests),
+        created_by=None if row.created_by is None else str(row.created_by),
+        created_at=float(row.created_at),
+        active=bool(row.active),
+    )
+
+
+def _identity(row: ExternalIdentityRow) -> ExternalIdentity:
+    return ExternalIdentity(
+        backend=str(row.backend),
+        external_user_id=str(row.external_user_id),
+        user_id=str(row.user_id),
+        display_name=None if row.display_name is None else str(row.display_name),
+        verified_at=float(row.verified_at),
+    )
+
+
+def _active_link(
+    session: Any, backend: str, surface_id: str, thread_id: str | None
+) -> ChannelLinkRow | None:
+    """The one active link for a surface. ``thread_id`` is matched exactly,
+    including its absence, which SQLite's unique index cannot do for NULL."""
+    condition = (
+        ChannelLinkRow.thread_id.is_(None)
+        if thread_id is None
+        else ChannelLinkRow.thread_id == thread_id
+    )
+    found: ChannelLinkRow | None = session.scalars(
+        select(ChannelLinkRow)
+        .where(
+            ChannelLinkRow.backend == backend,
+            ChannelLinkRow.surface_id == surface_id,
+            condition,
+            ChannelLinkRow.active == 1,
+        )
+        .limit(1)
+    ).first()
+    return found
+
+
+def _latest_summary(session: Any, channel_id: str) -> ChannelSummary | None:
+    """The newest compaction of a channel's history, if it has one."""
+    row = session.scalars(
+        select(ChannelSummaryRow)
+        .where(ChannelSummaryRow.channel_id == channel_id)
+        .order_by(ChannelSummaryRow.through_sequence.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    return ChannelSummary(
+        channel_id=str(row.channel_id),
+        through_sequence=int(row.through_sequence),
+        content=str(row.content),
+        created_at=float(row.created_at),
+    )
+
+
+def _artifact_ref(row: MessageArtifactRow) -> ArtifactRef:
+    return ArtifactRef(
+        id=str(row.artifact_id),
+        run_id="" if row.run_id is None else str(row.run_id),
+        relpath=str(row.relpath),
+        media_type=str(row.media_type),
+        size=int(row.size),
+    )
+
+
+def _history_line(
+    session: Any,
+    row: Any,
+    files: tuple[ArtifactRef, ...],
+    directory: _Directory = _NO_DIRECTORY,
+) -> str:
+    """One message as a turn's history carries it.
+
+    The single place that shape is written, so what counts against the
+    history's character budget and what counts against the compaction
+    window's are the same measure.
+    """
+    line: dict[str, Any] = {
+        "seq": int(row.sequence),
+        "author_kind": None,
+        "author": None,
+        "role": str(row.role),
+        "kind": str(row.kind),
+        "content": str(row.content),
+    }
+    author = _author(session, row.author_kind, row.author_id, directory)
+    if author is None:
+        derived = message_author(
+            str(row.role),
+            str(row.kind),
+            None if row.agent_slug is None else str(row.agent_slug),
+            _owner_id(session, str(row.channel_id), directory),
+        )
+        author = _author(session, derived.kind, derived.id, directory) or derived
+    line["author_kind"] = author.kind
+    line["author"] = author.id
+    if files:
+        line["artifacts"] = [
+            {"id": ref.id, "name": ref.relpath, "media_type": ref.media_type, "size": ref.size}
+            for ref in files
+        ]
+    return json.dumps(line, ensure_ascii=False)
+
+
+def _attachments(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[ArtifactRef, ...]]:
+    """The files each of ``message_ids`` carries, in one read: a channel's
+    whole history is projected without a query per message."""
+    found: dict[str, list[ArtifactRef]] = {}
+    if not message_ids:
+        return {}
+    rows = session.scalars(
+        select(MessageArtifactRow)
+        .where(MessageArtifactRow.message_id.in_(list(message_ids)))
+        .order_by(MessageArtifactRow.relpath.asc())
+    )
+    for row in rows:
+        found.setdefault(str(row.message_id), []).append(_artifact_ref(row))
+    return {key: tuple(value) for key, value in found.items()}
+
+
+def _message(
+    session: Any,
+    row: MessageRow,
+    attachments: Mapping[str, tuple[ArtifactRef, ...]] | None = None,
+    directory: _Directory = _NO_DIRECTORY,
+) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
+    origin = json.loads(row.origin_json) if row.origin_json else None
     if row.kind == "work_result":
         # Runner results stored before attribution carry no author; they were Angie's.
         agent_slug = agent_slug or ANGIE_SLUG
         if isinstance(work, dict) and work.get("agent_slug") is None:
             work["agent_slug"] = ANGIE_SLUG
-    author = _author(session, row.author_kind, row.author_id)
+    author = _author(session, row.author_kind, row.author_id, directory)
+    if author is not None and author.kind == "human" and author.id is None:
+        # A guest on a linked surface: no account, so the name they use
+        # there is the only one there is, and it rides with the origin.
+        author = Author("human", None, _origin_name(origin))
     if author is None:
         # Written by a release that recorded no author.
         derived = message_author(
-            str(row.role), str(row.kind), agent_slug, _owner_id(session, str(row.channel_id))
+            str(row.role),
+            str(row.kind),
+            agent_slug,
+            _owner_id(session, str(row.channel_id), directory),
         )
-        author = _author(session, derived.kind, derived.id) or derived
+        author = _author(session, derived.kind, derived.id, directory) or derived
     return Message(
         id=str(row.id),
         channel_id=str(row.channel_id),
@@ -476,6 +871,15 @@ def _message(session: Any, row: MessageRow) -> Message:
         work=work,
         reactions=tuple(str(value) for value in json.loads(row.reactions_json or "[]")),
         author=author,
+        artifacts=(
+            _attachments(session, [str(row.id)]).get(str(row.id), ())
+            if attachments is None
+            else attachments.get(str(row.id), ())
+        ),
+        origin=origin,
+        # A kind this build does not know (a later build's) reads as none:
+        # one row must never fail the whole channel's message list.
+        post_kind=cast(PostKind, str(row.post_kind)) if row.post_kind in POST_KINDS else None,
     )
 
 
@@ -501,6 +905,7 @@ def _turn(session: Any, row: TurnRow) -> Turn:
         parent_turn_id=None if row.parent_turn_id is None else str(row.parent_turn_id),
         source_message_id=None if row.source_message_id is None else str(row.source_message_id),
         chain_depth=int(row.chain_depth or 0),
+        steered_run_id=None if row.steered_run_id is None else str(row.steered_run_id),
     )
 
 
@@ -577,6 +982,11 @@ def _event(
 class CollaborationStore:
     def __init__(self, dstore: DaemonStore) -> None:
         self.dstore = dstore
+        #: Called with every message appended to a channel, after commit.
+        self._message_observers: list[Callable[[Message], None]] = []
+        #: Outstanding bridge identity link codes: code -> (user, expiry).
+        self._link_codes: dict[str, tuple[str, float]] = {}
+        self._link_code_lock = threading.Lock()
 
     # -- local profile -------------------------------------------------------------
 
@@ -927,6 +1337,311 @@ class CollaborationStore:
                 select(LocalUserRow).where(LocalUserRow.username == username.strip())
             ).first()
             return None if row is None else _user(row)
+
+    def find_user(self, selector: str) -> LocalUser | None:
+        """The user a selector names: a user id, or else a username."""
+        selector = selector.strip()
+        with self.dstore.read() as session:
+            row = session.get(LocalUserRow, selector)
+            if row is None:
+                row = session.scalars(
+                    select(LocalUserRow).where(LocalUserRow.username == selector)
+                ).first()
+            return None if row is None else _user(row)
+
+    # -- merging two accounts --------------------------------------------------------
+
+    def merge_users(
+        self, source_id: str, target_id: str, now: float, *, dry_run: bool = False
+    ) -> MergeReport:
+        """Fold ``source_id`` into ``target_id``, in one immediate transaction.
+
+        This is for one person holding two accounts: typically a local
+        account and the one a provider's first sign-in created because it
+        shared no verified email to link by. Everything the source made or
+        belongs to moves to the target: channel ownership and membership
+        (the stronger channel role and the further read position are kept),
+        human message and turn authorship, teams, preferences (the target's
+        value wins a clash), workflows, agent memories the source authored,
+        the invites it created, its bridge identities and the events meant
+        for it alone. The target keeps the stronger of the two workspace
+        roles.
+
+        The source's provider identity moves onto the target, which keeps
+        its username, email, password and ``auth_source``: an account that
+        still signs in with a password is ``local`` with a provider identity
+        recorded beside it, exactly as an email link leaves it. So both
+        sign-in methods reach the target afterwards. The source is then
+        deactivated, loses its membership, its provider identity and every
+        capability, and its refresh tokens are revoked, as a removed member's
+        are. The audit event names the two ids and nothing else.
+
+        Refused: merging a user into itself (``merge_same_user``), a user
+        that does not exist (``user_not_found``), an inactive target
+        (``merge_target_inactive``), and a target already bound to a
+        different provider identity than the source's
+        (``merge_identity_conflict``). ``dry_run`` does all of it inside the
+        transaction and rolls it back, so the report is exactly what a real
+        merge would do and nothing is written.
+        """
+        try:
+            with self.dstore.immediate_transaction() as session:
+                report = self._merge(session, source_id, target_id, now, dry_run=dry_run)
+                if dry_run:
+                    raise _DryRun(report)
+                return report
+        except _DryRun as unwound:
+            return unwound.report
+
+    def _merge(
+        self, session: Any, source_id: str, target_id: str, now: float, *, dry_run: bool
+    ) -> MergeReport:
+        if source_id == target_id:
+            raise CollaborationError("merge_same_user", "a user cannot be merged into itself")
+        source: LocalUserRow | None = session.get(LocalUserRow, source_id)
+        target: LocalUserRow | None = session.get(LocalUserRow, target_id)
+        if source is None or target is None:
+            missing = source_id if source is None else target_id
+            raise CollaborationError("user_not_found", f"no user {missing}")
+        if not target.active:
+            raise CollaborationError(
+                "merge_target_inactive", "the account to merge into is deactivated"
+            )
+        source_identity = (
+            None
+            if source.oidc_issuer is None or source.oidc_subject is None
+            else (str(source.oidc_issuer), str(source.oidc_subject))
+        )
+        target_identity = (
+            None
+            if target.oidc_issuer is None or target.oidc_subject is None
+            else (str(target.oidc_issuer), str(target.oidc_subject))
+        )
+        if target_identity is not None and target_identity != source_identity:
+            raise CollaborationError(
+                "merge_identity_conflict",
+                "the account to merge into already signs in through another provider identity",
+            )
+        moved: dict[str, int] = {}
+
+        def count(kind: str, result: Any) -> None:
+            moved[kind] = moved.get(kind, 0) + int(result.rowcount or 0)
+
+        # Channels the source owns or made.
+        count(
+            "channels",
+            session.execute(
+                update(ChannelRow).where(ChannelRow.user_id == source_id).values(user_id=target_id)
+            ),
+        )
+        session.execute(
+            update(ChannelRow)
+            .where(ChannelRow.created_by == source_id)
+            .values(created_by=target_id)
+        )
+        # Channel memberships: one row per channel, the stronger role and
+        # the further read position.
+        memberships = 0
+        for own in session.scalars(
+            select(ChannelMemberRow).where(ChannelMemberRow.user_id == source_id)
+        ).all():
+            theirs: ChannelMemberRow | None = session.get(
+                ChannelMemberRow, (own.channel_id, target_id)
+            )
+            if theirs is None:
+                session.execute(
+                    update(ChannelMemberRow)
+                    .where(
+                        ChannelMemberRow.channel_id == own.channel_id,
+                        ChannelMemberRow.user_id == source_id,
+                    )
+                    .values(user_id=target_id)
+                )
+            else:
+                if _CHANNEL_ROLE_RANK.get(str(own.role), 0) > _CHANNEL_ROLE_RANK.get(
+                    str(theirs.role), 0
+                ):
+                    theirs.role = own.role
+                theirs.last_read_sequence = max(
+                    int(theirs.last_read_sequence), int(own.last_read_sequence)
+                )
+                session.delete(own)
+            memberships += 1
+        session.flush()
+        session.expire_all()
+        moved["channel_memberships"] = memberships
+        session.execute(
+            update(ChannelMemberRow)
+            .where(ChannelMemberRow.added_by == source_id)
+            .values(added_by=target_id)
+        )
+        session.execute(
+            update(ChannelParticipantRow)
+            .where(
+                ChannelParticipantRow.added_by_kind == "human",
+                ChannelParticipantRow.added_by_id == source_id,
+            )
+            .values(added_by_id=target_id)
+        )
+        session.execute(
+            update(ChannelLinkRow)
+            .where(ChannelLinkRow.created_by == source_id)
+            .values(created_by=target_id)
+        )
+        # What the source said.
+        count(
+            "messages",
+            session.execute(
+                update(MessageRow)
+                .where(MessageRow.author_kind == "human", MessageRow.author_id == source_id)
+                .values(author_id=target_id)
+            ),
+        )
+        count(
+            "turns",
+            session.execute(
+                update(TurnRow)
+                .where(TurnRow.author_kind == "human", TurnRow.author_id == source_id)
+                .values(author_id=target_id)
+            ),
+        )
+        # Teams and workflows are unique per user by slug; a clash moves
+        # under a new slug rather than losing either.
+        renamed: dict[str, list[tuple[str, str]]] = {"teams": [], "workflows": []}
+        for kind, model in (("teams", TeamRow), ("workflows", WorkflowRow)):
+            taken = set(session.scalars(select(model.slug).where(model.user_id == target_id)).all())
+            rows = session.scalars(select(model).where(model.user_id == source_id)).all()
+            for row in rows:
+                slug = str(row.slug)
+                if slug in taken:
+                    new_slug = _free_slug(taken, slug)
+                    renamed[kind].append((slug, new_slug))
+                    row.slug = new_slug
+                    slug = new_slug
+                taken.add(slug)
+                row.user_id = target_id
+                row.updated_at = now
+            moved[kind] = len(rows)
+        session.flush()
+        # Preferences: the target's own answer wins.
+        target_names = set(
+            session.scalars(
+                select(PreferenceRow.name).where(PreferenceRow.user_id == target_id)
+            ).all()
+        )
+        conflicts: list[str] = []
+        preferences = 0
+        for pref in session.scalars(
+            select(PreferenceRow).where(PreferenceRow.user_id == source_id)
+        ).all():
+            if pref.name in target_names:
+                conflicts.append(str(pref.name))
+                session.delete(pref)
+            else:
+                pref.user_id = target_id
+                pref.updated_at = now
+                preferences += 1
+        moved["preferences"] = preferences
+        session.flush()
+        count(
+            "memories",
+            session.execute(
+                update(AgentMemoryRow)
+                .where(AgentMemoryRow.author == f"user:{source_id}")
+                .values(author=f"user:{target_id}")
+            ),
+        )
+        count(
+            "invites",
+            session.execute(
+                update(WorkspaceInviteRow)
+                .where(WorkspaceInviteRow.created_by == source_id)
+                .values(created_by=target_id)
+            ),
+        )
+        session.execute(
+            update(WorkspaceMemberRow)
+            .where(WorkspaceMemberRow.invited_by == source_id)
+            .values(invited_by=target_id)
+        )
+        count(
+            "bridge_identities",
+            session.execute(
+                update(ExternalIdentityRow)
+                .where(ExternalIdentityRow.user_id == source_id)
+                .values(user_id=target_id)
+            ),
+        )
+        count(
+            "private_events",
+            session.execute(
+                update(ApiEventRow)
+                .where(ApiEventRow.audience_user_id == source_id)
+                .values(audience_user_id=target_id)
+            ),
+        )
+        session.expire_all()
+        source = session.get(LocalUserRow, source_id)
+        target = session.get(LocalUserRow, target_id)
+        assert source is not None and target is not None  # nosec B101 - read above
+        # Workspace membership: the target keeps the stronger role.
+        source_member = self._member_row(session, source_id)
+        target_member = self._member_row(session, target_id)
+        previous_role: Role | None = (
+            None if target_member is None else _role(str(target_member.role))
+        )
+        candidates = [str(m.role) for m in (source_member, target_member) if m is not None]
+        role = _role(max(candidates, key=lambda r: _ROLE_RANK[r]) if candidates else "member")
+        if target_member is None:
+            session.add(
+                WorkspaceMemberRow(
+                    workspace_id=WORKSPACE_ID,
+                    user_id=target_id,
+                    role=role,
+                    created_at=now,
+                    invited_by=None,
+                )
+            )
+        else:
+            target_member.role = role
+        if source_member is not None:
+            session.delete(source_member)
+        session.flush()
+        # The provider identity moves: the source's row gives it up first,
+        # so the unique index never sees it twice.
+        source.oidc_issuer = None
+        source.oidc_subject = None
+        source.active = 0
+        source.updated_at = now
+        session.flush()
+        if source_identity is not None:
+            target.oidc_issuer, target.oidc_subject = source_identity
+        target.updated_at = now
+        self._grant_role(session, target, role)
+        self._grant_role(session, source, None)
+        self._revoke_refresh(session, str(source.client_id), now)
+        session.flush()
+        if not dry_run:
+            _event(
+                session,
+                "collaboration.user.merged",
+                now,
+                data={"source_user_id": source_id, "target_user_id": target_id},
+            )
+        return MergeReport(
+            source_id=source_id,
+            source_username=str(source.username),
+            target_id=target_id,
+            target_username=str(target.username),
+            dry_run=dry_run,
+            moved=moved,
+            preference_conflicts=tuple(conflicts),
+            renamed_teams=tuple(renamed["teams"]),
+            renamed_workflows=tuple(renamed["workflows"]),
+            identity=source_identity,
+            previous_role=previous_role,
+            role=role,
+        )
 
     def user_by_client(self, client_id: str) -> LocalUser | None:
         with self.dstore.read() as session:
@@ -1358,7 +2073,9 @@ class CollaborationStore:
                 )
             except CollaborationError:
                 return None
-            return _channel(row, _my_role(session, channel_id, member))
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
 
     def list_channels(
         self, viewer: Viewer, *, limit: int, offset: int
@@ -1391,7 +2108,11 @@ class CollaborationStore:
                 .limit(limit)
             ).all()
             channels = [
-                _channel(row, None if role is None else ("owner" if role == "owner" else "member"))
+                _channel(
+                    row,
+                    None if role is None else ("owner" if role == "owner" else "member"),
+                    _unread(session, str(row.id), member),
+                )
                 for row, role in rows
             ]
             return channels, total
@@ -1424,7 +2145,9 @@ class CollaborationStore:
             row.revision += 1
             session.flush()
             _event(session, "collaboration.channel.updated", now, data={"channel_id": channel_id})
-            return _channel(row, _my_role(session, channel_id, member))
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
 
     def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
         """Tombstone a channel so a late agent result cannot recreate it.
@@ -1568,22 +2291,27 @@ class CollaborationStore:
         agent_slug: str,
         values: dict[str, Any],
         now: float,
+        *,
+        added_by: Author | None = None,
     ) -> ChannelParticipant:
         """Add an agent to the channel or change how it takes part. ``values``
-        holds only the fields the caller set (``mode``, ``muted_until``)."""
+        holds only the fields the caller set (``mode``, ``muted_until``).
+        ``added_by`` credits a caller that is not a person: the agent whose
+        reply addressed this one."""
         mode = values.get("mode")
         if mode is not None and mode not in {"mention", "ambient"}:
             raise CollaborationError("invalid_participant", "mode is mention or ambient")
         with self.dstore.transaction() as session:
             _, member = _access(session, channel_id, viewer, "post", now=now)
+            author = Author("human", member.user.id) if member is not None else added_by
             row = session.get(ChannelParticipantRow, (channel_id, agent_slug))
             if row is None:
                 row = ChannelParticipantRow(
                     channel_id=channel_id,
                     agent_slug=agent_slug,
                     mode=mode or "mention",
-                    added_by_kind=None if member is None else "human",
-                    added_by_id=None if member is None else member.user.id,
+                    added_by_kind=None if author is None else author.kind,
+                    added_by_id=None if author is None else author.id,
                     muted_until=values.get("muted_until"),
                     created_at=now,
                 )
@@ -1638,6 +2366,493 @@ class CollaborationStore:
                 if participant.get("status") == "running"
             }
 
+    # -- bridge links and external identities --------------------------------------
+
+    def add_message_observer(self, observer: Callable[[Message], None]) -> None:
+        """Hear every message appended to a channel, after it is committed.
+
+        The mirror that posts channel traffic out to linked bridge surfaces
+        is one; an observer that raises is logged and never fails the write.
+        """
+        self._message_observers.append(observer)
+
+    def _appended(self, message: Message | None) -> Message | None:
+        """Tell the observers about ``message``; returns it, so a caller can
+        end with ``return self._appended(...)``."""
+        if message is not None:
+            for observer in tuple(self._message_observers):
+                try:
+                    observer(message)
+                except Exception:
+                    log.warning("collaboration.message_observer_failed", exc_info=True)
+        return message
+
+    def list_channel_links(self, viewer: Viewer, channel_id: str) -> list[ChannelLink]:
+        with self.dstore.read() as session:
+            _access(session, channel_id, viewer, "manage")
+            rows = session.scalars(
+                select(ChannelLinkRow)
+                .where(ChannelLinkRow.channel_id == channel_id, ChannelLinkRow.active == 1)
+                .order_by(ChannelLinkRow.created_at.asc())
+            )
+            return [_channel_link(row) for row in rows]
+
+    def create_channel_link(
+        self,
+        viewer: Viewer,
+        channel_id: str,
+        *,
+        backend: str,
+        surface_id: str,
+        thread_id: str | None,
+        allow_guests: bool,
+        created_by: str | None,
+        now: float,
+    ) -> ChannelLink:
+        """Link a bridge surface to the channel.
+
+        Takes managing the channel *and* administering the workspace: a link
+        makes the channel capture what everyone on that surface says and post
+        its own traffic there, which reaches past the channel. A run's thread
+        belongs to its run and is refused.
+        """
+        if backend == "discord" and thread_id is not None:
+            # A Discord thread is a channel of its own: messages typed there
+            # arrive with the thread's id as their channel, and a post to it
+            # goes to that id. So the thread is the surface.
+            surface_id, thread_id = thread_id, None
+        # A run's thread is recorded once, when the run opens it, so reading
+        # it ahead of the write transaction races nothing that matters.
+        run_thread = self.dstore.run_for_thread(thread_id or surface_id, backend) is not None
+        with self.dstore.immediate_transaction() as session:
+            _, member = _access(session, channel_id, viewer, "manage", now=now)
+            if member is not None and member.role not in MANAGING_ROLES:
+                raise CollaborationError(
+                    "channel_forbidden", "linking a surface takes a workspace admin"
+                )
+            if run_thread:
+                raise CollaborationError(
+                    "link_run_thread", "that surface is a run's thread and cannot be linked"
+                )
+            if _active_link(session, backend, surface_id, thread_id) is not None:
+                raise CollaborationError(
+                    "link_exists", "that surface is already linked to a channel"
+                )
+            if thread_id is not None:
+                # A retired link to this thread would trip the unique index
+                # (NULL threads never do). Nothing reads a retired row, since
+                # each message carries its own origin, so it gives way.
+                session.execute(
+                    delete(ChannelLinkRow).where(
+                        ChannelLinkRow.backend == backend,
+                        ChannelLinkRow.surface_id == surface_id,
+                        ChannelLinkRow.thread_id == thread_id,
+                        ChannelLinkRow.active == 0,
+                    )
+                )
+            link_id = "lnk_" + _token(16)
+            session.execute(
+                insert(ChannelLinkRow).values(
+                    id=link_id,
+                    channel_id=channel_id,
+                    backend=backend,
+                    surface_id=surface_id,
+                    thread_id=thread_id,
+                    allow_guests=1 if allow_guests else 0,
+                    created_by=created_by,
+                    created_at=now,
+                    active=1,
+                )
+            )
+            _event(
+                session,
+                "collaboration.link.added",
+                now,
+                data={"channel_id": channel_id, "link_id": link_id, "backend": backend},
+            )
+            row = session.get(ChannelLinkRow, link_id)
+            assert row is not None  # nosec B101 - just inserted
+            return _channel_link(row)
+
+    def delete_channel_link(
+        self, viewer: Viewer, channel_id: str, link_id: str, now: float
+    ) -> None:
+        """Retire a link. The row stays, inactive, so the messages that named
+        the surface keep an origin that can still be read back."""
+        with self.dstore.immediate_transaction() as session:
+            _access(session, channel_id, viewer, "manage", now=now)
+            row = session.get(ChannelLinkRow, link_id)
+            if row is None or str(row.channel_id) != channel_id or not row.active:
+                raise CollaborationError("link_not_found", "link not found")
+            row.active = 0
+            _event(
+                session,
+                "collaboration.link.removed",
+                now,
+                data={"channel_id": channel_id, "link_id": link_id, "backend": str(row.backend)},
+            )
+
+    def link_for_surface(
+        self, backend: str, surface_id: str, thread_id: str | None = None
+    ) -> ChannelLink | None:
+        """The active link for a surface, or None when it is not linked."""
+        with self.dstore.read() as session:
+            row = _active_link(session, backend, surface_id, thread_id)
+            return None if row is None else _channel_link(row)
+
+    def create_link_code(self, user_id: str, now: float) -> tuple[str, float]:
+        """A short code the person types on a bridge to prove who they are.
+
+        Codes live in this process only: they are single use and expire in
+        minutes, so a daemon restart costs one retyped code rather than a
+        table of half-finished identities.
+        """
+        expires_at = now + LINK_CODE_TTL_S
+        code = _token(8)
+        with self._link_code_lock:
+            self._link_codes = {
+                value: pending for value, pending in self._link_codes.items() if pending[1] > now
+            }
+            self._link_codes[code] = (user_id, expires_at)
+        return code, expires_at
+
+    def redeem_link_code(
+        self,
+        code: str,
+        *,
+        backend: str,
+        external_user_id: str,
+        display_name: str | None,
+        now: float,
+    ) -> ExternalIdentity | None:
+        """Spend a code: map this bridge account to the user who asked for
+        it. An unknown, spent or expired code maps nothing."""
+        with self._link_code_lock:
+            pending = self._link_codes.pop(code.strip(), None)
+        if pending is None or pending[1] <= now:
+            return None
+        return self.link_identity(
+            pending[0],
+            backend=backend,
+            external_user_id=external_user_id,
+            display_name=display_name,
+            now=now,
+        )
+
+    def link_identity(
+        self,
+        user_id: str,
+        *,
+        backend: str,
+        external_user_id: str,
+        display_name: str | None,
+        now: float,
+    ) -> ExternalIdentity:
+        """Map a bridge account to a local one, replacing any earlier map."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(ExternalIdentityRow, (backend, external_user_id))
+            if row is None:
+                row = ExternalIdentityRow(
+                    backend=backend,
+                    external_user_id=external_user_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    verified_at=now,
+                )
+                session.add(row)
+            else:
+                row.user_id = user_id
+                row.display_name = display_name
+                row.verified_at = now
+            return _identity(row)
+
+    def identity_user(self, backend: str, external_user_id: str) -> str | None:
+        """The local user a bridge account belongs to, or None.
+
+        A map outlives the membership it was made under, so the membership
+        is what answers: a user who has been removed from the workspace or
+        deactivated is no longer anybody here, exactly as ``_resolve`` has
+        it. The caller then treats the author as unmapped and the link's
+        own ``allow_guests`` rule decides what happens to the message.
+        """
+        with self.dstore.read() as session:
+            row = session.get(ExternalIdentityRow, (backend, external_user_id))
+            if row is None:
+                return None
+            member = _member_in(session, str(row.user_id))
+            if member is None or not member.user.active:
+                return None
+            return str(row.user_id)
+
+    def list_identities(self, user_id: str) -> list[ExternalIdentity]:
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(ExternalIdentityRow)
+                .where(ExternalIdentityRow.user_id == user_id)
+                .order_by(ExternalIdentityRow.backend.asc())
+            )
+            return [_identity(row) for row in rows]
+
+    def unlink_identity(self, user_id: str, backend: str) -> bool:
+        with self.dstore.immediate_transaction() as session:
+            rows = session.scalars(
+                select(ExternalIdentityRow).where(
+                    ExternalIdentityRow.user_id == user_id,
+                    ExternalIdentityRow.backend == backend,
+                )
+            ).all()
+            for row in rows:
+                session.delete(row)
+            return bool(rows)
+
+    # -- agent follow-ups, silence and read state -----------------------------------
+
+    def message_content(self, message_id: str) -> str | None:
+        """One message's text by id: what a follow-up turn is answering."""
+        with self.dstore.read() as session:
+            row = session.get(MessageRow, message_id)
+            return None if row is None else str(row.content)
+
+    def get_message(self, channel_id: str, message_id: str) -> Message | None:
+        """One message of a channel, read for the daemon rather than for a
+        viewer: the subject an ambient decision is made about."""
+        with self.dstore.read() as session:
+            row = session.get(MessageRow, message_id)
+            if row is None or str(row.channel_id) != channel_id:
+                return None
+            return _message(session, row)
+
+    def silenced_until(self, channel_id: str) -> float | None:
+        """When the channel's silence lifts, or ``None``. Read by the
+        guardrails, which run for the daemon and not for a viewer."""
+        with self.dstore.read() as session:
+            row = session.get(ChannelRow, channel_id)
+            if row is None or row.silenced_until is None:
+                return None
+            return float(row.silenced_until)
+
+    def may_post(self, viewer: Viewer, channel_id: str, now: float) -> bool:
+        """Whether ``viewer`` may post in the channel, by the same check
+        :meth:`set_silence` and a new turn make: the rule a channel stop
+        answers to, from chat as from ``POST /v1/channels/{id}/stop``."""
+        with self.dstore.transaction() as session:
+            try:
+                _access(session, channel_id, viewer, "post", now=now)
+            except CollaborationError:
+                return False
+            return True
+
+    def set_silence(
+        self, viewer: Viewer, channel_id: str, until: float | None, now: float
+    ) -> Channel | None:
+        """Silence the channel until ``until`` (``None`` lifts it). Anyone
+        who may post may quiet the agents in a channel they are in."""
+        with self.dstore.transaction() as session:
+            try:
+                row, member = _access(session, channel_id, viewer, "post", now=now)
+            except CollaborationError as exc:
+                if exc.code == "channel_not_found":
+                    return None
+                raise
+            row.silenced_until = None if until is None else float(until)
+            row.updated_at = now
+            row.revision += 1
+            _event(
+                session,
+                "collaboration.channel.silenced"
+                if until is not None
+                else "collaboration.channel.resumed",
+                now,
+                data={"channel_id": channel_id, "silenced_until": row.silenced_until},
+            )
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
+
+    def set_read_sequence(
+        self, viewer: Viewer, channel_id: str, sequence: int, now: float
+    ) -> ChannelMember | None:
+        """Record how far the reader has read. The sequence only moves
+        forward, so a stale client cannot un-read a channel."""
+        with self.dstore.transaction() as session:
+            _, member = _access(session, channel_id, viewer, "post", now=now)
+            if member is None:
+                return None
+            entry = session.get(ChannelMemberRow, (channel_id, member.user.id))
+            if entry is None:
+                return None
+            newest = session.scalar(
+                select(func.max(MessageRow.sequence)).where(MessageRow.channel_id == channel_id)
+            )
+            capped = min(int(sequence), int(newest or 0))
+            entry.last_read_sequence = max(int(entry.last_read_sequence or 0), capped)
+            _event(
+                session,
+                "collaboration.channel.read",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "user_id": member.user.id,
+                    "sequence": entry.last_read_sequence,
+                },
+                audience=member.user.id,
+            )
+            user = session.get(LocalUserRow, member.user.id)
+            assert user is not None  # nosec B101 - membership invariant
+            return _channel_member(entry, user)
+
+    def agent_turns_since(self, channel_id: str, since: float) -> list[AgentTurnRecord]:
+        """The channel's agent-started turns created at or after ``since``,
+        oldest first: what the rate caps and the pair cooldown count. A turn
+        a person asked for is not one of them, whoever it addresses."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(TurnRow)
+                .where(
+                    TurnRow.channel_id == channel_id,
+                    TurnRow.trigger.in_(("mention", "ambient")),
+                    TurnRow.created_at >= since,
+                )
+                .order_by(TurnRow.created_at.asc())
+            )
+            return [
+                AgentTurnRecord(
+                    turn_id=str(row.id),
+                    source_slug=None if row.author_id is None else str(row.author_id),
+                    targets=tuple(str(v) for v in json.loads(row.targets_json or "[]")),
+                    trigger=str(row.trigger or "human"),
+                    created_at=float(row.created_at),
+                )
+                for row in rows
+            ]
+
+    def ambient_turns_since(self, channel_id: str, agent_slug: str, since: float) -> int:
+        """How often ``agent_slug`` has spoken unprompted in the channel at
+        or after ``since``: what ``ambient_max_per_hour`` counts."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(TurnRow.targets_json).where(
+                    TurnRow.channel_id == channel_id,
+                    TurnRow.trigger == "ambient",
+                    TurnRow.created_at >= since,
+                )
+            )
+            return sum(1 for value in rows if agent_slug in json.loads(value or "[]"))
+
+    def recent_messages(self, channel_id: str, limit: int) -> list[Message]:
+        """The channel's newest messages, oldest first: the window an
+        ambient decision reads."""
+        with self.dstore.read() as session:
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.channel_id == channel_id)
+                    .order_by(MessageRow.sequence.desc())
+                    .limit(max(1, limit))
+                )
+            )
+            return [_message(session, row) for row in reversed(rows)]
+
+    def record_followup_decision(
+        self,
+        channel_id: str,
+        *,
+        source_slug: str | None,
+        target_slug: str,
+        trigger: str,
+        depth: int,
+        admission: Any,
+        now: float,
+    ) -> None:
+        """Audit one guardrail decision. The reason travels; the message
+        that caused it never does."""
+        with self.dstore.transaction() as session:
+            _event(
+                session,
+                "collaboration.followup.queued"
+                if admission.ok
+                else "collaboration.followup.suppressed",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "agent_slug": target_slug,
+                    "source_agent_slug": source_slug,
+                    "trigger": trigger,
+                    "chain_depth": depth,
+                    "reason": admission.reason,
+                    "retry_at": admission.retry_at,
+                },
+            )
+
+    def accept_agent_turn(
+        self,
+        channel_id: str,
+        source_message_id: str,
+        *,
+        author: Author,
+        targets: tuple[str, ...],
+        trigger: str,
+        parent_turn_id: str | None,
+        chain_depth: int,
+        now: float,
+    ) -> Turn | None:
+        """Accept a turn one agent started by addressing another.
+
+        No new message is appended: the agent's own reply, named by
+        ``source_message_id``, is the turn's input. ``None`` when the
+        channel is gone.
+        """
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, channel_id)
+            if channel is None or channel.state != "active":
+                return None
+            turn_id = "trn_" + _token(16)
+            session.execute(
+                insert(TurnRow).values(
+                    id=turn_id,
+                    channel_id=channel_id,
+                    client_turn_id=None,
+                    input_message_id=source_message_id,
+                    status="accepted",
+                    targets_json=json.dumps(list(targets)),
+                    intent="conversation",
+                    participants_json=json.dumps(
+                        [
+                            {
+                                "agent_slug": target,
+                                "status": "queued",
+                                "error": None,
+                                "read_only": target == "critic",
+                            }
+                            for target in targets
+                        ]
+                    ),
+                    created_at=now,
+                    author_kind=author.kind,
+                    author_id=author.id,
+                    trigger=trigger,
+                    parent_turn_id=parent_turn_id,
+                    source_message_id=source_message_id,
+                    chain_depth=chain_depth,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            row = session.get(TurnRow, turn_id)
+            assert row is not None  # nosec B101 - just inserted
+            _event(
+                session,
+                "collaboration.turn.accepted",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "turn_id": turn_id,
+                    "targets": list(targets),
+                    "trigger": trigger,
+                },
+            )
+            return _turn(session, row)
+
     # -- messages and turns --------------------------------------------------------
 
     @staticmethod
@@ -1684,12 +2899,16 @@ class CollaborationStore:
                 _access(session, channel_id, viewer, "read")
             except CollaborationError:
                 return None
-            rows = session.scalars(
-                select(MessageRow)
-                .where(MessageRow.channel_id == channel_id, MessageRow.sequence > after)
-                .order_by(MessageRow.sequence.asc())
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.channel_id == channel_id, MessageRow.sequence > after)
+                    .order_by(MessageRow.sequence.asc())
+                )
             )
-            return [_message(session, row) for row in rows]
+            attachments = _attachments(session, [str(row.id) for row in rows])
+            known = _directory(session, rows)
+            return [_message(session, row, attachments, known) for row in rows]
 
     def accept_turn(
         self,
@@ -1704,13 +2923,16 @@ class CollaborationStore:
         now: float,
         intent: str = "conversation",
         participants: tuple[str, ...] = (),
+        assignees: dict[str, str] | None = None,
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
         A repeated client turn id returns the original resources. A reused id
         with different text is rejected instead of silently changing meaning.
         ``participants`` are the agents the message mentions: each one not in
-        the channel yet joins it, answering when mentioned.
+        the channel yet joins it, answering when mentioned. ``assignees`` are
+        the run roles those mentions declare on a turn that may start managed
+        work; they ride the first participant slot, where admission reads them.
         """
         with self.dstore.immediate_transaction() as session:
             channel, _ = _access(session, channel_id, user_id, "post", now=now)
@@ -1769,8 +2991,13 @@ class CollaborationStore:
                                 "status": "queued",
                                 "error": None,
                                 "read_only": target == "critic",
+                                **(
+                                    {"assignees": dict(assignees)}
+                                    if assignees and index == 0
+                                    else {}
+                                ),
                             }
-                            for target in (targets or (None,))
+                            for index, target in enumerate(targets or (None,))
                         ]
                     ),
                     created_at=now,
@@ -1823,7 +3050,107 @@ class CollaborationStore:
                     "author_id": user_id,
                 },
             )
-            return _turn(session, turn_row), _message(session, message_row), True
+            accepted = (_turn(session, turn_row), _message(session, message_row), True)
+        self._appended(accepted[1])
+        return accepted
+
+    def accept_linked_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+        now: float,
+    ) -> tuple[Turn, Message]:
+        """Append a message that arrived on a linked bridge surface, and the
+        turn that answers it.
+
+        The link is the authorization: whoever may post on the surface the
+        channel's owner linked posts here. A mapped author is credited to
+        their account; a guest (only where the link admits one) is a human
+        with no account, named by the handle they use on that service.
+        """
+        origin = bridge_origin(
+            link.backend,
+            link.surface_id,
+            external_message_id,
+            None if author_user_id else display_name,
+        )
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, link.channel_id)
+            if channel is None or channel.state != "active":
+                raise CollaborationError("channel_not_found", "channel not found")
+            turn_id = "trn_" + _token(16)
+            message_id = "msg_" + _token(16)
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=link.channel_id,
+                    turn_id=turn_id,
+                    sequence=self._next_sequence(session, link.channel_id),
+                    role="user",
+                    kind="message",
+                    content=content,
+                    reactions_json=json.dumps(["⏳"]),
+                    created_at=now,
+                    author_kind="human",
+                    author_id=author_user_id,
+                    origin_json=json.dumps(origin),
+                )
+            )
+            session.execute(
+                insert(TurnRow).values(
+                    id=turn_id,
+                    channel_id=link.channel_id,
+                    input_message_id=message_id,
+                    status="accepted",
+                    targets_json=json.dumps([]),
+                    intent="conversation",
+                    participants_json=json.dumps(
+                        [
+                            {
+                                "agent_slug": None,
+                                "status": "queued",
+                                "error": None,
+                                "read_only": False,
+                            }
+                        ]
+                    ),
+                    created_at=now,
+                    author_kind="human",
+                    author_id=author_user_id,
+                    trigger="human",
+                    chain_depth=0,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            turn_row = session.get(TurnRow, turn_id)
+            message_row = session.get(MessageRow, message_id)
+            assert turn_row is not None and message_row is not None  # nosec B101
+            _event(
+                session,
+                "collaboration.turn.accepted",
+                now,
+                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": []},
+            )
+            _event(
+                session,
+                "collaboration.message.created",
+                now,
+                data={
+                    "channel_id": link.channel_id,
+                    "message_id": message_id,
+                    "sequence": message_row.sequence,
+                    "author_kind": "human",
+                    "author_id": author_user_id,
+                },
+            )
+            accepted = (_turn(session, turn_row), _message(session, message_row))
+        self._appended(accepted[1])
+        return accepted
 
     def start_turn(self, turn_id: str, now: float) -> bool:
         with self.dstore.transaction() as session:
@@ -1904,7 +3231,8 @@ class CollaborationStore:
                     "author_id": author_id,
                 },
             )
-            return _message(session, row)
+            appended = _message(session, row)
+        return self._appended(appended)
 
     def append_work_result(
         self,
@@ -1916,8 +3244,14 @@ class CollaborationStore:
         agent_slug: str | None,
         work: dict[str, Any],
         now: float,
+        artifacts: Sequence[Mapping[str, Any]] = (),
     ) -> Message | None:
-        """Append one server-owned work result, idempotently."""
+        """Append one server-owned work result, idempotently.
+
+        ``artifacts`` are the files the run delivered, as the work snapshot
+        names them. They are attached in the same transaction as the
+        message, so a result never exists without the files it announced.
+        """
         with self.dstore.immediate_transaction() as session:
             existing = session.get(MessageRow, message_id)
             if existing is not None:
@@ -1947,6 +3281,7 @@ class CollaborationStore:
                     author_id=agent_slug or ANGIE_SLUG,
                 )
             )
+            self._attach_artifacts(session, message_id, channel_id, artifacts, now)
             channel.updated_at = now
             channel.revision += 1
             row = session.get(MessageRow, message_id)
@@ -1957,7 +3292,334 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "turn_id": turn_id, "message_id": message_id},
             )
-            return _message(session, row)
+            delivered = _message(session, row)
+        return self._appended(delivered)
+
+    @staticmethod
+    def _attach_artifacts(
+        session: Any,
+        message_id: str,
+        channel_id: str,
+        artifacts: Sequence[Mapping[str, Any]],
+        now: float,
+    ) -> None:
+        """Record the files a message carries, inside the caller's
+        transaction. A file named twice on one message is one row."""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            artifact_id = artifact.get("id")
+            relpath = artifact.get("relpath")
+            if not isinstance(artifact_id, str) or not isinstance(relpath, str):
+                continue
+            if artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            run_id = artifact.get("run_id")
+            size = artifact.get("size")
+            rows.append(
+                {
+                    "message_id": message_id,
+                    "artifact_id": artifact_id,
+                    "channel_id": channel_id,
+                    "run_id": run_id if isinstance(run_id, str) else None,
+                    "relpath": relpath,
+                    "media_type": str(artifact.get("media_type") or "application/octet-stream"),
+                    "size": size if isinstance(size, int) and not isinstance(size, bool) else 0,
+                    "created_at": now,
+                }
+            )
+        if rows:
+            session.execute(insert(MessageArtifactRow).prefix_with("OR IGNORE"), rows)
+
+    def channel_artifacts(self, viewer: Viewer, channel_id: str) -> list[ArtifactRef] | None:
+        """Every file the channel's messages carry, newest message first;
+        ``None`` when the channel is not this viewer's to read."""
+        with self.dstore.read() as session:
+            try:
+                _access(session, channel_id, viewer, "read")
+            except CollaborationError:
+                return None
+            rows = session.scalars(
+                select(MessageArtifactRow)
+                .join(MessageRow, MessageRow.id == MessageArtifactRow.message_id)
+                .where(MessageArtifactRow.channel_id == channel_id)
+                .order_by(MessageRow.sequence.desc(), MessageArtifactRow.relpath.asc())
+            )
+            found: dict[str, ArtifactRef] = {}
+            for row in rows:
+                found.setdefault(str(row.artifact_id), _artifact_ref(row))
+            return list(found.values())
+
+    def artifact_attached(self, channel_id: str, artifact_id: str) -> bool:
+        """Whether a message in this channel carries that file."""
+        with self.dstore.read() as session:
+            return (
+                session.scalars(
+                    select(MessageArtifactRow.artifact_id)
+                    .where(
+                        MessageArtifactRow.channel_id == channel_id,
+                        MessageArtifactRow.artifact_id == artifact_id,
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def channel_owns_run(self, channel_id: str, run_id: str) -> bool:
+        """Whether a work item admitted for this channel produced ``run_id``.
+
+        A run linked to the channel is part of its shared context even
+        before its result message lands, so its files are readable there.
+        """
+        with self.dstore.read() as session:
+            return (
+                session.scalars(
+                    select(WorkItemRow.item_id)
+                    .where(WorkItemRow.channel_id == channel_id, WorkItemRow.run_id == run_id)
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def put_channel_summary(
+        self, channel_id: str, through_sequence: int, content: str, now: float
+    ) -> ChannelSummary:
+        """Record what the channel said up to ``through_sequence``.
+
+        Each summary continues the one before it, so only the newest is
+        ever read: the channel's older rows are deleted in the same
+        transaction rather than kept forever.
+        """
+        with self.dstore.immediate_transaction() as session:
+            session.execute(
+                delete(ChannelSummaryRow).where(
+                    ChannelSummaryRow.channel_id == channel_id,
+                    ChannelSummaryRow.through_sequence < through_sequence,
+                )
+            )
+            row = session.get(ChannelSummaryRow, (channel_id, through_sequence))
+            if row is None:
+                session.execute(
+                    insert(ChannelSummaryRow).values(
+                        channel_id=channel_id,
+                        through_sequence=through_sequence,
+                        content=content,
+                        created_at=now,
+                    )
+                )
+            else:
+                row.content = content
+                row.created_at = now
+        return ChannelSummary(channel_id, through_sequence, content, now)
+
+    def latest_channel_summary(self, channel_id: str) -> ChannelSummary | None:
+        with self.dstore.read() as session:
+            return _latest_summary(session, channel_id)
+
+    def summary_backlog(
+        self, channel_id: str, *, keep: int = HISTORY_MESSAGES, max_chars: int = HISTORY_CHARS
+    ) -> tuple[int, str | None, str] | None:
+        """What a compaction job has to summarise, or ``None`` when nothing
+        has fallen out of the channel's history window yet.
+
+        Returns the last sequence covered, the previous summary (so the new
+        one continues it) and the transcript of the messages that fell out,
+        oldest first and bounded by ``max_chars``.
+
+        The window is the one :meth:`turn_history` keeps: ``keep`` messages
+        *and* ``max_chars`` characters, whichever binds first. A channel far
+        under the message cap still trims on the character budget, and a
+        summary has to exist for the trimmed history to open with.
+
+        The sequence returned is the last one the transcript actually
+        carries, never the last one that fell out: a backlog too big for one
+        excerpt is summarised over several compactions instead of having its
+        tail marked covered without ever being read.
+        """
+        with self.dstore.read() as session:
+            newest = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.channel_id == channel_id)
+                    .order_by(MessageRow.sequence.desc())
+                    .limit(keep)
+                )
+            )
+            carried = _attachments(session, [str(message.id) for message in newest])
+            known = _directory(session, newest)
+            kept: list[int] = []
+            held = 0
+            for message in newest:
+                line = _history_line(session, message, carried.get(str(message.id), ()), known)
+                held += len(line) + 1
+                if kept and held > max_chars:
+                    break
+                kept.append(int(message.sequence))
+            if not kept:
+                return None
+            previous = _latest_summary(session, channel_id)
+            covered = 0 if previous is None else previous.through_sequence
+            rows = list(
+                session.scalars(
+                    select(MessageRow)
+                    .where(
+                        MessageRow.channel_id == channel_id,
+                        MessageRow.sequence < min(kept),
+                        MessageRow.sequence > covered,
+                    )
+                    .order_by(MessageRow.sequence.asc())
+                )
+            )
+            if not rows:
+                return None
+            through: int | None = None
+            lines: list[str] = []
+            spent = 0
+            for row in rows:
+                author = _author(session, row.author_kind, row.author_id)
+                who = (author.display_name or author.id or author.kind) if author else str(row.role)
+                line = f"{who}: {' '.join(str(row.content).split())}"
+                if lines and spent + len(line) > max_chars:
+                    break
+                # One message longer than the whole budget is cut rather
+                # than refused: the watermark has to be able to move past it.
+                lines.append(line[:max_chars])
+                spent += len(lines[-1]) + 1
+                through = int(row.sequence)
+            if through is None:
+                return None
+            return through, None if previous is None else previous.content, "\n".join(lines)
+
+    def member_reads_run(self, member: Member, run_id: str) -> bool:
+        """Whether ``member`` may read what run ``run_id`` (internal id)
+        produced: the run was asked for by a channel they can read. A run
+        no channel asked for, or whose channel is gone, is not theirs."""
+        with self.dstore.read() as session:
+            channel_id = channel_for_run(session, run_id)
+            if channel_id is None:
+                return False
+            try:
+                _access(session, channel_id, member, "read")
+            except CollaborationError:
+                return False
+            return True
+
+    def turn_for_post(
+        self,
+        channel_id: str,
+        reply_to_message_id: str | None,
+        item_id: str | None = None,
+    ) -> str | None:
+        """The turn a run's post belongs to: the turn that asked the message
+        it answers when that message is in this channel, and otherwise the
+        turn that asked for its work, by the identities the work's result
+        is delivered on. A channel with no such turn has nowhere to hang
+        the post, and it hangs on none."""
+        with self.dstore.read() as session:
+            if reply_to_message_id is not None:
+                message = session.get(MessageRow, reply_to_message_id)
+                if (
+                    message is not None
+                    and message.turn_id is not None
+                    and str(message.channel_id) == channel_id
+                ):
+                    return str(message.turn_id)
+            return None if item_id is None else turn_for_item(session, item_id, channel_id)
+
+    def post_agent_update(
+        self,
+        *,
+        channel_id: str,
+        author_agent: str,
+        kind: PostKind,
+        text: str,
+        run_id: str,
+        dedupe_key: str,
+        now: float,
+        turn_id: str | None = None,
+        work: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Record one post a run made, idempotently on ``dedupe_key``.
+
+        Returns the message id, or None when the channel is gone or
+        silenced. A silenced channel still hears a run that has finished
+        or stopped: ``delivery`` and ``notice`` are posted anyway.
+        """
+        if kind not in POST_KINDS:
+            # ``PostKind`` is a type, not a check: a caller naming a kind
+            # this build does not know gets nothing stored, and its key
+            # stays free for a post that is readable.
+            log.warning(
+                "api.channel_post_unknown_kind", channel=channel_id, key=dedupe_key, kind=kind
+            )
+            return None
+        with self.dstore.immediate_transaction() as session:
+            posted = session.get(ChannelRunPostRow, dedupe_key)
+            if posted is not None:
+                return str(posted.message_id)
+            channel = session.get(ChannelRow, channel_id)
+            if channel is None or channel.state != "active":
+                return None
+            if turn_id is not None:
+                # A post hangs on a turn of its own channel or on none:
+                # another channel's turn would carry it to its members.
+                turn = session.get(TurnRow, turn_id)
+                if turn is None or str(turn.channel_id) != channel_id:
+                    turn_id = None
+                    if work is not None and "turn_id" in work:
+                        work = {**work, "turn_id": None}
+            silenced = channel.silenced_until is not None and float(channel.silenced_until) > now
+            if silenced and kind not in TERMINAL_POST_KINDS:
+                return None
+            message_id = "msg_" + _token(16)
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=channel_id,
+                    turn_id=turn_id,
+                    sequence=self._next_sequence(session, channel_id),
+                    role="assistant",
+                    kind="agent_update",
+                    content=text,
+                    agent_slug=author_agent,
+                    work_json=None if work is None else json.dumps(work, default=str),
+                    created_at=now,
+                    author_kind="agent",
+                    author_id=author_agent,
+                    post_kind=kind,
+                )
+            )
+            session.execute(
+                insert(ChannelRunPostRow).values(
+                    dedupe_key=dedupe_key,
+                    run_id=run_id,
+                    message_id=message_id,
+                    kind=kind,
+                    posted_at=now,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            row = session.get(MessageRow, message_id)
+            assert row is not None  # nosec B101 - just inserted
+            _event(
+                session,
+                "collaboration.message.created",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "turn_id": turn_id,
+                    "message_id": message_id,
+                    "sequence": row.sequence,
+                    "agent_slug": author_agent,
+                    "author_kind": "agent",
+                    "author_id": author_agent,
+                    "post_kind": kind,
+                    "run_id": run_public_id(run_id) if run_id else None,
+                },
+            )
+            return message_id
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:
@@ -2015,7 +3677,20 @@ class CollaborationStore:
             session.flush()
             return _message(session, row)
 
+    def record_steered_run(self, turn_id: str, run_id: str, now: float) -> None:
+        """Note that this turn steered ``run_id`` rather than answering from
+        scratch (S-A11), so a client can show the mention as direction to
+        work already in flight."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is not None:
+                row.steered_run_id = run_id
+
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
+        # A turn that ends badly leaves the only answer the asker gets, and
+        # a linked surface hears about it the same way it hears about a
+        # reply: through the observers, once the write has committed.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
@@ -2081,6 +3756,10 @@ class CollaborationStore:
                         "author_id": None,
                     },
                 )
+                session.flush()
+                message_row = session.get(MessageRow, message_id)
+                if message_row is not None:
+                    appended = _message(session, message_row)
             session.flush()
             _event(
                 session,
@@ -2088,7 +3767,9 @@ class CollaborationStore:
                 now,
                 data={"channel_id": row.channel_id, "turn_id": row.id, "error": error},
             )
-            return _turn(session, row)
+            finished = _turn(session, row)
+        self._appended(appended)
+        return finished
 
     def recover_turns(self, now: float) -> list[tuple[Turn, LocalUser, str]]:
         """Settle interrupted execution and return only work that never started.
@@ -2125,10 +3806,28 @@ class CollaborationStore:
                     interrupted.append((row.id, expected <= replies))
                     continue
                 channel = session.get(ChannelRow, row.channel_id)
+                message = session.get(MessageRow, row.input_message_id)
+                stored_origin = message.origin_json if message is not None else None
+                origin = json.loads(stored_origin) if stored_origin else None
+                if row.author_kind == "human" and row.author_id is None and origin:
+                    # A guest on a linked surface: the turn runs for the same
+                    # stand-in it would have run for live, never for the
+                    # channel's owner, whose identity would answer a stranger.
+                    if channel and channel.state == "active" and message:
+                        queued.append(
+                            (
+                                message.sequence,
+                                _turn(session, row),
+                                guest_user(_origin_name(origin)),
+                                message.content,
+                            )
+                        )
+                    else:
+                        interrupted.append((row.id, False))
+                    continue
                 author_id = row.author_id if row.author_kind == "human" else None
                 user_id = author_id or (channel.user_id if channel else None)
                 user = session.get(LocalUserRow, user_id) if user_id else None
-                message = session.get(MessageRow, row.input_message_id)
                 if user is not None and not self._may_read(session, row.channel_id, user.id):
                     user = None
                 if channel and channel.state == "active" and user and user.active and message:
@@ -2160,8 +3859,16 @@ class CollaborationStore:
             return False
         return True
 
-    def turn_history(self, turn: Turn, *, max_chars: int = 60_000) -> str:
-        """Prior turns and completed peers in this turn, without future input."""
+    def turn_history(self, turn: Turn, *, max_chars: int = HISTORY_CHARS) -> str:
+        """Prior turns and completed peers in this turn, without future input.
+
+        One JSON object per line, oldest last written first: the sequence,
+        who wrote it, the message kind, the text and the files it carried.
+        Bounded to :data:`HISTORY_MESSAGES` messages and ``max_chars``
+        characters; when anything was dropped the channel's latest summary
+        opens the history as a ``channel_summary`` line, so the agent still
+        knows what came before rather than silently losing it.
+        """
         with self.dstore.read() as session:
             current = session.get(MessageRow, turn.input_message_id)
             if current is None:
@@ -2173,7 +3880,7 @@ class CollaborationStore:
                 MessageRow.role == "user",
                 MessageRow.sequence < current.sequence,
             )
-            rows = session.scalars(
+            eligible = (
                 select(MessageRow)
                 .where(
                     MessageRow.channel_id == turn.channel_id,
@@ -2181,23 +3888,38 @@ class CollaborationStore:
                     | ((MessageRow.turn_id == turn.id) & (MessageRow.role == "assistant")),
                 )
                 .order_by(MessageRow.sequence.desc())
-                .limit(200)
             )
+            # One more than the cap tells the reader whether anything was left out.
+            rows = list(session.scalars(eligible.limit(HISTORY_MESSAGES + 1)))
+            dropped = len(rows) > HISTORY_MESSAGES
+            rows = rows[:HISTORY_MESSAGES]
+            attachments = _attachments(session, [str(row.id) for row in rows])
+            known = _directory(session, rows)
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                chunk = json.dumps(
-                    {
-                        "role": row.role,
-                        "agent": row.agent_slug,
-                        "content": row.content,
-                    },
-                    ensure_ascii=False,
-                )
+                chunk = _history_line(session, row, attachments.get(str(row.id), ()), known)
                 if len(chunk) > remaining:
+                    dropped = True
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk) + 1
+            if dropped:
+                summary = _latest_summary(session, turn.channel_id)
+                if summary is not None:
+                    chunks.append(
+                        json.dumps(
+                            {
+                                "seq": summary.through_sequence,
+                                "author_kind": "system",
+                                "author": None,
+                                "role": "assistant",
+                                "kind": "channel_summary",
+                                "content": summary.content,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
         return "\n".join(reversed(chunks))
 
     def participant_result(self, turn: Turn, index: int) -> Message | None:
@@ -2456,6 +4178,9 @@ class CollaborationStore:
             )
         message = message.strip()
         key = hashlib.sha256(json.dumps([source_index, agent_slug, message]).encode()).hexdigest()
+        # One agent asking another is channel traffic like any other, so the
+        # observers — and through them a linked surface — hear it too.
+        appended: Message | None = None
         with self.dstore.immediate_transaction() as session:
             try:
                 channel, _ = _access(session, channel_id, user_id, "post", now=now)
@@ -2553,7 +4278,13 @@ class CollaborationStore:
                     "message_id": message_id,
                 },
             )
-            return f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+            session.flush()
+            message_row = session.get(MessageRow, message_id)
+            if message_row is not None:
+                appended = _message(session, message_row)
+            queued = f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
+        self._appended(appended)
+        return queued
 
     # -- teams ---------------------------------------------------------------------
 

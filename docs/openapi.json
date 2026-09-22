@@ -895,6 +895,53 @@
         "title": "AuthorOut",
         "type": "object"
       },
+      "BridgeOut": {
+        "additionalProperties": false,
+        "description": "A chat service this release can bridge, and whether it is set up.",
+        "properties": {
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "configured",
+          "label"
+        ],
+        "title": "BridgeOut",
+        "type": "object"
+      },
+      "BridgePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/BridgeOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "BridgePage",
+        "type": "object"
+      },
       "Capabilities": {
         "additionalProperties": false,
         "properties": {
@@ -950,6 +997,24 @@
         "title": "Capabilities",
         "type": "object"
       },
+      "ChannelArtifactPage": {
+        "additionalProperties": false,
+        "description": "Every file a channel's messages carry.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelArtifactPage",
+        "type": "object"
+      },
       "ChannelCreate": {
         "additionalProperties": false,
         "properties": {
@@ -967,6 +1032,139 @@
           }
         },
         "title": "ChannelCreate",
+        "type": "object"
+      },
+      "ChannelLinkCreate": {
+        "additionalProperties": false,
+        "description": "Link a surface of a chat service to this channel.\n\n``allow_guests`` admits people on that surface who have linked no\naccount: their messages are stored under the name they use there.",
+        "properties": {
+          "allow_guests": {
+            "default": false,
+            "title": "Allow Guests",
+            "type": "boolean"
+          },
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "surface_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Surface Id",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          }
+        },
+        "required": [
+          "backend",
+          "surface_id"
+        ],
+        "title": "ChannelLinkCreate",
+        "type": "object"
+      },
+      "ChannelLinkOut": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "default": true,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "allow_guests": {
+            "default": false,
+            "title": "Allow Guests",
+            "type": "boolean"
+          },
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "surface_id": {
+            "title": "Surface Id",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          }
+        },
+        "required": [
+          "id",
+          "channel_id",
+          "backend",
+          "surface_id",
+          "created_at"
+        ],
+        "title": "ChannelLinkOut",
+        "type": "object"
+      },
+      "ChannelLinkPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelLinkOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelLinkPage",
         "type": "object"
       },
       "ChannelMemberCreate": {
@@ -1149,6 +1347,17 @@
             "title": "Title",
             "type": "string"
           },
+          "unread_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unread Count"
+          },
           "updated_at": {
             "title": "Updated At",
             "type": "string"
@@ -1322,6 +1531,81 @@
         "title": "ChannelParticipantUpdate",
         "type": "object"
       },
+      "ChannelReadUpdate": {
+        "additionalProperties": false,
+        "description": "How far the caller has read this channel.",
+        "properties": {
+          "sequence": {
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence"
+        ],
+        "title": "ChannelReadUpdate",
+        "type": "object"
+      },
+      "ChannelSilence": {
+        "additionalProperties": false,
+        "description": "How long the channel's agents stay quiet; null lifts the silence.",
+        "properties": {
+          "until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until"
+          }
+        },
+        "title": "ChannelSilence",
+        "type": "object"
+      },
+      "ChannelStopOut": {
+        "additionalProperties": false,
+        "description": "What a stop actually stopped.",
+        "properties": {
+          "cancelled_items": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Items",
+            "type": "array"
+          },
+          "cancelled_runs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Runs",
+            "type": "array"
+          },
+          "cancelled_turns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Turns",
+            "type": "array"
+          },
+          "silenced_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Silenced Until"
+          }
+        },
+        "title": "ChannelStopOut",
+        "type": "object"
+      },
       "ChannelUpdate": {
         "additionalProperties": false,
         "description": "Only the fields sent change. Changing either one takes managing the\nchannel: its owner, or a workspace owner or admin.",
@@ -1448,13 +1732,19 @@
             "type": "string"
           },
           "turn_id": {
-            "title": "Turn Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Id"
           }
         },
         "required": [
           "item_id",
-          "turn_id",
           "agent_slug",
           "title",
           "kind",
@@ -1563,6 +1853,33 @@
         "title": "ConfigurationEntry",
         "type": "object"
       },
+      "ConnectionConfigure": {
+        "additionalProperties": false,
+        "description": "Only known service settings and write-only credentials are accepted.",
+        "properties": {
+          "activate": {
+            "default": true,
+            "title": "Activate",
+            "type": "boolean"
+          },
+          "credentials": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Credentials",
+            "type": "object"
+          },
+          "settings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Settings",
+            "type": "object"
+          }
+        },
+        "title": "ConnectionConfigure",
+        "type": "object"
+      },
       "ConnectionMutation": {
         "additionalProperties": false,
         "properties": {
@@ -1602,6 +1919,11 @@
       "ConnectionOut": {
         "additionalProperties": false,
         "properties": {
+          "active": {
+            "default": false,
+            "title": "Active",
+            "type": "boolean"
+          },
           "auth_type": {
             "enum": [
               "oauth2",
@@ -1611,6 +1933,11 @@
             ],
             "title": "Auth Type",
             "type": "string"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
           },
           "created_at": {
             "anyOf": [
@@ -1667,6 +1994,11 @@
             "title": "Masked Credentials",
             "type": "object"
           },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          },
           "scopes": {
             "anyOf": [
               {
@@ -1681,6 +2013,13 @@
           "service_type": {
             "title": "Service Type",
             "type": "string"
+          },
+          "settings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Settings",
+            "type": "object"
           },
           "status": {
             "enum": [
@@ -1984,6 +2323,63 @@
           "recorded_at"
         ],
         "title": "EventOut",
+        "type": "object"
+      },
+      "ExternalIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "backend": {
+            "enum": [
+              "discord",
+              "slack",
+              "mattermost"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "external_user_id": {
+            "title": "External User Id",
+            "type": "string"
+          },
+          "verified_at": {
+            "title": "Verified At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "external_user_id",
+          "verified_at"
+        ],
+        "title": "ExternalIdentityOut",
+        "type": "object"
+      },
+      "ExternalIdentityPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ExternalIdentityOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ExternalIdentityPage",
         "type": "object"
       },
       "Gate": {
@@ -2843,6 +3239,26 @@
         "title": "Limits",
         "type": "object"
       },
+      "LinkCodeOut": {
+        "additionalProperties": false,
+        "description": "A code to type on a bridge, once, to prove an account is yours.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "expires_at"
+        ],
+        "title": "LinkCodeOut",
+        "type": "object"
+      },
       "LocalLoginRequest": {
         "additionalProperties": false,
         "properties": {
@@ -3394,6 +3810,37 @@
         "title": "MemoryUpdate",
         "type": "object"
       },
+      "MessageOriginOut": {
+        "additionalProperties": false,
+        "description": "The bridge surface a message arrived on, for a message that did.",
+        "properties": {
+          "backend": {
+            "title": "Backend",
+            "type": "string"
+          },
+          "external_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Message Id"
+          },
+          "surface_id": {
+            "title": "Surface Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "surface_id"
+        ],
+        "title": "MessageOriginOut",
+        "type": "object"
+      },
       "MessageOut": {
         "additionalProperties": false,
         "properties": {
@@ -3407,6 +3854,13 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
           },
           "author": {
             "anyOf": [
@@ -3437,6 +3891,35 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MessageOriginOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "post_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "plan",
+                  "progress",
+                  "review",
+                  "delivery",
+                  "reply",
+                  "notice"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Kind"
           },
           "reactions": {
             "items": {
@@ -4134,6 +4617,7 @@
       },
       "ParticipantOut": {
         "additionalProperties": false,
+        "description": "One agent's slot in a turn. ``assignees`` is set on the first slot of\na turn that may start managed work: the run roles the turn's mentions\ndeclare, as ``role -> agent slug``, which admission uses to assign the\nrun.",
         "properties": {
           "agent_slug": {
             "anyOf": [
@@ -4145,6 +4629,20 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "assignees": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignees"
           },
           "error": {
             "anyOf": [
@@ -5626,6 +6124,18 @@
       "SteerRequest": {
         "additionalProperties": false,
         "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
           "expected_revision": {
             "anyOf": [
               {
@@ -5645,6 +6155,18 @@
             "maxItems": 32,
             "title": "Source Refs",
             "type": "array"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
           },
           "text": {
             "maxLength": 16384,
@@ -6316,7 +6838,8 @@
               "conversation",
               "delegate",
               "code",
-              "workload"
+              "workload",
+              "auto"
             ],
             "title": "Intent",
             "type": "string"
@@ -6349,6 +6872,11 @@
               }
             ],
             "title": "Author Id"
+          },
+          "chain_depth": {
+            "default": 0,
+            "title": "Chain Depth",
+            "type": "integer"
           },
           "channel_id": {
             "title": "Channel Id",
@@ -6388,6 +6916,17 @@
             "title": "Input Message Id",
             "type": "string"
           },
+          "intent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intent"
+          },
           "parent_turn_id": {
             "anyOf": [
               {
@@ -6420,6 +6959,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "steered_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steered Run Id"
           },
           "targets": {
             "items": {
@@ -8144,6 +8694,28 @@
         ]
       }
     },
+    "/v1/bridges": {
+      "get": {
+        "description": "The chat services a channel can be linked to, and whether this daemon\nhas one set up. An unconfigured service can still be linked: the link\nstarts working when the operator configures the bridge.",
+        "operationId": "list_bridges_v1_bridges_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BridgePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Bridges",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
     "/v1/capabilities": {
       "get": {
         "operationId": "capabilities_v1_capabilities_get",
@@ -8380,6 +8952,237 @@
           }
         },
         "summary": "Update Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/artifacts": {
+      "get": {
+        "description": "Every file this channel's messages carry, newest message first.\n\nChannel read permission, not ``artifacts:read``: a file delivered into\na conversation belongs to the people in it. ``GET /v1/runs/{id}/artifacts``\nis unchanged and still takes ``artifacts:read``.",
+        "operationId": "list_channel_artifacts_v1_channels__channel_id__artifacts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelArtifactPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Artifacts",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/artifacts/{artifact_id}/content": {
+      "get": {
+        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel's own file list: a file this channel does\nnot carry is ``404`` whatever else the caller may read -- including a\ncatalogued file of a run the channel started but never delivered here,\nsuch as a code run's checkout -- so an id from elsewhere never leaks\nthrough here.",
+        "operationId": "download_channel_artifact_v1_channels__channel_id__artifacts__artifact_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Channel Artifact",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/links": {
+      "get": {
+        "description": "The bridge surfaces mirroring this channel; takes managing it.",
+        "operationId": "list_channel_links_v1_channels__channel_id__links_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelLinkPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Links",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "description": "Mirror a bridge surface into this channel; takes managing it and a\nworkspace owner or admin. A surface carries one link, so a second one\nis refused, and a run's thread cannot be linked.",
+        "operationId": "create_channel_link_v1_channels__channel_id__links_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelLinkCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelLinkOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Channel Link",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/links/{link_id}": {
+      "delete": {
+        "operationId": "delete_channel_link_v1_channels__channel_id__links__link_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Channel Link",
         "tags": [
           "collaboration"
         ]
@@ -8797,6 +9600,198 @@
         ]
       }
     },
+    "/v1/channels/{channel_id}/read": {
+      "put": {
+        "description": "Record how far the caller has read. The sequence only moves forward,\nand never past the newest message.",
+        "operationId": "set_channel_read_v1_channels__channel_id__read_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelReadUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Channel Read",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/resume": {
+      "post": {
+        "description": "Lift the channel's silence; it does not restart what stop cancelled.",
+        "operationId": "resume_channel_v1_channels__channel_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/silence": {
+      "put": {
+        "description": "Quiet the channel's agents until ``until``; null lifts it. Nothing in\nflight is cancelled: that is what ``stop`` is for.",
+        "operationId": "silence_channel_v1_channels__channel_id__silence_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelSilence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Silence Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/stop": {
+      "post": {
+        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced until\n``resume`` or a ``silence`` of its own lifts it.",
+        "operationId": "stop_channel_v1_channels__channel_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelStopOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
     "/v1/channels/{channel_id}/turns": {
       "get": {
         "operationId": "list_turns_v1_channels__channel_id__turns_get",
@@ -9094,11 +10089,11 @@
         },
         "summary": "List Connections",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "post": {
-        "operationId": "create_connection_v1_connections_post",
+        "operationId": "legacy_create_v1_connections_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -9131,15 +10126,15 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Create Connection",
+        "summary": "Legacy Create",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
     "/v1/connections/services": {
       "get": {
-        "operationId": "connection_services_v1_connections_services_get",
+        "operationId": "services_v1_connections_services_get",
         "responses": {
           "200": {
             "content": {
@@ -9148,7 +10143,7 @@
                   "items": {
                     "$ref": "#/components/schemas/ServiceDefinitionOut"
                   },
-                  "title": "Response Connection Services V1 Connections Services Get",
+                  "title": "Response Services V1 Connections Services Get",
                   "type": "array"
                 }
               }
@@ -9156,22 +10151,22 @@
             "description": "Successful Response"
           }
         },
-        "summary": "Connection Services",
+        "summary": "Services",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
     "/v1/connections/{connection_id}": {
       "delete": {
-        "operationId": "delete_connection_v1_connections__connection_id__delete",
+        "operationId": "remove_connection_v1_connections__connection_id__delete",
         "parameters": [
           {
-            "in": "query",
-            "name": "_connection_id",
+            "in": "path",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": " Connection Id",
+              "title": "Connection Id",
               "type": "string"
             }
           }
@@ -9191,9 +10186,9 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Delete Connection",
+        "summary": "Remove Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "get": {
@@ -9233,18 +10228,18 @@
         },
         "summary": "Get Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       },
       "patch": {
-        "operationId": "update_connection_v1_connections__connection_id__patch",
+        "operationId": "legacy_patch_v1_connections__connection_id__patch",
         "parameters": [
           {
-            "in": "query",
-            "name": "_connection_id",
+            "in": "path",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": " Connection Id",
+              "title": "Connection Id",
               "type": "string"
             }
           }
@@ -9281,9 +10276,59 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Update Connection",
+        "summary": "Legacy Patch",
         "tags": [
-          "collaboration"
+          "connections"
+        ]
+      },
+      "put": {
+        "operationId": "configure_connection_v1_connections__connection_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionConfigure"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Configure Connection",
+        "tags": [
+          "connections"
         ]
       }
     },
@@ -9325,7 +10370,7 @@
         },
         "summary": "Test Connection",
         "tags": [
-          "collaboration"
+          "connections"
         ]
       }
     },
@@ -12251,6 +13296,85 @@
           }
         },
         "summary": "Update Local User",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities": {
+      "get": {
+        "operationId": "list_identities_v1_users_me_identities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalIdentityPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Identities",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities/link-code": {
+      "post": {
+        "description": "A code to type on a bridge, as ``!sbx link <code>``, so messages you\nsend on a linked surface post under this account. It is single use and\nshort-lived, and this is the only place it is shown.",
+        "operationId": "create_link_code_v1_users_me_identities_link_code_post",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkCodeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Link Code",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/identities/{backend}": {
+      "delete": {
+        "description": "Forget who this account is on a bridge. Messages already stored keep\nthe author they were written with.",
+        "operationId": "delete_identity_v1_users_me_identities__backend__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "backend",
+            "required": true,
+            "schema": {
+              "title": "Backend",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Identity",
         "tags": [
           "collaboration"
         ]

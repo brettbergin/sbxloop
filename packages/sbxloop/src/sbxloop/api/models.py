@@ -556,6 +556,13 @@ class SteerRequest(ApiModel):
     #: person read — kept on the record, never interpreted.
     source_refs: list[str] = Field(default_factory=list, max_length=32)
     expected_revision: int | None = Field(default=None, ge=0)
+    #: The task lane the instruction is for, so it is answered by that task
+    #: rather than by whichever lane reaches a boundary first, and the agent
+    #: that was mentioned, so the answer comes back in its persona (S-A11).
+    #: Both optional: naming neither steers the run as it always did, and a
+    #: target the run does not have falls back to the same.
+    task_id: str | None = Field(default=None, max_length=128)
+    agent_slug: str | None = Field(default=None, max_length=64)
 
 
 class Steering(ApiModel):

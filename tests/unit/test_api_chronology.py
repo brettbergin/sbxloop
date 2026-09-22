@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -123,6 +124,40 @@ class TestProjection:
         store.append_event(Event(ts=101.0, run_id="r1", type="worker.stdout", data={"i": 1}))
         assert chron.project(now=501.0) == 1
         assert [row.source_seq for row in chron.read()] == [1, 2]
+
+    def test_an_idle_projection_takes_no_write_lock(
+        self, stores: tuple[StateStore, DaemonStore]
+    ) -> None:
+        """Every open stream wakes and projects; with nothing new to copy
+        that must cost a read, never a ``BEGIN IMMEDIATE`` competing with
+        the daemon's own writes for the store's one lock."""
+        store, dstore = stores
+        chron = Chronology(dstore)
+        immediate = 0
+        real = dstore.immediate_transaction
+
+        def counted() -> Any:
+            nonlocal immediate
+            immediate += 1
+            return real()
+
+        dstore.immediate_transaction = counted  # type: ignore[method-assign]
+        try:
+            # An empty chronology, then a projected one: both are idle.
+            assert chron.project(now=500.0) == 0
+            _engine_events(store, "r1", 2)
+            assert chron.project(now=501.0) == 2
+            copied = immediate
+            assert copied > 0
+            for _ in range(5):
+                assert chron.project(now=502.0) == 0
+            assert immediate == copied
+            # New work still lands, under the immediate transaction.
+            store.append_event(Event(ts=103.0, run_id="r1", type="worker.stdout", data={}))
+            assert chron.project(now=503.0) == 1
+            assert immediate > copied
+        finally:
+            del dstore.immediate_transaction  # type: ignore[attr-defined]
 
 
 class TestRetention:

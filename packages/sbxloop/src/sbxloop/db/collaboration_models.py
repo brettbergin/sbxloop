@@ -173,6 +173,71 @@ class MessageRow(Base):
     reactions_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'[]'"))
     author_kind: Mapped[str | None] = mapped_column(Text)
     author_id: Mapped[str | None] = mapped_column(Text)
+    #: Where a message that arrived over a bridge came from, when it did.
+    origin_json: Mapped[str | None] = mapped_column(Text)
+    #: What an ``agent_update`` message is (revision 0030); null otherwise.
+    post_kind: Mapped[str | None] = mapped_column(Text)
+
+
+class ChannelLinkRow(Base):
+    """A bridge surface mirroring a channel (revision 0028).
+
+    ``surface_id`` is the service's own channel id and ``thread_id`` the
+    thread within it, when the link is to a thread. SQLite treats NULLs in
+    a unique index as distinct, so the store also refuses a second link to
+    a surface explicitly; the constraint is the backstop.
+    """
+
+    __tablename__ = "collaboration_channel_links"
+    __table_args__ = (
+        UniqueConstraint("backend", "surface_id", "thread_id"),
+        Index("idx_collaboration_channel_links_channel", "channel_id"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    backend: Mapped[str] = mapped_column(Text, nullable=False)
+    surface_id: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(Text)
+    allow_guests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_by: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    active: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class ExternalIdentityRow(Base):
+    """Who someone is on a bridge: their service account, mapped to a local
+    one by a code they typed there themselves (revision 0028)."""
+
+    __tablename__ = "collaboration_external_identities"
+    __table_args__ = (
+        PrimaryKeyConstraint("backend", "external_user_id"),
+        Index("idx_collaboration_external_identities_user", "user_id"),
+    )
+
+    backend: Mapped[str] = mapped_column(Text, nullable=False)
+    external_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    verified_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class ChannelRunPostRow(Base):
+    """One post a run made in a channel (revision 0030).
+
+    The dedupe key is the run's own name for the moment it is posting
+    about, so a replayed, resumed or re-observed run finds its own row
+    instead of writing a second message.
+    """
+
+    __tablename__ = "channel_run_posts"
+    __table_args__ = (Index("idx_channel_run_posts_run", "run_id", "posted_at"),)
+
+    dedupe_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    posted_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
 class TurnRow(Base):
@@ -203,6 +268,9 @@ class TurnRow(Base):
     parent_turn_id: Mapped[str | None] = mapped_column(Text)
     source_message_id: Mapped[str | None] = mapped_column(Text)
     chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    #: The run this turn steered instead of answering (S-A11): a mention of
+    #: an agent working live work in this channel goes to that run.
+    steered_run_id: Mapped[str | None] = mapped_column(Text)
 
 
 class TeamRow(Base):
@@ -298,3 +366,46 @@ class AgentMemoryRow(Base):
     last_used_at: Mapped[float | None] = mapped_column(REAL)
     deleted_at: Mapped[float | None] = mapped_column(REAL)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class MessageArtifactRow(Base):
+    """A file a message carries (revision 0028).
+
+    The row is written in the same transaction as the message, so a result
+    and the files it delivered are never half-recorded. ``channel_id`` is
+    denormalised from the message: it is what scopes a channel's file list
+    and the ``read_channel_artifact`` tool, and it is indexed for both.
+    ``run_id`` is the run's public id, as the work snapshot carries it.
+    """
+
+    __tablename__ = "collaboration_message_artifacts"
+    __table_args__ = (
+        PrimaryKeyConstraint("message_id", "artifact_id"),
+        Index("idx_collaboration_message_artifacts_channel", "channel_id"),
+    )
+
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[str | None] = mapped_column(Text)
+    relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    media_type: Mapped[str] = mapped_column(Text, nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class ChannelSummaryRow(Base):
+    """What a channel said before its history window (revision 0028).
+
+    One row per compaction: ``through_sequence`` is the last message the
+    summary covers, so the newest row is the one a trimmed history opens
+    with and the watermark the next compaction starts from.
+    """
+
+    __tablename__ = "collaboration_channel_summaries"
+    __table_args__ = (PrimaryKeyConstraint("channel_id", "through_sequence"),)
+
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    through_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)

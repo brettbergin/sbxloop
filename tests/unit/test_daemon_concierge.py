@@ -16,7 +16,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +24,8 @@ from typing import Any, ClassVar
 
 import pytest
 
+from sbxloop.agents.tools import AgentTool
+from sbxloop.api.channel_artifacts import TOOL_NAME as CHANNEL_READ_TOOL
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import (
     CONCIERGE_AGENT,
@@ -44,6 +46,7 @@ from sbxloop_worker.protocol import (
     ErrorInfo,
     HostToolCall,
     HostToolResponse,
+    HostToolSpec,
     JobRequest,
     JobResult,
 )
@@ -340,6 +343,20 @@ class TestJobShape:
             concierge.submit_turn("hello", author="owner", session_key=key).result(timeout=10)
         assert [job.resume_session_id for job in client.jobs] == [None, None, "session-a"]
 
+    def test_a_stateless_turn_neither_resumes_nor_leaves_a_session(self, tmp_path: Path) -> None:
+        """A one-shot question (the ambient relevance check) carries no
+        earlier exchange and leaves nothing for the next one to resume."""
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"session_id": "one-shot-a"}, {"session_id": "one-shot-b"}, {"session_id": "kept"}],
+        )
+        for _ in range(2):
+            concierge.submit_turn(
+                "RELEVANT or PASS?", author="sbxloop", session_key="c:ambient:x", stateless=True
+            ).result(timeout=10)
+        concierge.submit_turn("hello", author="owner", session_key="c:ambient:x").result(timeout=10)
+        assert [job.resume_session_id for job in client.jobs] == [None, None, None]
+
     def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
         reply = concierge.submit_turn(
@@ -356,6 +373,77 @@ class TestJobShape:
         assert job.system_message is not None
         assert "You are Angie." in job.system_message
         assert "ordinary conversation turn" in job.system_message
+        # A mention asks for a reply, so it is not how a person gets action:
+        # the turn points at the runner modes instead.
+        assert "mention an agent when action is wanted" not in job.system_message
+        assert "Auto" in job.system_message
+
+    def test_a_turn_that_may_not_start_work_keeps_its_other_tools(self, tmp_path: Path) -> None:
+        """A mention in a conversation asks an agent to reply: it keeps its
+        read tools but cannot start managed work, so answering is the only
+        outcome the turn can have."""
+        starters = {
+            "start_workload",
+            "start_entrygraph",
+            "create_schedule",
+            "create_issue",
+            "label_issue_for_run",
+        }
+        concierge, client, *_ = make(
+            tmp_path, [{"text": "one"}, {"text": "two"}], github=FakeGithub()
+        )
+        concierge.submit_turn("list bread items", author="owner", agent_role="planner").result(
+            timeout=10
+        )
+        concierge.submit_turn(
+            "list bread items", author="owner", agent_role="planner", start_work=False
+        ).result(timeout=10)
+        allowed, conversation = ({t.name for t in job.host_tools} for job in client.jobs)
+        assert {"start_workload", "create_issue"} <= allowed
+        assert not starters & conversation
+        assert {"list_runs", "run_detail", "list_issues"} <= conversation
+        assert client.jobs[1].system_message is not None
+        assert "cannot start managed work" in client.jobs[1].system_message
+
+    def test_a_turn_that_may_not_start_work_cannot_operate_the_daemon(self, tmp_path: Path) -> None:
+        """A reply is the only outcome such a turn can have, so it keeps only
+        read tools: nothing that runs an operator command, changes the
+        config or writes to the forge is offered, and a call to one is
+        refused without touching the daemon."""
+        writes = {
+            "sbx_control",
+            "set_config",
+            "close_issue",
+            "comment_on_issue",
+            "delete_schedule",
+            "watch_run",
+        }
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("sbx_control", {"command": "pause"}),
+                        ("sbx_control", {"command": "restart"}),
+                    ],
+                    "text": "done",
+                }
+            ],
+            github=FakeGithub(),
+        )
+        reply = concierge.submit_turn(
+            "@builder pause the daemon and restart it",
+            author="member",
+            agent_role="builder",
+            start_work=False,
+        ).result(timeout=10)
+        (job,) = client.jobs
+        offered = {tool.name for tool in job.host_tools}
+        assert not writes & offered
+        assert {"list_runs", "run_detail", "list_issues"} <= offered
+        assert [response.ok for response in client.responses] == [False, False]
+        assert not loop.paused
+        assert reply.after is None and not getattr(loop, "restarts", [])
 
     def test_handoff_requires_a_completed_deliverable(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"text": "done"}])
@@ -1399,7 +1487,7 @@ class TestTools:
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
         origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
-        concierge, client, _, _, dstore = make(
+        concierge, client, _, loop, dstore = make(
             tmp_path,
             [
                 {
@@ -1437,6 +1525,9 @@ class TestTools:
         assert body.startswith("Wrap fetch().\n\n---\nFiled by Discord user `ana` (via concierge)")
         assert "777" not in body  # the requester never reaches the public issue
         assert not any("/labels" in p for p in github.paths)  # already queued: no label call
+        # The labelled issue is on the forge: the loop is woken to poll for
+        # it now rather than at its next interval (field: 55s of waiting).
+        assert loop.wakes == 1
         # ...but the daemon's store knows who asked, so the work item will.
         dstore.upsert_new(
             WorkItem(item_id="gh:issue:41", source_key="41", title="Add retries"), 1.0
@@ -1452,7 +1543,9 @@ class TestTools:
         assert origins[-1] == ("owner/repo", 12, "Issue #12")
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
+        assert "polls for it now" in labelled.text
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
+        assert loop.wakes == 2
 
     def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
         origins: list[tuple[str, int, str]] = []
@@ -2385,6 +2478,53 @@ class TestMemoryStaysOutOfTheDaemonLog:
         assert "redacted query" in quoted
 
 
+class TestChannelToolsInTheRoster:
+    """The channel's own tools reach the turn, and a read-only role keeps
+    the ones that only read (plan S-P15).
+
+    ``ApiContext`` hands ``channel_tools`` to every participant, critics
+    included, and the roster's allowlist decides what a critic or a
+    read-only turn is actually offered. The behaviour lives in
+    :meth:`Concierge._chat_tools`, so it is pinned here rather than by
+    calling the tool's implementation directly.
+    """
+
+    @staticmethod
+    def _tool(name: str) -> AgentTool:
+        return AgentTool(
+            HostToolSpec(
+                name=name,
+                description="a tool over the turn's channel",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            lambda args: "ok",
+        )
+
+    def _offered(self, tmp_path: Path, **kwargs: Any) -> list[str]:
+        concierge, client, *_ = make(tmp_path, [{}])
+        concierge.submit_turn(
+            "review the delivered file",
+            author="Discord user `brett`",
+            channel_tools=(self._tool(CHANNEL_READ_TOOL), self._tool("rewrite_channel_artifact")),
+            **kwargs,
+        ).result(timeout=10)
+        return [spec.name for spec in client.jobs[0].host_tools]
+
+    def test_a_critic_is_offered_the_channel_s_read_tool(self, tmp_path: Path) -> None:
+        offered = self._offered(tmp_path, agent_role="critic")
+        assert CHANNEL_READ_TOOL in offered
+
+    def test_a_read_only_turn_is_offered_it_too(self, tmp_path: Path) -> None:
+        offered = self._offered(tmp_path, read_only=True)
+        assert CHANNEL_READ_TOOL in offered
+
+    def test_an_unlisted_channel_tool_stays_out_of_a_critic_s_roster(self, tmp_path: Path) -> None:
+        # The allowlist is what keeps a reviewer read-only: a channel tool
+        # nobody vouched for is not offered just because it was handed in.
+        assert "rewrite_channel_artifact" not in self._offered(tmp_path, agent_role="critic")
+        assert "rewrite_channel_artifact" in self._offered(tmp_path)
+
+
 class TestWatchRun:
     """``watch_run``: register interest, or answer at once if already done."""
 
@@ -3121,11 +3261,13 @@ class TestStartWorkload:
         return response.text or "", dstore, loop
 
     def test_queues_a_chat_item_under_the_default_profile(self, tmp_path: Path) -> None:
-        text, dstore, _ = self._call(
+        text, dstore, loop = self._call(
             tmp_path, {"ask": "Summarise last week's deploys\n\nOne paragraph per day."}
         )
         assert text.startswith("queued workload `chat:9001` under profile `research`")
-        assert "within 60s" in text and "run thread will appear here" in text
+        assert "starts it now" in text and "run thread will appear here" in text
+        # The loop is woken rather than left to its poll interval.
+        assert loop.wakes == 1
         item = dstore.get("chat:9001")
         assert item is not None
         assert item.kind == "workload" and item.profile == "research"
@@ -3802,6 +3944,56 @@ class LeasingHost(FakeHost):
                 self.free.append(client)
 
 
+class HeldClient:
+    """A WorkerClient stand-in that answers at once, except for an ask
+    starting with ``hold``, which it holds until ``release`` is set."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.holding = threading.Event()
+        self.asks: list[str] = []
+        self.lock = threading.Lock()
+
+    def submit(self, job: JobRequest, **_: Any) -> JobResult:
+        assert job.prompt is not None
+        # The ask is the last line of the prompt the concierge builds.
+        ask = job.prompt.splitlines()[-1]
+        with self.lock:
+            self.asks.append(ask)
+        if ask.startswith("hold"):
+            self.holding.set()
+            assert self.release.wait(timeout=20), "the held job was never released"
+        return JobResult(job_id=job.job_id, status="ok", output_text=f"done {ask}")
+
+
+class SecondSubmitterFirst:
+    """Wraps the concierge's pool so that the first caller to hand it a turn
+    is let through only once the second caller has been, or after a second:
+    the interleaving two chat bridges, each on its own thread, can hit."""
+
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+        self.first_submitting = threading.Event()
+        self.second_submitted = threading.Event()
+        self.calls = 0
+        self.lock = threading.Lock()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        with self.lock:
+            self.calls += 1
+            first = self.calls == 1
+        if first:
+            self.first_submitting.set()
+            self.second_submitted.wait(timeout=1)
+            return self.pool.submit(fn, *args, **kwargs)
+        future = self.pool.submit(fn, *args, **kwargs)
+        self.second_submitted.set()
+        return future
+
+    def shutdown(self, *args: Any, **kwargs: Any) -> None:
+        self.pool.shutdown(*args, **kwargs)
+
+
 class TestConcurrentTurns:
     def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
         assert Config.model_validate({}).concierge.max_concurrent_turns == 1
@@ -3930,6 +4122,103 @@ class TestConcurrentTurns:
         finally:
             concierge.close()
         assert replies == ["done ask bridge", "done ask channel"]
+
+    def test_a_turn_waiting_in_its_lane_leaves_the_pool_to_other_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        """Two bridge turns share the default lane; the second waits for the
+        first, but not on a worker: a product channel's turn submitted after
+        both is answered while the first is still running."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        futures: list[Future[ConciergeReply]] = []
+        try:
+            futures = [
+                concierge.submit_turn("hold bridge a", author="a"),
+                concierge.submit_turn("ask bridge b", author="b"),
+                concierge.submit_turn("ask channel", author="c", session_key="channel-1:angie"),
+            ]
+            assert futures[2].result(timeout=5).text == "done ask channel"
+            assert not futures[0].done() and not futures[1].done()
+            client.release.set()
+            assert [future.result(timeout=20).text for future in futures[:2]] == [
+                "done hold bridge a",
+                "done ask bridge b",
+            ]
+        finally:
+            client.release.set()
+            concierge.close()
+        # The two sessions overlap, so only the bridge lane's order is fixed.
+        assert [ask for ask in client.asks if "bridge" in ask] == ["hold bridge a", "ask bridge b"]
+        assert sorted(client.asks) == ["ask bridge b", "ask channel", "hold bridge a"]
+
+    def test_bridge_turns_from_two_threads_are_all_answered_at_width_one(
+        self, tmp_path: Path
+    ) -> None:
+        """The local console and a configured bridge each submit from their
+        own thread into the one default lane. Whichever reaches the pool
+        first, both turns are answered, in the order they joined the lane."""
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        pool = SecondSubmitterFirst(concierge._executor)
+        concierge._executor = pool  # type: ignore[assignment]
+        futures: dict[str, Future[ConciergeReply]] = {}
+
+        def ask(name: str) -> None:
+            futures[name] = concierge.submit_turn(f"ask {name}", author=name)
+
+        first = threading.Thread(target=ask, args=("local",))
+        second = threading.Thread(target=ask, args=("mattermost",))
+        try:
+            first.start()
+            assert pool.first_submitting.wait(timeout=5)
+            second.start()
+            first.join(timeout=10)
+            second.join(timeout=10)
+            replies = [futures[name].result(timeout=10).text for name in ("local", "mattermost")]
+        finally:
+            concierge.close()
+        assert replies == ["done ask local", "done ask mattermost"]
+        assert client.asks == ["ask local", "ask mattermost"]
+
+    def test_a_cancelled_turn_gives_its_lane_place_to_the_next(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn(name, author="x") for name in ("hold a", "ask b", "ask c")
+            ]
+            assert futures[1].cancel()
+            client.release.set()
+            assert futures[2].result(timeout=20).text == "done ask c"
+        finally:
+            client.release.set()
+            concierge.close()
+        assert futures[1].cancelled()
+        assert client.asks == ["hold a", "ask c"]
+        # The bridge tells a newcomer how many turns are ahead of theirs; a
+        # cancelled one is no longer among them.
+        assert concierge.pending == 0
+
+    def test_closing_cancels_the_turns_still_waiting_in_a_lane(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = HeldClient()
+        host._client = client  # type: ignore[assignment]
+        futures = [concierge.submit_turn(name, author="x") for name in ("hold a", "ask b")]
+        try:
+            assert client.holding.wait(timeout=10)
+            concierge.close()
+            with pytest.raises(CancelledError):
+                futures[1].result(timeout=5)
+        finally:
+            client.release.set()
+        assert futures[0].result(timeout=20).text == "done hold a"
+        assert client.asks == ["hold a"]
 
     def test_turns_run_one_at_a_time_at_width_one(self, tmp_path: Path) -> None:
         concierge, _, host, _, _ = make(
