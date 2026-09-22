@@ -285,7 +285,7 @@ def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
             scratch = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             store = StateStore(scratch / "state.db")
         stack.callback(store.close)
-        return count_orphans(cli, store)
+        return count_orphans(cli, store, home=SbxloopHome(state_db.parent.parent))
 
 
 def vcs_backend_checks(config: Config) -> list[Check]:

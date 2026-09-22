@@ -386,7 +386,7 @@ credential:
 
 |            | agent sandbox                                                                                                                                                                                                                                    | VCS sandbox                                                                                                     |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-<forge>`                                                                                         |
+| name       | `sbxl-<instance>-<run>-run-agent`                                                                                                                                                                                                                | `sbxl-<instance>-<run>-run-vcs-<forge>`                                                                         |
 | credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | the configured forge token only                                                                                 |
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret on GitHub; the non-proxy env-file path on other forges and for GitHub App auth |
 | network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the repository's forge hosts + plan-declared grants                                                                    | balanced policy + the repository's forge API hosts (+ GitHub's dotcom storage hosts when applicable)            |
@@ -467,7 +467,7 @@ the retry that follows is a fresh run). `_reconcile_gates` leaves publish
 gates alone at boot: a released hold is a queued item, and the tick resumes
 it. `!sbx abandon <item>` drops the held result unpublished.
 
-The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
+The service sandbox (`sbxl-<instance>-<run>-run-credential-service`, #765) is the github sandbox's
 pattern generalized to the operator's own credentials. `[[credentials]]`
 declares a catalogue — `name`, the daemon-environment `env` holding the value,
 the ONE `host` the credential is good for, and how it is attached (`header`,
@@ -756,9 +756,15 @@ provisions a fresh pair.
 
 ### The daemon's own sandboxes
 
+The eight-character `<instance>` is the SHA-256 prefix of the resolved
+`SBXLOOP_HOME` path. It separates homes sharing an sbx app state; the run ID
+and trailing purpose identify each run sandbox. Names from earlier releases
+remain discoverable for cleanup. A home moved to another path gets a new
+instance ID, while its earlier sandboxes retain their old names.
+
 `sbxloop daemon` owns two long-lived sandboxes outside any run's pair, both
-named per state dir (`sbxloop-daemon-<forge>-<digest>`,
-`sbxloop-concierge-<digest>`) and both reported-but-never-pruned by
+named per state dir (`sbxl-<instance>-daemon-vcs-<forge>`,
+`sbxl-<instance>-daemon-chat-concierge`) and both reported-but-never-pruned by
 `sandbox prune`:
 
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle

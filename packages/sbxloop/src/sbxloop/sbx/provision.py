@@ -73,6 +73,7 @@ from sbxloop.events import EventBus
 from sbxloop.hostgit import exclude_from_git
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
+from sbxloop.paths import SbxloopHome
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx import registries
 from sbxloop.sbx.allocations import record_allocation, require_allocation
@@ -88,6 +89,7 @@ from sbxloop.sbx.conformance import (
     stdin_env_probe,
 )
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
+from sbxloop.sbx.naming import legacy_run_names, run_name, run_name_candidates
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.sandbox import (
     ENV_FILE,
@@ -306,29 +308,25 @@ PostCreate = Callable[[Sandbox, SandboxRole], None]
 
 
 def sandbox_name(run_id: str, role: SandboxRole, *, vcs_kind: VcsKind = "github") -> str:
-    """The externally visible name for one member of a run's sandbox set.
-
-    ``github`` remains the internal role name for the credential-isolated
-    forge worker, but its sandbox name follows the backend it actually runs.
-    Keeping the role separate preserves the worker and event protocol while
-    avoiding a GitLab or Gitea box being presented to an operator as GitHub.
-    """
-    suffix = vcs_kind if role == "github" else role
-    return f"sbxloop-{run_id}-{suffix}"
+    """Legacy run name, retained for callers handling pre-upgrade boxes."""
+    return legacy_run_names(run_id, role, vcs_kind=vcs_kind)[0]
 
 
 def sandbox_name_candidates(
-    run_id: str, role: SandboxRole, *, vcs_kind: VcsKind = "github"
+    run_id: str,
+    role: SandboxRole,
+    *,
+    vcs_kind: VcsKind = "github",
+    home: SbxloopHome | None = None,
 ) -> tuple[str, ...]:
-    """Current name, then any pre-forge-naming name an upgrade may leave.
+    """Current name, then names an earlier release may have left.
 
     Callers that inspect or remove an already-created sandbox use this
     instead of stranding a non-GitHub run made by an older release.
     """
-    current = sandbox_name(run_id, role, vcs_kind=vcs_kind)
-    if role != "github" or vcs_kind == "github":
-        return (current,)
-    return (current, sandbox_name(run_id, role))
+    if home is not None:
+        return run_name_candidates(home, run_id, role, vcs_kind=vcs_kind)
+    return legacy_run_names(run_id, role, vcs_kind=vcs_kind)
 
 
 def dedupe_domains(domains: Iterable[str]) -> list[str]:
@@ -555,7 +553,7 @@ class Provisioner:
         if languages is None:
             languages = self.config.sandbox.effective_languages
         agent = SandboxSpec(
-            name=sandbox_name(run_id, "agent"),
+            name=run_name(self.config.paths, run_id, "agent"),
             role="agent",
             resources=self.config.sandbox_resources_for("agent", repo),
             workspace=workspace,
@@ -571,7 +569,7 @@ class Provisioner:
             files=self.agent_files(repo),
         )
         github = self._github_spec(
-            sandbox_name(run_id, "github", vcs_kind=self.forge_kind(repo)),
+            run_name(self.config.paths, run_id, "github", vcs_kind=self.forge_kind(repo)),
             workspace,
             repo,
             template,
@@ -1929,7 +1927,7 @@ class Provisioner:
         or the 0600 env file) exactly as GH_TOKEN does, with no package-manager client files."""
         regs = self.config.credentialed_registries_for(repo)
         return SandboxSpec(
-            name=sandbox_name(run_id, "service"),
+            name=run_name(self.config.paths, run_id, "service"),
             role="service",
             resources=self.config.sandbox_resources_for("service"),
             workspace=workspace,

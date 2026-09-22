@@ -619,7 +619,7 @@ def prune_sandboxes(
         cli = deps.sbx()
         with deps.mailbox.read_engine() as engine:
             fresh = classify_sandboxes(
-                cli.ls(), engine, include_kept=include_kept, now=deps.clock()
+                cli.ls(), engine, include_kept=include_kept, now=deps.clock(), home=deps.home
             )
         orphans = [v for v in fresh if v.orphan]
         skipped = {v.name for v in shown} - {v.name for v in orphans}

@@ -68,6 +68,18 @@ class TestFactory:
 
 
 class TestTheDaemonsBox:
+    def test_old_same_home_name_is_removed_before_new_provision(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.sbx.naming import legacy_daemon_vcs_name
+
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "github")
+        old = legacy_daemon_vcs_name(box.config.paths)
+        box.sbx.create(SandboxSpec(name=old, role="github", workspace=tmp_path))
+        box.remove_stale()
+        assert old not in {info.name for info in box.sbx.ls()}
+        assert box.name == sandbox_name_for(box.config.paths)
+
     def test_the_daemon_box_follows_the_configured_forge(
         self, fake_sbx: FakeSbx, tmp_path: str
     ) -> None:
@@ -83,7 +95,7 @@ class TestTheDaemonsBox:
         )
         assert box.kind == "gitlab"
         assert box.name == sandbox_name_for(config.paths, "gitlab")
-        assert box.name.startswith("sbxloop-daemon-gitlab-")
+        assert box.name.endswith("-daemon-vcs-gitlab")
         ops = box.backend(StubWorkerClient({}))  # type: ignore[arg-type]
         assert isinstance(ops, GitlabOps)
         assert ops.transport is not None and ops.transport.api_url == "https://gl.example/api/v4"

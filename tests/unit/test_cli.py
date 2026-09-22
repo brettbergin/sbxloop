@@ -140,8 +140,8 @@ class TestStatusAndLogs:
         assert result.exit_code == 0
         assert "Task one" in result.output
         # the pair names print with liveness, so no by-hand reconstruction
-        assert "sbxloop-rseeded11-agent" in result.output
-        assert "sbxloop-rseeded11-github" in result.output
+        assert "-rseeded11-run-agent" in result.output
+        assert "-rseeded11-run-vcs-github" in result.output
         assert "not running" in result.output
         assert "sbxloop shell" not in result.output
 
@@ -438,25 +438,51 @@ class TestSandboxCommands:
     def test_sandbox_ls_filters_sbxloop(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         from sbxloop.sbx.cli import SbxCLI
         from sbxloop.sbx.models import SandboxSpec
+        from sbxloop.sbx.naming import run_name
 
         cli = SbxCLI(binary=str(fake_sbx.binary))
         cli.create(SandboxSpec(name="sbxloop-r1-agent", role="agent", workspace=workdir))
+        current = run_name(home(workdir), "rabc12345", "agent")
+        cli.create(SandboxSpec(name=current, role="agent", workspace=workdir))
         cli.create(SandboxSpec(name="unrelated", role="agent", workspace=workdir))
         result = runner.invoke(app, ["sandbox", "ls"])
         assert result.exit_code == 0
         assert "sbxloop-r1-agent" in result.output
+        assert current in result.output
         assert "unrelated" not in result.output
 
     def test_sandbox_rm_by_run(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         from sbxloop.sbx.cli import SbxCLI
         from sbxloop.sbx.models import SandboxSpec
+        from sbxloop.sbx.naming import run_name
 
         cli = SbxCLI(binary=str(fake_sbx.binary))
         for role in ("agent", "github"):
             cli.create(SandboxSpec(name=f"sbxloop-r9-{role}", role="agent", workspace=workdir))
+        cli.create(
+            SandboxSpec(
+                name=run_name(home(workdir), "r9", "service"),
+                role="service",
+                workspace=workdir,
+            )
+        )
         result = runner.invoke(app, ["sandbox", "rm", "--run", "r9"])
         assert result.exit_code == 0
         assert cli.ls() == []
+
+    def test_sandbox_rm_all_keeps_another_home(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.models import SandboxSpec
+        from sbxloop.sbx.naming import run_name
+
+        cli = SbxCLI(binary=str(fake_sbx.binary))
+        own = run_name(home(workdir), "rabc12345", "agent")
+        other = run_name(SbxloopHome(workdir / "other"), "rabc12345", "agent")
+        for name in (own, other):
+            cli.create(SandboxSpec(name=name, role="agent", workspace=workdir))
+        result = runner.invoke(app, ["sandbox", "rm", "--all"])
+        assert result.exit_code == 0, result.output
+        assert {info.name for info in cli.ls()} == {other}
 
     def test_sandbox_rm_requires_target(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         result = runner.invoke(app, ["sandbox", "rm"])
@@ -2084,7 +2110,7 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "make it so", "--no-tui", "--keep-sandboxes"])
         assert result.exit_code == 0, result.output
         boxes = fake_sbx.state / "sandboxes"
-        assert any(p.name.startswith("sbxloop-") for p in boxes.iterdir())
+        assert any(p.name.startswith("sbxl-") for p in boxes.iterdir())
 
     def test_run_tui_preserves_full_transcript_history(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -2386,7 +2412,7 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "impossible", "--no-tui", "--keep-on-failure"])
         assert result.exit_code == 2
         boxes = fake_sbx.state / "sandboxes"
-        assert any(p.name.startswith("sbxloop-") for p in boxes.iterdir())
+        assert any(p.name.startswith("sbxl-") for p in boxes.iterdir())
         # the run.keep event reaches the transcript with the shell pointer
         assert "sbxloop shell" in result.output
 
@@ -3091,8 +3117,8 @@ class TestMultiRepoCli:
         result = runner.invoke(app, ["status", "rmulti003"])
 
         assert result.exit_code == 0
-        assert "sbxloop-rmulti003-gitlab" in result.output
-        assert "sbxloop-rmulti003-github" not in result.output
+        assert "-rmulti003-run-vcs-gitlab" in result.output
+        assert "-rmulti003-run-vcs-github" not in result.output
 
     def test_status_single_repo_shape_unchanged(self, workdir: Path) -> None:
         seed_store(workdir)

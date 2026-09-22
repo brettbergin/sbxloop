@@ -5228,7 +5228,9 @@ class DaemonLoop:
             pass
         vcs_kind = self.config.vcs_kind_for(repo)
         for role in roles:
-            for name in sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind):
+            for name in sandbox_name_candidates(
+                run_id, role, vcs_kind=vcs_kind, home=self.config.paths
+            ):
                 try:
                     remove_run_sandbox(self.sbx, name, role, self.config)
                     self._notice(

@@ -21,7 +21,6 @@ from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.agentbox import (
     REPROVISION_MIN_INTERVAL_S,
-    SANDBOX_NAME_PREFIX,
     DaemonAgent,
     sandbox_name_for,
 )
@@ -79,12 +78,24 @@ class TestNaming:
         agent_a = DaemonAgent(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         agent_b = DaemonAgent(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         assert agent_a.name != agent_b.name
-        assert agent_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
+        assert agent_a.name.endswith("-daemon-chat-concierge")
         assert agent_a.name == sandbox_name_for(a.paths)
         assert agent_a.workspace == (a.paths.daemon / "concierge-workspace").resolve()
 
 
 class TestLifecycle:
+    def test_existing_concierge_keeps_its_session_name_during_upgrade(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.sbx.naming import legacy_concierge_name
+
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch)
+        old = legacy_concierge_name(agent.config.paths)
+        agent.provisioner.ensure_agent_only(old, agent.workspace, run_id="concierge")
+        agent.client()
+        assert agent.name == old
+        assert created_names(fake_sbx) == [old]
+
     @pytest.mark.parametrize("old_vm", [False, True])
     def test_changed_or_unknown_allocation_preserves_concierge_history(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_vm: bool

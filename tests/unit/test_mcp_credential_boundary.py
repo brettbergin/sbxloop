@@ -56,7 +56,7 @@ def test_provision_keeps_mcp_keys_in_service_under_fallback(
     )
     pair = provisioner.ensure_pair("audit", workspace=tmp_path / "workspace", expects_mount=False)
 
-    agent_fs = fake_sbx.sandbox_fs("sbxloop-audit-agent")
+    agent_fs = fake_sbx.sandbox_fs(pair.agent.name)
     assert marker not in "".join(p.read_text(errors="replace") for p in agent_fs.rglob("env.sh"))
     agent_env = provisioner.job_env("agent", sandbox=pair.agent)
     assert marker not in str(agent_env() if agent_env else {})
@@ -65,14 +65,14 @@ def test_provision_keeps_mcp_keys_in_service_under_fallback(
     if stdin_ok:
         assert service_env is not None and service_env()["WEATHER_API_KEY"] == marker
     else:
-        service_fs = fake_sbx.sandbox_fs("sbxloop-audit-service")
+        service_fs = fake_sbx.sandbox_fs(pair.service.name)
         assert marker in (service_fs / "home/agent/.sbxloop/env.sh").read_text()
     assert "api.weather.example.com" not in agent_policy_allows(provisioner.config, ["python"])
     for record in fake_sbx.raw_invocations():
         # Custom-secret registration carries names; raw values must never
         # become a command or stdin payload for arbitrary agent processes.
         assert marker not in str(record.get("args", []))
-        if "sbxloop-audit-agent" in record.get("args", []):
+        if pair.agent.name in record.get("args", []):
             assert marker not in str(record.get("stdin", ""))
 
 
@@ -85,8 +85,8 @@ def test_credential_free_mcp_preserves_non_proxy_agent_auth(
         configuration(tmp_path, "plain-env", credentialed=False),
         env={"COPILOT_GITHUB_TOKEN": "audit-inference-key", "WEATHER_API_KEY": "not-granted"},
     )
-    provisioner.ensure_pair("audit")
-    env_file = fake_sbx.sandbox_fs("sbxloop-audit-agent") / "home/agent/.sbxloop/env.sh"
+    pair = provisioner.ensure_pair("audit")
+    env_file = fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sbxloop/env.sh"
     assert "audit-inference-key" in env_file.read_text()
     assert "not-granted" not in env_file.read_text()
 
