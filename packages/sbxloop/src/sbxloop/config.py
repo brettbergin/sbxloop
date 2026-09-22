@@ -1911,8 +1911,9 @@ class DaemonConfig(_ConfigModel):
     run_cap_timezone: str = "UTC"
     # The workspace's daily token budget: input plus output tokens reported
     # by every run and every chat turn since 00:00 in `run_cap_timezone`.
-    # Once reached, no new run starts (and a chat guardrail may refuse a
-    # turn) until the next day. Unset: tokens never refuse work.
+    # Once reached, no new run starts and no chat turn, whoever asked for
+    # it, is sent to the model until the next day; the person is told so
+    # in reply. Unset: tokens never refuse work.
     daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a

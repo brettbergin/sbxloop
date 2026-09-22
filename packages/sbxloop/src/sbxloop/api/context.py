@@ -837,6 +837,19 @@ class ApiContext:
                 self.hub.notify()
                 index += 1
                 continue
+            # A turn a person started passes the same admission a turn one
+            # agent starts for another does (the guardrails asked the pool
+            # for that one before it was queued): once the day's token
+            # budget is spent nothing is sent to the model, and the refusal
+            # is the turn's answer. Asked here, after stop and steer, which
+            # spend nothing: a person can always stop work.
+            refused = self._turn_budget_refusal(turn, target) if source_agent is None else None
+            if refused is not None:
+                errors.append(refused)
+                store.participant_failed(turn.id, index, refused, self.clock())
+                self.hub.notify()
+                index += 1
+                continue
             read_only = (
                 bool(participant.get("read_only")) or target == "critic" or source_agent is not None
             )
@@ -1034,11 +1047,35 @@ class ApiContext:
             )
         store.finish_turn(
             turn.id,
-            error="; ".join(errors) if errors else None,
+            # Once each: two refused participants share one reason.
+            error="; ".join(dict.fromkeys(errors)) if errors else None,
             now=self.clock(),
         )
         self.hub.notify()
         self.schedule_compaction(turn.channel_id)
+
+    def _turn_budget_refusal(self, turn: Turn, agent_slug: str | None) -> str | None:
+        """Why the workspace's daily token budget refuses the part of a
+        person's turn that ``agent_slug`` would answer, worded for the
+        person; ``None`` when the pool admits it, or when there is no pool
+        or no budget. A refusal never blocks: it is decided before the turn
+        is submitted, so chat cannot deadlock on it."""
+        pool = getattr(self.loop, "usage_pool", None)
+        if pool is None:
+            return None
+        now = self.clock()
+        admission = pool.admit_turn(turn.channel_id, agent_slug, now)
+        if admission.ok:
+            return None
+        log.info(
+            "collaboration.turn_refused",
+            channel=turn.channel_id,
+            turn=turn.id,
+            agent=agent_slug,
+            reason=admission.reason,
+            retry_at=admission.retry_at,
+        )
+        return str(pool.refusal_text(admission, now))
 
     def _channel_tools(self, channel_id: str) -> tuple[AgentTool, ...]:
         """The tools over the turn's own channel: today, reading a file
