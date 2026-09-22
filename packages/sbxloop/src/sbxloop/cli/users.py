@@ -9,8 +9,9 @@ interleaves with the daemon's writes.
 
 from __future__ import annotations
 
+import getpass
 import time
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -27,6 +28,15 @@ def say(line: str) -> None:
     console.print(line, markup=False, soft_wrap=True)
 
 
+def operator() -> dict[str, Any]:
+    """Who is running the command, for the audit trail."""
+    try:
+        who = getpass.getuser()
+    except (KeyError, OSError):  # pragma: no cover - no account name on this host
+        who = "unknown"
+    return {"kind": "operator", "id": who, "via": "cli"}
+
+
 @users_app.command("merge")
 def merge(
     source: Annotated[
@@ -37,6 +47,16 @@ def merge(
         str,
         typer.Option("--into", help="The account that keeps everything (username or user id)."),
     ],
+    readmit: Annotated[
+        bool,
+        typer.Option(
+            "--readmit",
+            help=(
+                "Allow the merge when the --into account is no longer a workspace "
+                "member; it is brought back in with the merged role."
+            ),
+        ),
+    ] = False,
     yes: Annotated[
         bool, typer.Option("--yes", help="Apply the merge; without it nothing is written.")
     ] = False,
@@ -46,7 +66,9 @@ def merge(
     Everything the --from account made moves to the --into account, its
     provider sign-in then reaches the --into account, and the --from account
     is deactivated with its tokens revoked. Without --yes this prints what
-    would move and writes nothing.
+    would move and writes nothing. A deactivated --from account lends none
+    of its workspace role, and an --into account that has left the
+    workspace is refused unless --readmit says to bring it back in.
     """
     # Imported here, as `sbxloop api` does: the collaboration store is a
     # sizeable module most commands never need.
@@ -61,14 +83,27 @@ def merge(
         store = CollaborationStore(dstore)
         found = {}
         for flag, selector in (("--from", source), ("--into", target)):
-            user = store.find_user(selector)
+            try:
+                user = store.find_user(selector)
+            except CollaborationError as exc:
+                console.print(
+                    f"{flag}: refused ({exc.code}): {exc.message}",
+                    markup=False,
+                    style="bold red",
+                )
+                raise typer.Exit(2) from exc
             if user is None:
                 console.print(f"{flag}: no user {selector!r}", markup=False, style="bold red")
                 raise typer.Exit(2)
             found[flag] = user
         try:
             report = store.merge_users(
-                found["--from"].id, found["--into"].id, time.time(), dry_run=not yes
+                found["--from"].id,
+                found["--into"].id,
+                time.time(),
+                dry_run=not yes,
+                readmit=readmit,
+                actor=operator(),
             )
         except CollaborationError as exc:
             console.print(f"refused ({exc.code}): {exc.message}", markup=False, style="bold red")
@@ -86,7 +121,10 @@ def merge(
     if report.identity is not None:
         issuer, subject = report.identity
         say(f"  provider identity    {issuer} sub={subject} -> {report.target_username}")
-    say(f"  workspace role       {report.previous_role or 'none'} -> {report.role}")
+    if report.readmitted:
+        say(f"  workspace role       re-admitted to the workspace as {report.role}")
+    else:
+        say(f"  workspace role       {report.previous_role or 'none'} -> {report.role}")
     if report.preference_conflicts:
         say("  preferences kept from the target: " + ", ".join(sorted(report.preference_conflicts)))
     for label, renames in (("team", report.renamed_teams), ("workflow", report.renamed_workflows)):

@@ -61,7 +61,9 @@ concierge, operation controls, schedules, events, artifacts, and usage instead
 of starting another scheduler or opening another SQLite writer.
 
 The installation has at most one local user. `POST /v1/auth/local/register`
-creates that profile and its scoped API principal; `/v1/auth/local/login` returns
+creates that profile and its scoped API principal; a `username` beginning
+with `usr_` is refused (`422 invalid_request`), since that is how the user
+ids in `GET /v1/users` read and no name may stand in for one; `/v1/auth/local/login` returns
 the same short-lived access and rotating refresh tokens as the existing client
 credential flow. Existing machine clients and all existing routes keep their
 original behavior.
@@ -538,7 +540,10 @@ caller; the text is cut to `[memory] max_item_chars`, and past
 `[memory] max_items_per_agent` the agent's oldest unpinned memory is dropped
 (`409 memory_full` when every one is pinned). `PATCH {content?, pinned?, expected_revision}`
 answers `409 revision_conflict` for a stale revision. `DELETE` forgets the
-memory (a soft delete). With `[memory] enabled = false`, `POST` answers
+memory (a soft delete). Both read the caller's channel access first: a
+memory from a private channel the caller cannot read answers the
+`404 memory_not_found` an unknown id answers, so it is neither changed,
+forgotten nor read back. With `[memory] enabled = false`, `POST` answers
 `409 memory_disabled`. Changes write `agent.memory.created`, `.updated` and
 `.deleted` events that name the memory, its agent and its source channel but
 never its text.
