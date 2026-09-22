@@ -507,11 +507,13 @@ BridgeBackendName = Literal["discord", "slack", "mattermost"]
 
 
 class MessageOriginOut(ApiModel):
-    """The bridge surface a message arrived on, for a message that did."""
+    """The bridge surface a message arrived on, for a message that did.
+    ``thread_id`` is set when it came in through a link to one thread."""
 
     backend: str
     surface_id: str
     external_message_id: str | None = None
+    thread_id: str | None = None
 
 
 class BridgeOut(ApiModel):
