@@ -373,6 +373,31 @@ class TestRepositoryExclusivity:
         finally:
             _release_all(h, gate)
 
+    def test_a_code_run_refreshes_while_a_workload_shares_its_repository(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The opposite order: a workload works from its own data
+        directory, never from the checkout, so a code run admitted beside
+        it still starts from current ``origin/<branch>``. Only a live code
+        run keeps the checkout from moving."""
+        h = _harness(tmp_path)
+        gate = Gate(h)
+        h.loop._runner = gate.runner
+        refreshed: list[str | None] = []
+        monkeypatch.setattr(h.loop, "_ensure_workspace", refreshed.append)
+        h.source.items = [_item("o/a", "1", kind="workload")]
+        try:
+            h.loop.tick()
+            gate.wait_started("gh:o/a:issue:1")
+            assert refreshed == ["o/a"]
+            h.source.items = [_item("o/a", "2")]
+            assert _tick(h).launched == ("gh:o/a:issue:2",)
+            gate.wait_started("gh:o/a:issue:2")
+            # The workload is not on the checkout: the code run refreshes it.
+            assert refreshed == ["o/a", "o/a"]
+        finally:
+            _release_all(h, gate)
+
 
 class TestShutdown:
     def test_drain_settles_every_run_after_a_stop(self, tmp_path: Path) -> None:
