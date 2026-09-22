@@ -676,18 +676,36 @@ def _unread(
     return int(session.scalar(statement) or 0)
 
 
-def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
-    """Whether the channel has an owner besides ``user_id``."""
-    found = session.scalar(
-        select(ChannelMemberRow.user_id)
+def _standing_members(channel_id: str) -> Any:
+    """The channel's member rows whose user is an active workspace member.
+    A row left behind by someone removed from the workspace or deactivated
+    counts for nothing: not as an owner, not as someone left behind."""
+    return (
+        select(ChannelMemberRow)
+        .join(WorkspaceMemberRow, WorkspaceMemberRow.user_id == ChannelMemberRow.user_id)
+        .join(LocalUserRow, LocalUserRow.id == ChannelMemberRow.user_id)
         .where(
             ChannelMemberRow.channel_id == channel_id,
-            ChannelMemberRow.user_id != user_id,
-            ChannelMemberRow.role == "owner",
+            WorkspaceMemberRow.workspace_id == WORKSPACE_ID,
+            LocalUserRow.active != 0,
         )
-        .limit(1)
     )
+
+
+def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
+    """Whether the channel has an owner besides ``user_id`` who is still an
+    active workspace member."""
+    found = session.scalars(
+        _standing_members(channel_id)
+        .where(ChannelMemberRow.user_id != user_id, ChannelMemberRow.role == "owner")
+        .limit(1)
+    ).first()
     return found is not None
+
+
+def _outranks(role: str, other: str) -> bool:
+    """Whether workspace role ``role`` is above ``other``."""
+    return ROLES.index(_role(role)) < ROLES.index(_role(other))
 
 
 def _channel_member(row: ChannelMemberRow, user: LocalUserRow) -> ChannelMember:
@@ -1051,8 +1069,7 @@ class CollaborationStore:
                         raise CollaborationError(
                             "local_user_exists", "this installation already has a local user"
                         )
-                    invite = self._open_invite(session, invite_token, now, email=email)
-                    role = _role(str(invite.role))
+                    invite, role = self._open_invite(session, invite_token, now, email=email)
                     capabilities_json = _capabilities_json(ROLE_CAPABILITIES[role])
                 session.execute(
                     insert(ClientRow).values(
@@ -1753,13 +1770,16 @@ class CollaborationStore:
 
     # -- workspace membership ------------------------------------------------------
 
-    @staticmethod
     def _open_invite(
-        session: Any, raw_token: str, now: float, *, email: str | None
-    ) -> WorkspaceInviteRow:
-        """The unspent, unexpired invite behind ``raw_token``. An invite
-        addressed to an email admits only that address, compared without
-        regard to case."""
+        self, session: Any, raw_token: str, now: float, *, email: str | None
+    ) -> tuple[WorkspaceInviteRow, Role]:
+        """The unspent, unexpired invite behind ``raw_token`` and the role
+        it grants today. An invite addressed to an email admits only that
+        address, compared without regard to case. An invite stands only
+        while its creator does: one whose creator is no longer an active
+        member admits nobody, and one above its creator's current role
+        grants that role instead. A plain operator client's invite
+        (``client:<id>``) is not measured against a membership."""
         row: WorkspaceInviteRow | None = session.scalars(
             select(WorkspaceInviteRow).where(
                 WorkspaceInviteRow.token_hash == invite_token_hash(raw_token),
@@ -1774,7 +1794,18 @@ class CollaborationStore:
             raise CollaborationError(
                 "invite_email_mismatch", "the invite is addressed to another email"
             )
-        return row
+        role = _role(str(row.role))
+        creator = str(row.created_by)
+        if not creator.startswith("client:"):
+            member = self._member_row(session, creator)
+            user = session.get(LocalUserRow, creator)
+            if member is None or user is None or not user.active:
+                raise CollaborationError(
+                    "invite_invalid", "the invite's creator is no longer a member"
+                )
+            if _outranks(role, str(member.role)):
+                role = _role(str(member.role))
+        return row, role
 
     @staticmethod
     def _grant_role(session: Any, user: LocalUserRow, role: Role | None) -> None:
@@ -1798,6 +1829,89 @@ class CollaborationStore:
             .where(RefreshTokenRow.client_id == client_id, RefreshTokenRow.revoked_at.is_(None))
             .values(revoked_at=now)
         )
+
+    @staticmethod
+    def _end_channel_memberships(session: Any, user_id: str, now: float | None) -> None:
+        """Take the user out of every channel, inside the caller's
+        transaction. Where they were a channel's last standing owner, the
+        longest-standing member still in the workspace becomes its owner;
+        a channel nobody else is in is left without a member. Events are
+        recorded when ``now`` is known."""
+        rows = session.scalars(
+            select(ChannelMemberRow)
+            .where(ChannelMemberRow.user_id == user_id)
+            .order_by(ChannelMemberRow.joined_at, ChannelMemberRow.channel_id)
+        ).all()
+        for row in rows:
+            channel_id = str(row.channel_id)
+            was_owner = row.role == "owner"
+            session.delete(row)
+            session.flush()
+            if now is not None:
+                _event(
+                    session,
+                    "collaboration.member.removed",
+                    now,
+                    data={"channel_id": channel_id, "user_id": user_id},
+                )
+            if not was_owner or _other_owner(session, channel_id, user_id):
+                continue
+            heir = session.scalars(
+                _standing_members(channel_id)
+                .where(ChannelMemberRow.user_id != user_id)
+                .order_by(ChannelMemberRow.joined_at, ChannelMemberRow.user_id)
+                .limit(1)
+            ).first()
+            if heir is None:
+                continue
+            heir.role = "owner"
+            session.flush()
+            if now is not None:
+                _event(
+                    session,
+                    "collaboration.member.updated",
+                    now,
+                    data={"channel_id": channel_id, "user_id": str(heir.user_id)},
+                )
+
+    @staticmethod
+    def _revoke_invites(
+        session: Any,
+        user_id: str,
+        now: float | None,
+        *,
+        reason: str,
+        actor: dict[str, Any] | None = None,
+        above: Role | None = None,
+    ) -> None:
+        """Withdraw the unspent invites ``user_id`` created, inside the
+        caller's transaction: every one of them, or with ``above`` only
+        those granting more than that role. Spent invites stay on record.
+        Each withdrawal is a ``workspace.invite.revoked`` event with its
+        ``reason`` when ``now`` is known."""
+        rows = session.scalars(
+            select(WorkspaceInviteRow)
+            .where(
+                WorkspaceInviteRow.workspace_id == WORKSPACE_ID,
+                WorkspaceInviteRow.created_by == user_id,
+                WorkspaceInviteRow.accepted_at.is_(None),
+            )
+            .order_by(WorkspaceInviteRow.created_at, WorkspaceInviteRow.id)
+        ).all()
+        for row in rows:
+            if above is not None and not _outranks(str(row.role), above):
+                continue
+            invite_id, role = str(row.id), str(row.role)
+            session.delete(row)
+            if now is not None:
+                _event(
+                    session,
+                    "workspace.invite.revoked",
+                    now,
+                    actor=actor,
+                    data={"invite_id": invite_id, "role": role, "reason": reason},
+                )
+        session.flush()
 
     @staticmethod
     def _owner_count(session: Any, *, besides: str | None = None) -> int:
@@ -1905,7 +2019,10 @@ class CollaborationStore:
         reactivated, when it holds the role's capabilities again. The
         workspace always keeps an active owner. Without ``owner_ok`` the
         change may neither touch an owner nor grant the owner role
-        (``owner_required``).
+        (``owner_required``). Deactivation takes the user out of every
+        channel and withdraws the invites they created; a demotion
+        withdraws those above the new role. All of it lands in the one
+        transaction.
         """
         role = None if role is None else _role(role)
         with self.dstore.transaction() as session:
@@ -1921,6 +2038,7 @@ class CollaborationStore:
             if losing_owner and not self._owner_count(session, besides=user_id):
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
             data: dict[str, Any] = {"user_id": user_id}
+            previous = _role(str(row.role))
             if role is not None:
                 row.role = role
                 data["role"] = role
@@ -1933,6 +2051,15 @@ class CollaborationStore:
             if not user.active:
                 self._revoke_refresh(session, str(user.client_id), now)
             session.flush()
+            if active is False:
+                self._end_channel_memberships(session, user_id, now)
+                self._revoke_invites(
+                    session, user_id, now, reason="creator_deactivated", actor=actor
+                )
+            elif _outranks(previous, current):
+                self._revoke_invites(
+                    session, user_id, now, reason="creator_demoted", actor=actor, above=current
+                )
             _event(session, "workspace.member.updated", now, actor=actor, data=data)
             return _member(user, row)
 
@@ -1944,7 +2071,9 @@ class CollaborationStore:
         actor: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
-        """End a membership; the user's API client keeps no capability.
+        """End a membership; the user's API client keeps no capability, they
+        are out of every channel and the invites they created are withdrawn,
+        all in one transaction, so a later invite starts them from nothing.
         Without ``owner_ok`` an owner cannot be removed (``owner_required``)."""
         with self.dstore.transaction() as session:
             row = self._member_row(session, user_id)
@@ -1956,11 +2085,14 @@ class CollaborationStore:
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
             role = str(row.role)
             session.delete(row)
+            session.flush()
             user = session.get(LocalUserRow, user_id)
             if user is not None:
                 self._grant_role(session, user, None)
                 if now is not None:
                     self._revoke_refresh(session, str(user.client_id), now)
+            self._end_channel_memberships(session, user_id, now)
+            self._revoke_invites(session, user_id, now, reason="creator_removed", actor=actor)
             if now is not None:
                 _event(
                     session,
@@ -2045,10 +2177,8 @@ class CollaborationStore:
             user = session.get(LocalUserRow, user_id)
             if user is None:
                 raise CollaborationError("user_not_found", "user not found")
-            invite = self._open_invite(session, raw_token, now, email=str(user.email))
-            member = self._insert_member(
-                session, user_id, _role(str(invite.role)), str(invite.created_by), now
-            )
+            invite, role = self._open_invite(session, raw_token, now, email=str(user.email))
+            member = self._insert_member(session, user_id, role, str(invite.created_by), now)
             invite.accepted_at = now
             _event(
                 session,
@@ -2328,14 +2458,12 @@ class CollaborationStore:
                     "channel_member_not_found", "the user is not in this channel"
                 )
             if row.role == "owner":
-                others = list(
-                    session.scalars(
-                        select(ChannelMemberRow.role).where(
-                            ChannelMemberRow.channel_id == channel_id,
-                            ChannelMemberRow.user_id != user_id,
-                        )
+                others = [
+                    str(other.role)
+                    for other in session.scalars(
+                        _standing_members(channel_id).where(ChannelMemberRow.user_id != user_id)
                     )
-                )
+                ]
                 if others and "owner" not in others:
                     raise CollaborationError(
                         "last_channel_owner",
@@ -2878,16 +3006,27 @@ class CollaborationStore:
         chain_depth: int,
         now: float,
     ) -> Turn | None:
-        """Accept a turn one agent started by addressing another.
+        """Accept a turn one agent started by addressing another, or by
+        volunteering on a message nobody sent it.
 
-        No new message is appended: the agent's own reply, named by
-        ``source_message_id``, is the turn's input. ``None`` when the
-        channel is gone.
+        No new message is appended: the message named by
+        ``source_message_id`` is the turn's input. ``None`` when the channel
+        is gone or silenced, or when ``parent_turn_id`` names a turn that is
+        no longer live: those are decided here, inside the transaction, and
+        not only by the guardrails earlier, because a stop or a cancel that
+        lands while the follow-up is still being decided (a relevance call
+        in flight) has to win over it.
         """
         with self.dstore.immediate_transaction() as session:
             channel = session.get(ChannelRow, channel_id)
             if channel is None or channel.state != "active":
                 return None
+            if channel.silenced_until is not None and float(channel.silenced_until) > now:
+                return None
+            if parent_turn_id is not None:
+                parent = session.get(TurnRow, parent_turn_id)
+                if parent is None or parent.status not in {"accepted", "running"}:
+                    return None
             turn_id = "trn_" + _token(16)
             session.execute(
                 insert(TurnRow).values(
@@ -3891,10 +4030,20 @@ class CollaborationStore:
                 message = session.get(MessageRow, row.input_message_id)
                 stored_origin = message.origin_json if message is not None else None
                 origin = json.loads(stored_origin) if stored_origin else None
-                if row.author_kind == "human" and row.author_id is None and origin:
-                    # A guest on a linked surface: the turn runs for the same
-                    # stand-in it would have run for live, never for the
-                    # channel's owner, whose identity would answer a stranger.
+                guest_input = bool(origin) and (
+                    (row.author_kind == "human" and row.author_id is None)
+                    or (
+                        message is not None
+                        and message.author_kind == "human"
+                        and message.author_id is None
+                    )
+                )
+                if guest_input:
+                    # A guest on a linked surface, or an agent's own turn on
+                    # the guest's message (a listener that volunteered): the
+                    # turn runs for the same stand-in it would have run for
+                    # live, never for the channel's owner, whose identity
+                    # would answer a stranger.
                     if channel and channel.state == "active" and message:
                         queued.append(
                             (
