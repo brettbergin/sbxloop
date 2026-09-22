@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**A run the daemon lands is finished before its follow-ups are filed, so a
+restart during the filing pass leaves nothing parked.** Approving a merge
+gate or a review wait filed the run's follow-up issues between resolving
+the gate and marking the item done. That pass is network work (paging the
+repository's issues, one create per follow-up, a PR comment), and a
+restart, a crash or a stop whose grace ran out in the middle of it left a
+merged pull request with an item still `gated` or `awaiting_review`:
+recovery only settles open gates and holds and running items, the merged
+report was never delivered, the tracker issue kept its awaiting-merge
+label, and approving again was refused as already merged. The item is now
+marked done, its ledger closed and its report delivered before any
+follow-up is filed; the filing itself is unchanged and stays best-effort
+and idempotent.
+
 **A channel summary the daemon gives up on no longer holds the concierge
 pool.** The compaction job abandons a summary after its timeout, or when
 the daemon is stopping, but left the model call queued: at the default

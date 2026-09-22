@@ -3987,12 +3987,14 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("review.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_review_hold(run_id, "merged", by, now)
-            self._file_followups(run_id, item_id, hold.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            # The item is finished and recoverable before any network work
+            # (#1268): a restart during the filing pass leaves nothing gated.
+            self._file_followups(run_id, item_id, hold.repo)
             self._chronicle_landed(fresh, run_id, hold.pr_number, hold.pr_url or None)
             self._notice(
                 "run.done",
@@ -4225,12 +4227,14 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("gate.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_merge_gate(run_id, "merged", by, now)
-            self._file_followups(run_id, item_id, gate.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            # The item is finished and recoverable before any network work
+            # (#1268): a restart during the filing pass leaves nothing gated.
+            self._file_followups(run_id, item_id, gate.repo)
             if item is not None:
                 self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
             self._chronicle_landed(fresh or item, run_id, gate.pr_number, gate.pr_url or None)
@@ -4285,7 +4289,11 @@ class DaemonLoop:
         that one could not (a GitHub failure, a restart) and is idempotent
         against it: the run's ``followup`` rows and the issue markers on the
         repository mean nothing is filed twice. Best-effort: the PR is
-        merged, so a failure here is logged, never raised."""
+        merged, so a failure here is logged, never raised. It runs only once
+        the item is done, its ledger closed and its report delivered
+        (#1268): the pass pages through the repository's issues and creates
+        one per follow-up, and a restart in the middle of that must not
+        leave a merged item parked, which recovery would never settle."""
         assert self.github is not None
         try:
             item = self.dstore.get(item_id)
