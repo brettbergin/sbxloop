@@ -17,7 +17,7 @@ import functools
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -841,11 +841,21 @@ class ApiContext:
             # The channel's own files, for every participant: a read-only
             # critic reviewing a delivered file has to be able to read it.
             channel_tools = self._channel_tools(turn.channel_id)
+            # How deep the work this participant does sits: the turn's own
+            # chain depth (0 for a person's), plus one hop per handoff
+            # between the participant the person addressed and this one.
+            depth = turn.chain_depth + int(participant.get("depth") or 0)
+            # Whether an agent whose starts answer to its own guardrails
+            # handed off, directly or through peers, to this participant.
+            guarded_start = self._handoff_guarded(participants, index)
             if not read_only:
                 # An agent whose spec declares `can_start` may put work in
-                # the queue itself, on behalf of whoever asked (S-A12). A
-                # read-only turn, and every built-in, gets nothing new.
-                agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
+                # the queue itself, on behalf of whoever asked (S-A12), one
+                # hop deeper than the work it is doing now. A read-only
+                # turn, and every built-in, gets nothing new.
+                agent_tools += self._agent_work(
+                    definition, turn.channel_id, on_behalf_of=author, depth=depth
+                )
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
             model = definition.agent.spec.model if definition and definition.agent else None
@@ -958,6 +968,7 @@ class ApiContext:
                     history=store.turn_history(turn),
                     agent_role=definition.role if definition else "concierge",
                     read_only=read_only,
+                    guarded_start=guarded_start,
                     handoff=handoff if may_handoff else None,
                     on_tool_activity=tool_activity,
                     on_code_work=code_work,
@@ -1362,12 +1373,17 @@ class ApiContext:
         channel_id: str,
         *,
         on_behalf_of: str | None,
+        depth: int = 0,
     ) -> tuple[AgentTool, ...]:
         """``start_run`` and ``file_issue`` for a mentioned agent whose spec
-        declares ``can_start`` (S-A12). A turn is depth 0 -- a person asked
-        for it -- so what the agent starts from here is depth 1. A
-        daemon-less context, or an agent that declares nothing, brings
-        nothing, so the shipped team's turns are unchanged."""
+        declares ``can_start`` (S-A12). ``depth`` is how deep the work the
+        agent is doing now sits: a turn a person asked for is depth 0, so
+        what the agent it addressed starts is depth 1, and a peer that
+        agent handed off to is one hop deeper again, so ``[agent_team]
+        max_chain_depth`` counts handoffs as the hops they are. A chat turn
+        answers no work item of its own, so what it starts has no parent
+        item. A daemon-less context, or an agent that declares nothing,
+        brings nothing, so the shipped team's turns are unchanged."""
         agent = definition.agent if definition is not None else None
         if agent is None or self.loop is None or not work_granted(agent):
             return ()
@@ -1379,13 +1395,38 @@ class ApiContext:
                     agent,
                     channel_id=channel_id,
                     parent_item_id=None,
-                    parent_depth=0,
+                    parent_depth=depth,
                     on_behalf_of=on_behalf_of,
                 )
             )
         except Exception:
             log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
             return ()
+
+    def _handoff_guarded(self, participants: Sequence[Mapping[str, Any]], index: int) -> bool:
+        """Whether the participant at ``index`` was handed off to, directly
+        or through other peers, by an agent whose starts answer to the
+        agent-team guardrails (one offered ``start_run`` / ``file_issue``).
+
+        Such an agent is never offered the concierge's own start tools, which
+        check none of its ``can_start``, chain depth, daily cap or dedupe;
+        a peer it hands off to is not offered them either, whatever that
+        peer declares, or a handoff would grant the peer more starting power
+        than the agent that handed off had.
+        """
+        seen: set[int] = set()
+        current = participants[index]
+        while current.get("parent_index") is not None:
+            parent_index = int(current["parent_index"])
+            if parent_index in seen or not 0 <= parent_index < len(participants):
+                break
+            seen.add(parent_index)
+            current = participants[parent_index]
+            slug = current.get("agent_slug")
+            source = self.agents.get(str(slug)) if slug else None
+            if source is not None and work_granted(source):
+                return True
+        return False
 
     def _chat_principal(self, user: LocalUser, author: str) -> Principal:
         """The person behind a chat turn, holding what their workspace role

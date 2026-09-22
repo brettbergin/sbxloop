@@ -217,6 +217,11 @@ class TurnContext:
     start_work: bool = True
     role: Role = "concierge"
     read_only: bool = False
+    #: The turn descends, through handoffs, from an agent whose starts
+    #: answer to the agent-team guardrails (its ``can_start``): the
+    #: concierge's own start tools, which check none of them, are withheld
+    #: from it as they are from that agent.
+    guarded_start: bool = False
     handoff: Callable[[str, str], str] | None = None
     #: The agents ``handoff_agent`` offers; ``None`` offers the built-ins.
     handoff_agents: tuple[str, ...] | None = None
@@ -570,6 +575,10 @@ class Concierge:
         return self._turn.read_only
 
     @property
+    def _turn_guarded_start(self) -> bool:
+        return self._turn.guarded_start
+
+    @property
     def _turn_handoff(self) -> Callable[[str, str], str] | None:
         return self._turn.handoff
 
@@ -651,6 +660,7 @@ class Concierge:
         history: str | None = None,
         agent_role: Role = "concierge",
         read_only: bool = False,
+        guarded_start: bool = False,
         handoff: Callable[[str, str], str] | None = None,
         on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
         on_code_work: Callable[[str, int, str], None] | None = None,
@@ -683,7 +693,10 @@ class Concierge:
         it answers and the agent that speaks (the role when unset);
         ``agent_tools`` are the answering agent's own tools (its memory),
         offered only when the turn may act. ``start_work`` false withholds
-        the tools that start managed work, so the turn can only reply.
+        the tools that start managed work, so the turn can only reply;
+        ``guarded_start`` withholds only the concierge's own start tools,
+        for a turn an agent with ``can_start`` handed off to, so the
+        handoff is not the way round that agent's guardrails.
         ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
         this turn starts is admitted with: the channel it answers to, the
         lead and the agent per run role (already checked by the caller).
@@ -714,6 +727,7 @@ class Concierge:
                 start_work=start_work,
                 role=agent_role,
                 read_only=read_only,
+                guarded_start=guarded_start,
                 handoff=handoff,
                 handoff_agents=None if handoff_agents is None else tuple(handoff_agents),
                 model_override=model,
@@ -1381,11 +1395,15 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
-        if any(tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools):
+        if self._turn_guarded_start or any(
+            tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools
+        ):
             # An agent offered its own guarded start_run / file_issue starts
             # work only through them: these check none of its can_start,
             # chain depth, daily cap or dedupe, so leaving them beside the
-            # guarded pair would make every one of those a suggestion.
+            # guarded pair would make every one of those a suggestion. A
+            # peer such an agent handed off to is not offered them either,
+            # or the handoff would be the way round the same guardrails.
             for name in UNGUARDED_START_TOOLS:
                 available.pop(name, None)
         for tool in self._turn_agent_tools:
