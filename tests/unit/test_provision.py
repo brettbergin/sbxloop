@@ -13,7 +13,9 @@ from sbxloop.errors import ProvisionError
 from sbxloop.events import Event, EventBus
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.provision import Provisioner, sandbox_name
+from sbxloop.sbx.models import SandboxRole
+from sbxloop.sbx.naming import run_name
+from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import WORK_DIR
 from tests.conftest import FakeSbx
 
@@ -50,6 +52,10 @@ def make_provisioner(
     )
 
 
+def run_box(fake_sbx: FakeSbx, run_id: str, role: SandboxRole) -> str:
+    return run_name(SbxloopHome(fake_sbx.state.parent / "state"), run_id, role)
+
+
 class TestSpecs:
     def test_allocation_mismatch_refuses_the_entire_reused_pair_before_mutation(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -64,14 +70,14 @@ class TestSpecs:
         assert not any(
             call[0] in ("create", "rm", "secret", "policy", "cp", "exec") for call in after
         )
-        assert fake_sbx.meta("sbxloop-r1-agent")["cpus"] == 6
-        assert fake_sbx.meta("sbxloop-r1-agent")["memory"] == "12g"
+        assert fake_sbx.meta(run_box(fake_sbx, "r1", "agent"))["cpus"] == 6
+        assert fake_sbx.meta(run_box(fake_sbx, "r1", "agent"))["memory"] == "12g"
 
     def test_build_specs_roles_and_domains(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         agent, github = provisioner.build_specs("r1", tmp_path)
-        assert agent.name == "sbxloop-r1-agent"
-        assert github.name == "sbxloop-r1-github"
+        assert agent.name == run_box(fake_sbx, "r1", "agent")
+        assert github.name == run_box(fake_sbx, "r1", "github")
         assert "api.githubcopilot.com" in agent.policy_allows
         assert "uploads.github.com" in github.policy_allows
         # The prompt-advertised baseline (PyPI + apt mirrors) is granted to
@@ -200,9 +206,9 @@ class TestGithubGating:
         pair = provisioner.ensure_pair("r1")
         try:
             assert pair.github is None
-            assert pair.agent.name == sandbox_name("r1", "agent")
+            assert pair.agent.name == run_box(fake_sbx, "r1", "agent")
             created = [c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")]
-            assert created == [sandbox_name("r1", "agent")]
+            assert created == [run_box(fake_sbx, "r1", "agent")]
         finally:
             pair.cleanup()
 
@@ -243,8 +249,8 @@ class TestEnsurePair:
 
         pair = provisioner.ensure_pair("r1")
         try:
-            assert pair.agent.name == sandbox_name("r1", "agent")
-            assert pair.github.name == sandbox_name("r1", "github")
+            assert pair.agent.name == run_box(fake_sbx, "r1", "agent")
+            assert pair.github.name == run_box(fake_sbx, "r1", "github")
 
             # both sandboxes exist and are running
             assert fake_sbx.meta(pair.agent.name)["status"] == "running"
@@ -377,8 +383,8 @@ class TestEnsurePair:
         pair = provisioner.ensure_pair("r1")
         pair.cleanup()
         assert sorted(seen) == [
-            ("sbxloop-r1-agent", "agent"),
-            ("sbxloop-r1-github", "github"),
+            (run_box(fake_sbx, "r1", "agent"), "agent"),
+            (run_box(fake_sbx, "r1", "github"), "github"),
         ]
 
     def test_pair_provisions_concurrently(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
@@ -397,12 +403,16 @@ class TestEnsurePair:
     def test_rollback_on_secret_failure(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         # the github sandbox's secret application fails after both creates
-        fake_sbx.fail_next("secret set sbxloop-r1-github", returncode=1, stderr="keychain locked")
+        fake_sbx.fail_next(
+            f"secret set {run_box(fake_sbx, 'r1', 'github')}",
+            returncode=1,
+            stderr="keychain locked",
+        )
         with pytest.raises(ProvisionError, match="provisioning run r1 failed"):
             provisioner.ensure_pair("r1")
         # everything created so far was rolled back
-        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
-        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-github").exists()
+        assert not (fake_sbx.state / "sandboxes" / run_box(fake_sbx, "r1", "agent")).exists()
+        assert not (fake_sbx.state / "sandboxes" / run_box(fake_sbx, "r1", "github")).exists()
         # ...including the agent's custom-secret registration, which would
         # otherwise be left owned by the now-deleted sandbox scope
         assert self.registered_custom_secrets(fake_sbx) == {}
@@ -428,7 +438,7 @@ class TestEnsurePair:
         # both sandboxes' secrets land; the github probe then dies at the
         # sbx level twice, which fails provisioning loudly
         fake_sbx.script(
-            "exec sbxloop-r1-github sh -lc v=",
+            f"exec {run_box(fake_sbx, 'r1', 'github')} sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -843,11 +853,15 @@ class TestSecretIdempotency:
         pair = provisioner.ensure_pair("r1")
         state = self.secret_state(fake_sbx)
         assert "COPILOT_GITHUB_TOKEN" in state["custom"]
-        assert any(k.startswith("sbxloop-r1-github|") for k in state["service"])
+        assert any(k.startswith(run_box(fake_sbx, "r1", "github") + "|") for k in state["service"])
         pair.cleanup()
         state = self.secret_state(fake_sbx)
         assert state["custom"] == {}
-        assert not any(k.startswith("sbxloop-r1-") for k in state["service"])
+        assert not any(
+            k.startswith(run_box(fake_sbx, "r1", role) + "|")
+            for k in state["service"]
+            for role in ("agent", "github")
+        )
 
     def test_reprovision_replaces_secret_owned_by_old_scope(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -866,12 +880,13 @@ class TestSecretIdempotency:
         try:
             state = self.secret_state(fake_sbx)
             entry = state["custom"]["COPILOT_GITHUB_TOKEN"]
-            assert entry["scope"] == "sbxloop-r2-agent"  # replaced, new owner
+            assert entry["scope"] == run_box(fake_sbx, "r2", "agent")  # replaced, new owner
             assert entry["value"] == "github_pat_copilot"
             # the rm targeted the OLD run's scope, parsed from the error
             rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
             assert any(
-                "--sandbox" in a and a[a.index("--sandbox") + 1] == "sbxloop-r1-agent" for a in rms
+                "--sandbox" in a and a[a.index("--sandbox") + 1] == run_box(fake_sbx, "r1", "agent")
+                for a in rms
             )
             # every removal is forced: without -f sbx 0.38 prompts, cancels
             # non-interactively, and exits 0 having removed nothing
@@ -897,7 +912,10 @@ class TestSecretIdempotency:
         pair = provisioner2.ensure_pair("r1")
         try:
             state = self.secret_state(fake_sbx)
-            assert state["service"]["sbxloop-r1-github|github"] == "github_pat_rotated"
+            assert (
+                state["service"][run_box(fake_sbx, "r1", "github") + "|github"]
+                == "github_pat_rotated"
+            )
         finally:
             pair.cleanup()
 
@@ -992,7 +1010,7 @@ class TestSecretEnvVerification:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         # every probe attempt (including the retry) dies at the sbx level
         fake_sbx.script(
-            "exec sbxloop-r1-agent sh -lc v=",
+            f"exec {run_box(fake_sbx, 'r1', 'agent')} sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -1012,8 +1030,8 @@ class TestSecretEnvVerification:
         assert [e.data["env"] for e in errors] == ["COPILOT_GITHUB_TOKEN"]
         # rollback removed everything the attempt created — including the
         # github sandbox whose own provisioning succeeded
-        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
-        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-github").exists()
+        assert not (fake_sbx.state / "sandboxes" / run_box(fake_sbx, "r1", "agent")).exists()
+        assert not (fake_sbx.state / "sandboxes" / run_box(fake_sbx, "r1", "github")).exists()
 
     def test_transient_probe_error_retries_to_a_clean_answer(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1023,7 +1041,7 @@ class TestSecretEnvVerification:
         # first probe attempt hits a transient sbx failure; the retry gets
         # the real fake's clean "invisible" answer -> normal fallback
         fake_sbx.fail_next(
-            "exec sbxloop-r1-agent sh -lc v=",
+            f"exec {run_box(fake_sbx, 'r1', 'agent')} sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -1104,7 +1122,7 @@ class TestSecretEnvVerification:
     ) -> None:
         # the probe answers 0 (usable), 1 (unset) or 3 (sentinel); anything
         # else is not an answer
-        fake_sbx.script("exec sbxloop-r1-agent sh -lc v=", returncode=5)
+        fake_sbx.script(f"exec {run_box(fake_sbx, 'r1', 'agent')} sh -lc v=", returncode=5)
         provisioner = make_provisioner(fake_sbx, tmp_path)
         with pytest.raises(ProvisionError, match="without a clean answer"):
             provisioner.ensure_pair("r1")
@@ -1183,7 +1201,11 @@ class TestMountDiscovery:
         from sbxloop.sbx.conformance import PROBE_WORKSPACE_MOUNT, load_verdicts
 
         # sbx-level failure of the find probe must degrade, not abort the run
-        fake_sbx.script("exec sbxloop-r1-agent sh -c set --", returncode=1, stderr="not found")
+        fake_sbx.script(
+            f"exec {run_box(fake_sbx, 'r1', 'agent')} sh -c set --",
+            returncode=1,
+            stderr="not found",
+        )
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)
@@ -1230,7 +1252,10 @@ class TestMountExpected:
         with pytest.raises(ProvisionError) as info:
             provisioner.ensure_pair("r1")
         message = str(info.value)
-        assert "was not visible inside the agent sandbox sbxloop-r1-agent" in message
+        assert (
+            f"was not visible inside the agent sandbox {run_box(fake_sbx, 'r1', 'agent')}"
+            in message
+        )
         assert "found no marker under any candidate root" in message
         assert "sbxloop doctor" in message
         # The pair is torn down: nothing is left for `sandbox prune`.
@@ -1248,7 +1273,11 @@ class TestMountExpected:
     ) -> None:
         """Could not tell is not "not mounted": the probe's own failure is
         what the message names, so field debugging chases the right cause."""
-        fake_sbx.script("exec sbxloop-r1-agent sh -c set --", returncode=1, stderr="find: boom")
+        fake_sbx.script(
+            f"exec {run_box(fake_sbx, 'r1', 'agent')} sh -c set --",
+            returncode=1,
+            stderr="find: boom",
+        )
         provisioner, events = self.configured(fake_sbx, tmp_path)
         with pytest.raises(ProvisionError, match="mount discovery probe failed") as info:
             provisioner.ensure_pair("r1")
@@ -1650,27 +1679,27 @@ class TestPurgeStaleRegistrations:
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         TestGithubAppAuth().stub_mint(monkeypatch)
-        self.stale_github_registration(fake_sbx, "sbxloop-r1-github")
+        self.stale_github_registration(fake_sbx, run_box(fake_sbx, "r1", "github"))
         provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
         pair = provisioner.ensure_pair("r1")
         try:
-            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            rm, create = self.indices(fake_sbx, run_box(fake_sbx, "r1", "github"))
             assert rm is not None and rm < create
             import json
 
             state_path = fake_sbx.state / "secrets-state.json"
             state = json.loads(state_path.read_text())
-            assert "sbxloop-r1-github|github" not in state.get("service", {})
+            assert run_box(fake_sbx, "r1", "github") + "|github" not in state.get("service", {})
         finally:
             pair.cleanup()
 
     def test_cached_verdict_mode_purges_too(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         TestCachedProxyVerdictSkip().seed_broken_verdict(tmp_path)
-        self.stale_github_registration(fake_sbx, "sbxloop-r1-github")
+        self.stale_github_registration(fake_sbx, run_box(fake_sbx, "r1", "github"))
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:
-            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            rm, create = self.indices(fake_sbx, run_box(fake_sbx, "r1", "github"))
             assert rm is not None and rm < create
         finally:
             pair.cleanup()
@@ -1683,7 +1712,7 @@ class TestPurgeStaleRegistrations:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:
-            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            rm, create = self.indices(fake_sbx, run_box(fake_sbx, "r1", "github"))
             assert rm is None or rm > create
         finally:
             pair.cleanup()
@@ -1893,7 +1922,7 @@ class TestStdinEnvDelivery:
     def _env_files(self, fake_sbx: FakeSbx) -> list[Path]:
         return [
             fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/env.sh"
-            for name in ("sbxloop-r1-agent", "sbxloop-r1-github")
+            for name in (run_box(fake_sbx, "r1", "agent"), run_box(fake_sbx, "r1", "github"))
         ]
 
     def test_fallback_delivers_via_stdin_when_probe_passes(
@@ -1972,7 +2001,7 @@ class TestStdinEnvDelivery:
 
         provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
         monkeypatch.setattr(provisioner, "_cached_verdict", lambda probe_id: VERDICT_STDIN_DELIVERS)
-        sandbox = _Sandbox(provisioner.cli, "sbxloop-r1-github")
+        sandbox = _Sandbox(provisioner.cli, run_box(fake_sbx, "r1", "github"))
         assert provisioner.gh_refresher(sandbox, "owner/repo") is None
 
 
@@ -2080,7 +2109,9 @@ class TestClaudeAgentBackend:
     ) -> None:
         provisioner = self._provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1")
-        env_file = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        env_file = (
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/env.sh"
+        )
         content = env_file.read_text()
         assert "ANTHROPIC_API_KEY=sk-ant-claude-agent-key" in content
         assert "SBXLOOP_WORKER_BACKEND=claude" in content
@@ -2131,11 +2162,13 @@ class TestOperatorSandboxEnv:
         provisioner = self._provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1", repo="owner/repo")
         env_sh = (
-            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/env.sh"
         ).read_text()
         assert "export RAILS_ENV=test\n" in env_sh
         assert "export GREETING='hello world'\n" in env_sh
-        github_sh = fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.sbxloop/env.sh"
+        github_sh = (
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "github")) / "home/agent/.sbxloop/env.sh"
+        )
         if github_sh.exists():
             assert "RAILS_ENV" not in github_sh.read_text()
 
@@ -2145,7 +2178,9 @@ class TestOperatorSandboxEnv:
         monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
         provisioner = self._provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1", repo="owner/repo")
-        env_sh = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        env_sh = (
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/env.sh"
+        )
         assert "export RAILS_ENV=test\n" in env_sh.read_text()
         provider = provisioner.job_env("agent", "owner/repo")
         assert provider is not None
@@ -2164,7 +2199,7 @@ class TestOperatorSandboxEnv:
         assert agent.persistent_env == {"GOFLAGS": "-mod=vendor"}
         provisioner.ensure_pair("r1", repo="owner/repo")
         env_sh = (
-            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/env.sh"
         ).read_text()
         assert "GOFLAGS=-mod=vendor" in env_sh
         assert "RAILS_ENV" not in env_sh
@@ -2276,7 +2311,7 @@ class TestPrivateRegistries:
             pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
         assert pair.service is not None and pair.service_workdir is None
 
-        service_home = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent"
+        service_home = fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "service")) / "home/agent"
         assert not (service_home / ".npmrc").exists()
         assert not (service_home / ".netrc").exists()
         service_sh = (service_home / ".sbxloop/env.sh").read_text()
@@ -2290,7 +2325,7 @@ class TestPrivateRegistries:
         chmods = [c for c in fake_sbx.invocations("exec") if "chmod" in c and ".netrc" in c[-1]]
         assert chmods == []
 
-        agent_home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
+        agent_home = fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent"
         assert not (agent_home / ".npmrc").exists()
         assert not (agent_home / ".netrc").exists()
         agent_sh = (agent_home / ".sbxloop/env.sh").read_text()
@@ -2309,7 +2344,9 @@ class TestPrivateRegistries:
         for event in events:
             assert self.SECRET not in repr(event.data), event
         assert all(self.SECRET not in record.getMessage() for record in caplog.records)
-        assert not (fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.netrc").exists()
+        assert not (
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "github")) / "home/agent/.netrc"
+        ).exists()
 
     def test_only_the_agent_gets_the_cache_link_and_it_is_never_committed(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -2322,14 +2359,16 @@ class TestPrivateRegistries:
         pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
         cache = workspace / ".sbxloop" / "deps"
         assert cache.is_dir()
-        link = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/deps"
+        link = fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/deps"
         assert link.is_symlink()
         assert Path(link.readlink()).resolve() == cache.resolve()
-        service_link = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent/.sbxloop/deps"
+        service_link = (
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "service")) / "home/agent/.sbxloop/deps"
+        )
         assert not service_link.exists() and not service_link.is_symlink()
         assert ".sbxloop/" in (workspace / ".git/info/exclude").read_text().splitlines()
         (event,) = [e for e in events if e.type == "sandbox.deps_cache"]
-        assert event.data["name"] == "sbxloop-r1-agent"
+        assert event.data["name"] == run_box(fake_sbx, "r1", "agent")
         assert event.data["workdir"] == pair.agent_workdir
 
     def test_agent_dependency_preparation_requires_the_workspace(
@@ -2372,9 +2411,9 @@ class TestPrivateRegistries:
         pair = provisioner.ensure_pair("r1", repo="owner/repo")
         assert pair.service is None
         created = {c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")}
-        assert created == {"sbxloop-r1-agent", "sbxloop-r1-github"}
+        assert created == {run_box(fake_sbx, "r1", "agent"), run_box(fake_sbx, "r1", "github")}
         agent_sh = (
-            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+            fake_sbx.sandbox_fs(run_box(fake_sbx, "r1", "agent")) / "home/agent/.sbxloop/env.sh"
         ).read_text()
         assert "export GOPRIVATE=github.example.com\n" in agent_sh
         assert "GOPROXY=off" not in agent_sh

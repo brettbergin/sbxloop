@@ -12,11 +12,11 @@ from sbxloop.config import Config
 from sbxloop.errors import ProvisionError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import run_name
 from sbxloop.sbx.provision import (
     GhPat,
     Provisioner,
     github_policy_allows,
-    sandbox_name,
     sandbox_name_candidates,
 )
 from tests.conftest import FakeSbx
@@ -74,8 +74,7 @@ class TestSpec:
             fake_sbx, tmp_path, {"GITLAB_TOKEN": "glpat-x", "COPILOT_GITHUB_TOKEN": "c"}
         )
         _agent, github = provisioner.build_specs("r1", tmp_path)
-        assert github.name == "sbxloop-r1-gitlab"
-        assert github.name == sandbox_name("r1", "github", vcs_kind="gitlab")
+        assert github.name == run_name(provisioner.config.paths, "r1", "github", vcs_kind="gitlab")
         assert github.secrets == []
         assert github.forge_token_envs == ["GITLAB_TOKEN"]
         assert "gitlab.example.com" in github.policy_allows

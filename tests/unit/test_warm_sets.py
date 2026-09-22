@@ -18,6 +18,7 @@ from sbxloop.errors import ProvisionError
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxInfo
+from sbxloop.sbx.naming import is_managed_name
 from sbxloop.sbx.prune import classify_sandboxes
 from sbxloop.sbx.warm import Warmer, WarmRegistry, warm_fingerprint
 from sbxloop.worker.client import WorkerClient
@@ -57,7 +58,12 @@ class TestFilling:
         w = warmer(fake_sbx, config(tmp_path))
         warm = w.fill_one()
         assert warm is not None and warm.state == "ready"
-        assert warm.names == [f"sbxloop-{warm.run_id}-agent", f"sbxloop-{warm.run_id}-github"]
+        from sbxloop.sbx.naming import run_name
+
+        assert warm.names == [
+            run_name(w.config.paths, warm.run_id, "agent"),
+            run_name(w.config.paths, warm.run_id, "github"),
+        ]
         listed = {info.name for info in w.cli.ls()}
         assert set(warm.names) <= listed
         # Recorded for the next daemon (and for prune) to find.
@@ -98,7 +104,7 @@ class TestFilling:
         w = warmer(fake_sbx, config(tmp_path), install_workers=True)
         assert w.fill_one() is None
         assert w.sets() == []
-        assert not any(info.name.startswith("sbxloop-r") for info in w.cli.ls())
+        assert not any(is_managed_name(info.name) for info in w.cli.ls())
 
 
 class TestClaiming:
@@ -256,17 +262,23 @@ class TestEngine:
 class TestPrune:
     def test_a_warm_set_is_not_an_orphan(self, tmp_path: Path) -> None:
         from sbxloop.engine.store import StateStore
+        from sbxloop.paths import SbxloopHome
+        from sbxloop.sbx.naming import run_name
 
         warm_id, cold_id = new_run_id(), new_run_id()
+        home = SbxloopHome(tmp_path)
         store = StateStore(tmp_path / "state.db")
         try:
             infos = [
-                SandboxInfo(name=f"sbxloop-{warm_id}-agent", status="running"),
-                SandboxInfo(name=f"sbxloop-{cold_id}-agent", status="running"),
+                SandboxInfo(name=run_name(home, warm_id, "agent"), status="running"),
+                SandboxInfo(name=run_name(home, cold_id, "agent"), status="running"),
             ]
-            verdicts = {v.name: v for v in classify_sandboxes(infos, store, warm_run_ids={warm_id})}
+            verdicts = {
+                v.name: v
+                for v in classify_sandboxes(infos, store, warm_run_ids={warm_id}, home=home)
+            }
         finally:
             store.close()
-        assert not verdicts[f"sbxloop-{warm_id}-agent"].orphan
-        assert "warm" in verdicts[f"sbxloop-{warm_id}-agent"].reason
-        assert verdicts[f"sbxloop-{cold_id}-agent"].orphan
+        assert not verdicts[run_name(home, warm_id, "agent")].orphan
+        assert "warm" in verdicts[run_name(home, warm_id, "agent")].reason
+        assert verdicts[run_name(home, cold_id, "agent")].orphan

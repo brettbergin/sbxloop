@@ -24,13 +24,15 @@ For a first run, start with the [README](../README.md).
 Every run gets an isolated microVM agent sandbox — plus, when a repository
 integration is configured, a second VCS-ops sandbox named for its forge, so no
 single environment ever holds both credentials. In the table, `<forge>` is
-`github`, `gitlab` or `gitea`:
+`github`, `gitlab` or `gitea`. `<instance>` is an eight-character ID derived
+from the resolved sbxloop home path, so separate homes sharing sbx state have
+distinct names. Existing `sbxloop-` names remain usable during migration:
 
-| Sandbox                 | Credential                                                                                                                                                                                                                                                                                                           | Purpose                                                                                                                                                                                                                                                              |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission), `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex, or the variable `[agent.openai] api_key_env` names for an OpenAI-compatible endpoint ([Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)) | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK, the Python Codex SDK, or the `openai` client against the endpoint you name. All model calls and tool executions happen inside this VM. |
-| `sbxloop-<run>-<forge>` | The configured forge token; on GitHub, `GH_TOKEN` or a host-minted, auto-refreshed App installation token ([GitHub App auth](#github-app-auth))                                                                                                                                                                      | Performs forge operations (branch, change, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when a repository is declared.                                                                                           |
-| `sbxloop-<run>-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                                                                                                                                    | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today.                           |
+| Sandbox                                        | Credential                                                                                                                                                                                                                                                                                                           | Purpose                                                                                                                                                                                                                                                              |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxl-<instance>-<run>-run-agent`              | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission), `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex, or the variable `[agent.openai] api_key_env` names for an OpenAI-compatible endpoint ([Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)) | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK, the Python Codex SDK, or the `openai` client against the endpoint you name. All model calls and tool executions happen inside this VM. |
+| `sbxl-<instance>-<run>-run-vcs-<forge>`        | The configured forge token; on GitHub, `GH_TOKEN` or a host-minted, auto-refreshed App installation token ([GitHub App auth](#github-app-auth))                                                                                                                                                                      | Performs forge operations (branch, change, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when a repository is declared.                                                                                           |
+| `sbxl-<instance>-<run>-run-credential-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                                                                                                                                    | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today.                           |
 
 The rule behind the table: **the only key in an agent sandbox is its inference
 key.** Everything else that needs a secret happens in a separate sandbox that
@@ -1896,7 +1898,7 @@ listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
 line under your question, so nothing happens invisibly. Steering a live
 run still happens by @mentioning the bot in that run's thread; asked from
 the control channel, the concierge points at the thread. It runs as a Copilot session in a
-**long-lived agent sandbox** the daemon owns (`sbxloop-concierge-<digest>`,
+**long-lived agent sandbox** the daemon owns (`sbxl-<instance>-daemon-chat-concierge`,
 reused across daemon restarts so the conversation keeps its memory; the
 SDK session is rotated after `[concierge] session_turns` messages) and
 reaches the daemon only through host tools — the same
@@ -3142,11 +3144,18 @@ sbxloop sandbox prune            # dry run: classify every sbxloop sandbox
 sbxloop sandbox prune --force    # actually remove the orphan candidates
 ```
 
+`sbxloop sandbox rm --all` removes only boxes attributable to the current
+home; `sbxloop sandbox rm NAME` remains available for an explicitly selected
+legacy box.
+
 A sandbox counts as an orphan candidate when its run is terminal
-(merged/completed/failed/blocked/cancelled), unknown to this working copy's state DB, or
-non-terminal but silent past `--min-age` (default 1 hour — the persisted event
-stream, heartbeats included, is the liveness signal). Sandboxes deliberately
-kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
+(merged/completed/failed/blocked/cancelled), when its `sbxl-` name identifies
+this home but no run is recorded, or when a non-terminal run is silent past
+`--min-age` (default 1 hour — the persisted event stream, heartbeats included,
+is the liveness signal). An unknown legacy `sbxloop-` name is left alone because
+its owner cannot be established. Sandboxes deliberately kept for debugging are
+excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current
+orphan-candidate count.
 
 Run directories accrete too: every run leaves `~/.sbxloop/runs/<run>/` — a
 full clone of the target checkout under workspace isolation, plus harvested

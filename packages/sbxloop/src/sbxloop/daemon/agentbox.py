@@ -32,7 +32,6 @@ holds a lease on it.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -58,6 +57,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop.provider import ProviderRecovery
 from sbxloop.sbx.allocations import require_allocation
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import concierge_name, legacy_concierge_name
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
@@ -68,7 +68,6 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-SANDBOX_NAME_PREFIX = "sbxloop-concierge"
 # Events from the concierge's own sandbox carry this run id.
 CONCIERGE_RUN_ID = "concierge"
 # Same reasoning as the github box: a dead sandbox costs one re-provision,
@@ -89,10 +88,8 @@ class _Held(NamedTuple):
 
 
 def sandbox_name_for(home: SbxloopHome) -> str:
-    """Per-instance sandbox name (the home is the daemon's identity,
-    see ``sbxloop.daemon.github.sandbox_name_for``)."""
-    digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
-    return f"{SANDBOX_NAME_PREFIX}-{digest}"
+    """Per-instance concierge sandbox name."""
+    return concierge_name(home)
 
 
 class DaemonAgent:
@@ -113,6 +110,8 @@ class DaemonAgent:
         self.worker_python = worker_python
         self.install_workers = install_workers
         self.name = name or sandbox_name_for(config.paths)
+        self._new_name = self.name
+        self._legacy_name = legacy_concierge_name(config.paths) if name is None else None
         self.clock = clock
         self._last_reprovision_at: float | None = None
         self.provisioner = Provisioner(sbx, config, bus=bus)
@@ -463,6 +462,8 @@ class DaemonAgent:
         try:
             sandbox.rm()
             log.info("concierge_sandbox.removed", sandbox=self.name)
+            if self.name == self._legacy_name:
+                self.name = self._new_name
         except SbxError:
             if strict:
                 raise
@@ -516,6 +517,15 @@ class DaemonAgent:
     def _ensure(self) -> WorkerClient:
         started = time.monotonic()
         stale = False
+        if self._legacy_name is not None and self.name == self._new_name:
+            try:
+                live = {info.name for info in self.sbx.ls()}
+            except SbxError as exc:
+                raise DaemonError(f"cannot inspect concierge sandboxes: {exc}") from exc
+            if self._new_name not in live and self._legacy_name in live:
+                # Keep the VM's SDK session store across an upgrade. Its next
+                # replacement gets the new name after the old box is removed.
+                self.name = self._legacy_name
         if self.exists():
             sandbox = Sandbox(self.sbx, self.name)
             # Resource changes are not worker failures: never route this refusal

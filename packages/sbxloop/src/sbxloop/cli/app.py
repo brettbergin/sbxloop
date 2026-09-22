@@ -32,6 +32,7 @@ from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import (
+    VCS_KINDS,
     ChatConfig,
     Config,
     DaemonConfig,
@@ -70,8 +71,15 @@ from sbxloop.paths import SbxloopHome, resolve_home_root
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.models import SandboxRole
+from sbxloop.sbx.naming import (
+    instance_prefix,
+    is_managed_name,
+    legacy_concierge_name,
+    legacy_daemon_vcs_name,
+    run_name,
+)
 from sbxloop.sbx.pair import cleanup_registry
-from sbxloop.sbx.provision import sandbox_name, sandbox_name_candidates
+from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import (
     classify_sandboxes,
     format_age,
@@ -1175,7 +1183,7 @@ def status(
     attempts = store.phase_attempts(run_id)
     console.print(f"{len(attempts)} phase attempts recorded")
     # The pair names, so debugging a live run needs no by-hand
-    # `sbxloop-<run>-agent` reconstruction.
+    # sandbox-name reconstruction.
     console.print("sandboxes:")
     # The service sandbox (#765) exists only for a run granted credentials;
     # the github sandbox never for a workload (#755) or a tool run.
@@ -1187,13 +1195,13 @@ def status(
     except SbxloopError:
         for role in roles:
             console.print(
-                f"  {sandbox_name(run_id, role, vcs_kind=vcs_kind)}  "
+                f"  {run_name(config.paths, run_id, role, vcs_kind=vcs_kind)}  "
                 "[dim](liveness unknown: sbx ls failed)[/]"
             )
         return
     any_live = False
     for role in roles:
-        candidates = sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind)
+        candidates = sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind, home=config.paths)
         name = next((candidate for candidate in candidates if candidate in live), candidates[0])
         any_live = any_live or name in live
         state_note = "[green]running[/]" if name in live else "[dim]not running[/]"
@@ -1289,7 +1297,7 @@ def shell(
     sandbox_role: SandboxRole = (
         "agent" if role == "agent" else "service" if role == "service" else "github"
     )
-    candidates = sandbox_name_candidates(run_id, sandbox_role, vcs_kind=vcs_kind)
+    candidates = sandbox_name_candidates(run_id, sandbox_role, vcs_kind=vcs_kind, home=config.paths)
     try:
         live_names = {info.name for info in cli.ls()}
     except SbxloopError as exc:
@@ -1359,22 +1367,25 @@ def sandbox_ls() -> None:
     """List sbxloop-managed sandboxes."""
     config = _run_config()
     cli = SbxCLI(app_name=config.app_name or None)
-    table = Table(title="sbxloop sandboxes")
-    for column in ("name", "agent", "status", "workspace"):
-        table.add_column(column)
+    console.print("[bold]sbxloop sandboxes[/]")
     for info in cli.ls():
-        if info.name.startswith("sbxloop-"):
-            table.add_row(info.name, info.agent or "", info.status or "", info.workspace or "")
-    console.print(table)
+        if is_managed_name(info.name):
+            console.print(info.name)
+            console.print(
+                f"  {info.status or 'unknown'} · {info.agent or 'unknown agent'} · "
+                f"{info.workspace or 'no workspace'}"
+            )
 
 
 @sandbox_app.command("rm")
 def sandbox_rm(
     name: Annotated[str | None, typer.Argument(help="Sandbox name.")] = None,
     run_id: Annotated[str | None, typer.Option("--run", help="Remove a run's pair.")] = None,
-    all_: Annotated[bool, typer.Option("--all", help="Remove all sbxloop sandboxes.")] = False,
+    all_: Annotated[
+        bool, typer.Option("--all", help="Remove sandboxes owned by this sbxloop home.")
+    ] = False,
 ) -> None:
-    """Remove sbxloop sandboxes by name, by run, or all of them."""
+    """Remove sbxloop sandboxes by name, by run, or by this home."""
     config = _run_config()
     cli = SbxCLI(app_name=config.app_name or None)
     targets: list[str] = []
@@ -1384,10 +1395,29 @@ def sandbox_rm(
         store = _store(config)
         repo = _run_repo(store, run_id)
         vcs_kind = _run_vcs_kind(store, config, run_id, repo)
-        targets.append(sandbox_name(run_id, "agent"))
-        targets.extend(sandbox_name_candidates(run_id, "github", vcs_kind=vcs_kind))
+        for role in ("agent", "github", "service"):
+            targets.extend(
+                sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind, home=config.paths)
+            )
     if all_:
-        targets += [i.name for i in cli.ls() if i.name.startswith("sbxloop-")]
+        store = _store(config)
+        from sbxloop.sbx.warm import registry_for
+
+        warm_ids = registry_for(config).run_ids()
+        verdicts = classify_sandboxes(cli.ls(), store, warm_run_ids=warm_ids, home=config.paths)
+        own_prefix = instance_prefix(config.paths) + "-"
+        old_daemon = (
+            *(legacy_daemon_vcs_name(config.paths, kind) for kind in VCS_KINDS),
+            legacy_concierge_name(config.paths),
+        )
+        targets += [
+            v.name
+            for v in verdicts
+            if v.name.startswith(own_prefix)
+            or v.run_state is not None
+            or v.run_id in warm_ids
+            or any(v.name == base or v.name.startswith(base + "-g") for base in old_daemon)
+        ]
     if not targets:
         console.print("nothing to remove: pass a NAME, --run, or --all")
         raise typer.Exit(2)
@@ -1616,6 +1646,7 @@ def sandbox_prune(
             include_kept=include_kept,
             # The daemon's warm sets (#47) have no run row yet; not orphans.
             warm_run_ids=registry_for(config).run_ids(),
+            home=config.paths,
         )
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
@@ -1624,21 +1655,18 @@ def sandbox_prune(
         console.print("no sbxloop sandboxes found")
         return
 
-    table = Table(title="sbxloop sandbox prune")
-    for column in ("sandbox", "run", "run state", "age", "verdict"):
-        table.add_column(column)
+    console.print("[bold]sbxloop sandbox prune[/]")
     for v in verdicts:
-        table.add_row(
-            v.name,
-            v.run_id or "",
-            v.run_state or "[dim]unknown[/]",
-            format_age(v.age_s),
-            ("[red]orphan[/] — " if v.orphan else "[green]keep[/] — ") + v.reason,
+        console.print(v.name)
+        console.print(
+            f"  run {v.run_id or '?'} · state {v.run_state or 'unknown'} · "
+            f"age {format_age(v.age_s)} · "
+            + ("[red]orphan[/] — " if v.orphan else "[green]keep[/] — ")
+            + v.reason
         )
-    console.print(table)
     console.print(
-        "[dim]note: the state DB is per working copy — 'unknown' sandboxes may "
-        "belong to another checkout's runs on this sbx host[/]"
+        "[dim]note: an unknown legacy sandbox may belong to another working copy; "
+        "only names owned by this home are auto-pruned[/]"
     )
 
     orphans = [v for v in verdicts if v.orphan]

@@ -699,6 +699,12 @@ a code run's checkout, is `404` like any other id from elsewhere.
 
 ### Changed
 
+- **Sandbox names identify their installation and purpose.** New sandboxes use
+  `sbxl-<instance>-<run>-run-agent`, `-run-vcs-<forge>`, or
+  `-run-credential-service`; daemon boxes end in `-daemon-vcs-<forge>` or
+  `-daemon-chat-concierge`. Existing names remain discoverable for cleanup,
+  and bulk removal and pruning do not claim another home's boxes.
+
 - **Forge polls start short and back off.** Field (db, 2026-09-19): a merge
   request whose CI went green in two seconds spent three more minutes in
   60s polls (a settle read, the undraft, the mergeability read, the merge)

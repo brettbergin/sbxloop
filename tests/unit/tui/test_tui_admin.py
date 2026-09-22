@@ -13,6 +13,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.ids import new_run_id
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.models import SandboxInfo
+from sbxloop.sbx.naming import run_name
 from sbxloop.tui.commands import CATALOGUE
 from sbxloop.tui.screens.daemon import DaemonScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen, TypedConfirmScreen
@@ -255,7 +256,7 @@ def test_run_verbs_go_through_confirmations_and_ctl(seeded: SbxloopHome) -> None
             assert runner.interactive_calls and runner.interactive_calls[0][:3] == (
                 "sbx",
                 "exec",
-                "sbxloop-r_live-agent",
+                run_name(seeded, "r_live", "agent"),
             )
 
     drive(scenario)

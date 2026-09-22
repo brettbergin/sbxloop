@@ -21,7 +21,7 @@ from sbxloop.cli.tui import TASK_STATE_STYLES
 from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.usage import usage_lines
 from sbxloop.engine.model import TERMINAL_RUN_STATES, artifacts_dir, scan_artifacts
-from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.tui import actions
 from sbxloop.tui.data import ConsoleState, EventTail, RunDetail, build_run_detail
 from sbxloop.tui.format import (
@@ -606,12 +606,17 @@ class RunDetailScreen(ConsoleScreen):
         )
 
     def _shell(self, role: str) -> None:
+        deps = self.console_app.deps
         if role == "agent":
-            name = sandbox_name(self.run_id, "agent")
+            candidates = sandbox_name_candidates(self.run_id, "agent", home=deps.home)
         else:
             kind = self.detail.vcs_kind if self.detail is not None else "github"
-            name = sandbox_name(self.run_id, "github", vcs_kind=kind)
-        self.console_app.perform(actions.shell(self.console_app.deps, name))
+            candidates = sandbox_name_candidates(
+                self.run_id, "github", vcs_kind=kind, home=deps.home
+            )
+        live = {info.name for info in deps.sbx().ls()}
+        name = next((candidate for candidate in candidates if candidate in live), candidates[0])
+        self.console_app.perform(actions.shell(deps, name))
 
     def action_shell_agent(self) -> None:
         self._shell("agent")
