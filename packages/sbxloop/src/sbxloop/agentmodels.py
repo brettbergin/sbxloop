@@ -83,11 +83,10 @@ def refreshed_models(config: Config) -> Config:
         )
         for entry in config.github.repos
     ]
-    return config.model_copy(
+    return config.with_github(config.github.model_copy(update={"repos": repos})).model_copy(
         update={
             "model": live.model,
             "agent": config.agent.model_copy(update={"models": live.agent.models}),
-            "github": config.github.model_copy(update={"repos": repos}),
             "concierge": config.concierge.model_copy(update={"model": live.concierge.model}),
         }
     )

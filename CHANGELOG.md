@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+**A repository is declared under `[[vcs.repos]]`, whatever forge it lives
+on.** The repository list moves from the GitHub section to the forge section
+(#2255): `[[vcs.repos]]` carries the same entries and keys `[[github.repos]]`
+did, and `[github]` keeps only the GitHub backend's own settings (where GitHub
+is, naming, identity, reviewers). The legacy spelling, `[[github.repos]]` or a
+single `[github] repo`, still loads, folded into the same list with one notice
+(`config.repos_legacy`); a file that declares repositories under both, and not
+the same ones, is refused by name. The GitHub section's view of the list is
+rebuilt from the declared one on every load, a run's narrowing goes through
+`Config.for_repo` so both stay in step in the persisted config, and a stored
+config from an earlier release loads unchanged. Validation errors name
+`vcs.repos[]`; the config editor's model keys and the concierge's default lock
+list cover the new path (the forge, its API root and every credential name are
+locked; a repository's own delivery settings are not). The example config and
+the user guide document the new spelling.
+
 **Files delivered into a conversation are now the whole channel's to read, and
 a long channel keeps a summary of what fell out of its history.** A work
 result's files are attached to the message in the same transaction that writes

@@ -156,17 +156,21 @@ descriptor the worker needs.
   scopes, expiry and whether it is still active; GitHub answers `None`,
   because there the credential is the provisioner's knowledge.
 
-`[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
+`[vcs] kind` (and a `[[vcs.repos]]` entry's own `kind`) names the forge;
 `Config.vcs_kind_for` resolves it per repository, `Config.vcs_api_url_for`
 the API root a backend of that kind speaks to, and `sbxloop doctor` prints
 one `vcs backend <kind>` row per forge with each capability's state, or a
-failing row for a kind no backend answers yet. `[github]` stays the section
-a repository is declared in and reads as `kind = "github"`. The github-role
+failing row for a kind no backend answers yet. A repository is declared
+under `[[vcs.repos]]`, whatever forge it lives on (#2255); `[github]` keeps
+the GitHub backend's own settings, reads as `kind = "github"` when no
+`[vcs]` section names the forge, and still accepts the legacy
+`[[github.repos]]` spelling, which the loader folds into the same list with
+one notice. The github-role
 sandbox for a repository on another forge holds that forge's token under
 the forge's own variable (`GITLAB_TOKEN`), delivered by the env-file road
 because sbx's secret proxy knows only GitHub's service, and reaches only
 that forge's host; the daemon's shared polling box follows `[vcs] kind`, so
-a `[[github.repos]] kind` that differs from it is honoured by a run's own
+a `[[vcs.repos]] kind` that differs from it is honoured by a run's own
 box and not by the daemon's.
 
 The decision logic sits above the roles and knows no forge: the baseline
@@ -373,7 +377,7 @@ and drivers have the same authority as other agent code. This preserves
 host-initiated transport and mediation between the credential and agent
 planes; no new listener or box-to-box channel is introduced.
 The VCS sandbox exists only when the repository integration is configured
-(`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
+(`[github] repo = "owner/repo"`, or at least one `[[vcs.repos]]` entry);
 without it, the internally named `pair.github` is `None`, a forge token
 is not required, and the run has no VCS capability at all. When several
 repositories are configured, the VCS sandbox is scoped to the one the
@@ -661,7 +665,7 @@ missing venv prerequisite cannot be persisted as a successful bake.
 ### Verify mode (#682)
 
 `Config.verify_mode_for(repo)` resolves `[sandbox] verify_mode` with the
-`[[github.repos]]` override, and the engine reads it at three points: the
+`[[vcs.repos]]` override, and the engine reads it at three points: the
 per-task VERIFY phase, the GATE stage, and `_verification_note`, which turns
 the phase rows back into prose for the review prompt (`$verification`,
 defaulted empty by `prompts.render`) and the pull request body
@@ -699,7 +703,7 @@ and load the env file at startup, the next job authenticates with the
 fresh token — covering both a run's pair and the daemon's long-lived
 polling sandbox. PAT and App credentials are
 mutually exclusive and a partial App set is refused, both validated before
-any microVM boots; a `[[github.repos]] token_env` remains an explicit
+any microVM boots; a `[[vcs.repos]] token_env` remains an explicit
 per-repo PAT override.
 
 `[github] api_url` (#623) is the one place the GitHub host is written down.
@@ -888,7 +892,7 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   last check on the tree exactly as it will be delivered. `verify_mode`
   governs this stage the same way: `advisory` records a red gate without a
   fix round, `ci-only` skips it. A run with no
-  `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
+  `[github] repo` (and no `[[vcs.repos]]`) ends `completed` here, its
   work in the workspace.
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
   prefix, the PR title and the commit message are `[github]` templates)
@@ -1873,7 +1877,7 @@ compare under the suffix fold; kinds must agree when both are known, so
 a person named `foo` is not the App `foo[bot]`, and an unknown kind
 still matches on the login alone. The sources, in order: the App slug;
 `GET /user`; `[github] bot_login` (the operator's word, per repository
-in `[[github.repos]]`); the delivered PR's author — a source only because
+in `[[vcs.repos]]`); the delivered PR's author — a source only because
 one github-ops credential both opens and reviews the PR
 (`resolve_identity(pr_author_is_loop=True)`), never for a reviewer-only
 identity. Marker-stamped replies (`has_reply_marked`, #618) count only
@@ -2432,11 +2436,11 @@ One daemon may tend several repositories. They are declared as an array of
 tables, each entry carrying its own settings:
 
 ```toml
-[[github.repos]]
+[[vcs.repos]]
 repo = "you/one"
 deliver_base = "main"
 
-[[github.repos]]
+[[vcs.repos]]
 repo = "you/two"
 enabled = false              # registered but not polled
 token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
@@ -2444,14 +2448,16 @@ trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
 labels = ["team:core"]       # extra labels applied to issues/PRs here
 ```
 
-The legacy `[github] repo = "owner/name"` form still loads and is
-normalised internally into a one-entry repo list carrying the same
-`deliver_base` / `create_repo` / `create_public`, so nothing about an
-existing single-repo deployment changes. The two forms are mutually
-exclusive; migrate by moving `[github] repo` and its delivery settings into
-one `[[github.repos]]` entry. Configuration is rejected with a clear error
-when a repository is listed twice, when a slug is not `owner/name`, or when
-the section carries delivery settings but names no repository at all.
+The legacy spellings still load: `[[github.repos]]` is folded into the same
+list with one notice, and `[github] repo = "owner/name"` is normalised into
+a one-entry list carrying the same `deliver_base` / `create_repo` /
+`create_public`, so nothing about an existing deployment changes. A file
+that declares repositories under both `[[vcs.repos]]` and
+`[[github.repos]]`, and not the same ones, is refused by name; migrate by
+moving the entries (or `[github] repo` and its delivery settings) under
+`[[vcs.repos]]`. Configuration is rejected with a clear error when a
+repository is listed twice, when a slug is not `owner/name`, or when the
+GitHub section carries delivery settings but names no repository at all.
 
 The split is deliberate and worth stating plainly:
 
@@ -2541,7 +2547,7 @@ git credential of its own (#46). With no credential configured only a
 public repository clones; a private one fails the run explicitly, naming
 the case. There is no fallback to another repository's checkout in any of
 these paths. Migration for an existing single-repo daemon: move
-`[sandbox] workspace` into the matching `[[github.repos]]` entry.
+`[sandbox] workspace` into the matching `[[vcs.repos]]` entry.
 
 `sbxloop doctor` checks each configured repository on its own line
 (reachable, token permissions), so one broken repo never masks the others'
