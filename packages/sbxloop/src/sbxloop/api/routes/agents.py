@@ -3,15 +3,18 @@
 Reads cover every source; only a person's own agents are created, edited
 (against the revision the caller last read) and archived, and only by the
 person who saved one or a workspace owner or admin (403 ``agent_forbidden``
-for anyone else). A built-in or configured agent answers 409
-``agent_read_only``. Every agent, from any
+for anyone else). Letting an agent start work on its own (``can_start``)
+is the operator's to grant: only a workspace owner or admin sets it on a
+new agent or adds a kind to a saved one (403 ``agent_forbidden`` for a
+member, who may still narrow or clear it). A built-in or configured agent
+answers 409 ``agent_read_only``. Every agent, from any
 source, also has a long-term memory a person can list, add to, edit and
 forget (``/agents/{slug}/memories``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -137,6 +140,27 @@ def _saver(auth: Authenticated) -> tuple[str, bool]:
     return who, role_of(auth) in MANAGING_ROLES
 
 
+def _refuse_start_grant(
+    requested: Iterable[str] | None, current: Iterable[str] = (), *, manager: bool
+) -> None:
+    """Refuse a body that would let an agent start a kind of run it cannot
+    already, unless a workspace owner or admin sends it. ``can_start`` is
+    what makes an agent queue runs and file issues by itself, and its daily
+    cap is the operator's ceiling either way, so the grant is the
+    operator's call too. Narrowing, clearing, or saving the same list back
+    (an editor that sends the whole form) is the agent owner's."""
+    if manager or not requested:
+        return
+    granted = set(requested) - set(current)
+    if granted:
+        raise Problem(
+            403,
+            "agent_forbidden",
+            "only a workspace owner or admin may let an agent start work on its own "
+            f"(can_start: {', '.join(sorted(granted))})",
+        )
+
+
 def _found(registry: AgentRegistry, slug: str) -> RegistryAgent:
     agent = registry.get(slug)
     if agent is None:
@@ -183,7 +207,8 @@ async def create_agent(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
 ) -> AgentOut:
     spec = AgentSpec.model_validate(body.model_dump())
-    by, _ = _saver(auth)
+    by, manager = _saver(auth)
+    _refuse_start_grant(spec.can_start, manager=manager)
     try:
         agent = await ctx.call(ctx.agents.create, spec, by)
     except _REFUSALS as exc:
@@ -202,6 +227,9 @@ async def update_agent(
     patch = body.model_dump(exclude_unset=True)
     expected = patch.pop("expected_revision")
     by, manager = _saver(auth)
+    if not manager and patch.get("can_start"):
+        current = await ctx.call(_found, ctx.agents, slug)
+        _refuse_start_grant(patch["can_start"], current.spec.can_start, manager=manager)
     try:
         agent = await ctx.call(ctx.agents.update, slug, patch, expected, by, manager=manager)
     except _REFUSALS as exc:

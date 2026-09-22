@@ -357,6 +357,96 @@ def test_the_creator_edits_and_archives_from_any_of_their_clients(api: Any) -> N
     assert api.client.post("/v1/agents/scout/archive", headers=second).status_code == 200
 
 
+def test_only_a_workspace_owner_or_admin_grants_can_start(api: Any) -> None:
+    """``can_start`` lets an agent queue runs and file issues on its own, so
+    granting it is the operator's call: a member (or a plain client without
+    ``daemon:manage``) creating or patching an agent with a kind it does not
+    already have answers 403 ``agent_forbidden`` and nothing is saved. A
+    workspace owner or admin grants it; the member who owns the agent may
+    then narrow it, clear it, or save it back unchanged (an editor that
+    sends the whole form does exactly that)."""
+    owner = bearer(register(api))
+    alice = bearer(_invite(api, "member", "alice"))
+    admin = bearer(_invite(api, "admin", "admin"))
+    starting = {**SCOUT, "can_start": ["workload"]}
+
+    refused = _create(api, alice, starting)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["code"] == "agent_forbidden"
+    assert api.client.get("/v1/agents/scout", headers=alice).status_code == 404
+    client = api.bearer(frozenset({"collaboration:read", "collaboration:write"}))
+    assert _create(api, client, starting).status_code == 403
+
+    assert _create(api, alice).status_code == 201
+    patched = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 1, "can_start": ["workload"]},
+        headers=alice,
+    )
+    assert patched.status_code == 403, patched.text
+    assert patched.json()["code"] == "agent_forbidden"
+    current = api.client.get("/v1/agents/scout", headers=alice).json()
+    assert (current["can_start"], current["revision"]) == ([], 1)
+
+    granted = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 1, "can_start": ["code", "workload"]},
+        headers=admin,
+    )
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["can_start"] == ["code", "workload"]
+
+    narrowed = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 2, "can_start": ["workload"]},
+        headers=alice,
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    assert narrowed.json()["can_start"] == ["workload"]
+    resaved = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 3, "can_start": ["workload"], "description": "Scouts."},
+        headers=alice,
+    )
+    assert resaved.status_code == 200, resaved.text
+    raised = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 4, "can_start": ["workload", "code"]},
+        headers=alice,
+    )
+    assert raised.status_code == 403, raised.text
+    assert raised.json()["code"] == "agent_forbidden"
+    assert api.client.get("/v1/agents/scout", headers=alice).json()["revision"] == 4
+
+    by_owner = _create(api, owner, {**starting, "slug": "lookout", "name": "Lookout"})
+    assert by_owner.status_code == 201, by_owner.text
+    assert by_owner.json()["can_start"] == ["workload"]
+
+
+def test_a_member_sets_their_own_daily_cap_but_the_team_cap_is_the_ceiling(api: Any) -> None:
+    """``max_runs_per_day`` stays a member's to set on their own agent; what
+    they cannot do is buy more than ``[agent_team] max_agent_runs_per_day``
+    with it. The API stores the number as given (the ceiling is applied
+    where runs start), so lowering and raising both save."""
+    register(api)
+    alice = bearer(_invite(api, "member", "alice"))
+    assert _create(api, alice).status_code == 201
+    lowered = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 1, "max_runs_per_day": 1},
+        headers=alice,
+    )
+    assert lowered.status_code == 200, lowered.text
+    assert lowered.json()["max_runs_per_day"] == 1
+    raised = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 2, "max_runs_per_day": 100000},
+        headers=alice,
+    )
+    assert raised.status_code == 200, raised.text
+    assert raised.json()["max_runs_per_day"] == 100000
+
+
 def test_editing_agents_needs_collaboration_write(api: Any) -> None:
     reader = api.bearer(frozenset({"collaboration:read"}))
     assert api.client.get("/v1/agents", headers=reader).status_code == 200
