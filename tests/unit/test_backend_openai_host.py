@@ -368,7 +368,7 @@ def test_a_plan_still_may_not_declare_a_bare_host_or_literal(declared: str) -> N
     ):
         EgressSpec(domain=declared, reason="model")
     with pytest.raises(
-        ValidationError, match=r"needs\.hosts must be domains or \*\.domain wildcards"
+        ValidationError, match=r"needs\.hosts must be domains, \*\.domain wildcards"
     ):
         TaskNeeds(hosts=[declared])
 

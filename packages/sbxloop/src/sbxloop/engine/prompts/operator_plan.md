@@ -83,7 +83,8 @@ lost when the sandbox is destroyed.
   by shell.
 - **Needs.** A task that must reach the outside declares what it needs in
   `needs`, and the plan is where it asks: `hosts` — the domains it will
-  reach; `credentials` — each **by name**, the name a credential is
+  reach, or `*` when the task cannot know them in advance (it follows
+  links it has not seen yet); `credentials` — each **by name**, the name a credential is
   catalogued under, **never its value**: a name here is a request that
   calls needing that credential be made on the task's behalf, in a
   separate box that holds it. The task never sees the secret, and a

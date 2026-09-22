@@ -197,7 +197,8 @@ class TaskNeeds(_Model):
     """What a workload task declares it will need, by name — the operator's
     plan asking, never taking.
 
-    ``hosts`` are domains the task will reach (the shape of ``egress``);
+    ``hosts`` are domains the task will reach (the shape of ``egress``),
+    or ``*`` for a task that cannot know them in advance;
     ``credentials`` are catalogue names, each a request for a grant on the
     service sandbox — a credential is never a value in the agent's box;
     ``sink`` names where the result should go and ``repo`` a repository it
@@ -216,11 +217,15 @@ class TaskNeeds(_Model):
         from sbxloop.policy import valid_pattern
 
         hosts = [host.strip().lower() for host in value]
-        bad = [host for host in hosts if not valid_pattern(host)]
+        # `*` is a request for every host, granted only by a profile whose
+        # egress is `*` itself; a task that cannot know its hosts in
+        # advance has no truer answer to give.
+        bad = [host for host in hosts if not valid_pattern(host, operator=True)]
         if bad:
             raise ValueError(
-                f"needs.hosts must be domains or *.domain wildcards (no scheme/path/port), "
-                f"got {bad!r}"
+                "needs.hosts must be domains, *.domain wildcards under a named domain "
+                "(not a bare suffix such as *.com), or '*' for any host; no scheme, "
+                f"path or port. Got {bad!r}"
             )
         return hosts
 
