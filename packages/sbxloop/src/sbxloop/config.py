@@ -2848,6 +2848,8 @@ class ApiOidcConfig(_ConfigModel):
     #: Create an account on a first sign-in; off, only linked or existing
     #: accounts may sign in.
     auto_provision: bool = True
+    #: Absolute lifetime of an application session; refresh never extends it.
+    session_max_age_s: int = Field(default=28800, ge=300, le=86400)
     #: Link a first sign-in to the local account holding the same email when
     #: the provider says the address is verified and the local side does
     #: too: the address came from the installation's first registration, an
@@ -2934,6 +2936,9 @@ class ApiConfig(_ConfigModel):
     """
 
     enabled: bool = False
+    #: Permit human password login and registration. Machine clients remain
+    #: available; disabling this also refuses existing non-OIDC human tokens.
+    local_auth_enabled: bool = True
     # Loopback by default: a broader bind is an explicit choice, and local
     # binding alone never establishes identity — every request authenticates.
     bind: str = "127.0.0.1"

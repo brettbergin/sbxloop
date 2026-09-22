@@ -205,7 +205,12 @@ def test_providers_offer_only_local_login_when_oidc_is_off(api: Api) -> None:
     response = api.client.get("/v1/auth/providers")
 
     assert response.status_code == 200
-    assert response.json() == {"local": True, "oidc": None}
+    assert response.json() == {
+        "local": True,
+        "oidc": None,
+        "policy_version": 1,
+        "oidc_session_max_age_s": None,
+    }
     features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
     assert "auth.oidc" not in features
 
@@ -218,6 +223,8 @@ def test_providers_describe_the_configured_provider_without_a_token(
     assert response.status_code == 200
     assert response.json() == {
         "local": True,
+        "policy_version": 1,
+        "oidc_session_max_age_s": 28800,
         "oidc": {
             "id": "authentik",
             "label": "Authentik",
@@ -237,7 +244,12 @@ def test_providers_offer_no_oidc_when_discovery_fails(served: Api, idp: FakeIdP)
     response = served.client.get("/v1/auth/providers")
 
     assert response.status_code == 200
-    assert response.json() == {"local": True, "oidc": None}
+    assert response.json() == {
+        "local": True,
+        "oidc": None,
+        "policy_version": 1,
+        "oidc_session_max_age_s": 28800,
+    }
 
 
 def test_a_failed_discovery_is_not_retried_on_every_request(served: Api, idp: FakeIdP) -> None:

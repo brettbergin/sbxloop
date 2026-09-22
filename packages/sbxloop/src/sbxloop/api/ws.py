@@ -224,7 +224,9 @@ class _Session:
             fresh = await self.ctx.call(resolve_token, self.ctx, self.auth.token)
         except Problem as exc:
             await self.send({"type": "closing", "reason": exc.code})
-            await self.ws.close(code=CLOSE_UNAUTHENTICATED)
+            await self.ws.close(
+                code=CLOSE_FORBIDDEN if exc.code == "access_revoked" else CLOSE_UNAUTHENTICATED
+            )
             return False
         if not stream_still_allowed(fresh, opened_as_member=self.opened_as_member):
             self.subscribed = False

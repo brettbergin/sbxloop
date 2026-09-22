@@ -156,6 +156,38 @@ class TokenRevocationRow(Base):
     revoked_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
+class OidcSessionRow(Base):
+    """One OIDC login and its access tokens / refresh family, never renewed."""
+
+    __tablename__ = "api_oidc_sessions"
+    __table_args__ = (
+        Index("idx_api_oidc_sessions_subject", "issuer", "subject"),
+        Index("idx_api_oidc_sessions_sid", "issuer", "provider_sid"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    issuer: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_sid: Mapped[str | None] = mapped_column(Text)
+    issued_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    revoked_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class OidcLogoutRow(Base):
+    """Durable replay protection for verified provider logout events."""
+
+    __tablename__ = "api_oidc_logouts"
+
+    issuer: Mapped[str] = mapped_column(Text, primary_key=True)
+    jti: Mapped[str] = mapped_column(Text, primary_key=True)
+    subject: Mapped[str | None] = mapped_column(Text)
+    provider_sid: Mapped[str | None] = mapped_column(Text)
+    issued_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
 class PublicIdRow(Base):
     __tablename__ = "api_public_ids"
     __table_args__ = (UniqueConstraint("kind", "workspace_id", "internal_key"),)

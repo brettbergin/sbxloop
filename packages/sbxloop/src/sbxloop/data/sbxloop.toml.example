@@ -966,6 +966,7 @@ service_memory = "2g"
 # retention_days = 14              # mailbox rows pruned past this (0 keeps them)
 
 # [api]
+# local_auth_enabled = true        # false requires OIDC for all human sign-ins
 # The remote operations API, served by `sbxloop daemon` in-process: REST
 # under /v1 with generated OpenAPI, for a client that admits work, watches
 # it, steers it and fetches results without parsing CLI prose. Off by
@@ -1015,6 +1016,7 @@ service_memory = "2g"
 # allowed_groups = []              # only these groups may sign in; empty = anyone
 # default_role = "member"          # a new person's role: member or admin
 # auto_provision = true            # create an account on first sign-in
+# session_max_age_s = 28800        # absolute OIDC session lifetime; refresh cannot extend it
 # link_verified_email = false      # link a local account with the same verified
 #                                  # email (verified on both sides, see the guide);
 #                                  # only if users cannot edit their email

@@ -42,6 +42,7 @@ class AccessClaims:
     expires_at: float
     kid: str
     workspace_id: str
+    session_id: str | None = None
 
 
 def scope_from(capabilities: frozenset[Capability]) -> str:
@@ -60,6 +61,7 @@ def mint_access(
     capabilities: frozenset[Capability],
     ttl_s: int,
     now: float,
+    session_id: str | None = None,
 ) -> tuple[str, AccessClaims]:
     if keys.current.private is None:
         raise TokenError("no_signing_key", "the current signing key has no private half")
@@ -71,6 +73,7 @@ def mint_access(
         expires_at=now + ttl_s,
         kid=keys.current.kid,
         workspace_id=WORKSPACE_ID,
+        session_id=session_id,
     )
     payload: dict[str, Any] = {
         "iss": ISSUER,
@@ -82,6 +85,8 @@ def mint_access(
         "scope": scope_from(capabilities),
         "workspace": WORKSPACE_ID,
     }
+    if session_id is not None:
+        payload["session_id"] = session_id
     token = jwt.encode(
         payload, keys.current.private, algorithm=ALGORITHM, headers={"kid": keys.current.kid}
     )
@@ -133,4 +138,5 @@ def verify_access(keys: SigningKeys, token: str, *, now: float) -> AccessClaims:
         expires_at=float(payload["exp"]),
         kid=str(header.get("kid")),
         workspace_id=str(payload.get("workspace", WORKSPACE_ID)),
+        session_id=payload.get("session_id"),
     )

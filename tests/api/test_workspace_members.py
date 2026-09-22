@@ -571,8 +571,8 @@ def test_removing_a_member_ends_their_access(api: Any) -> None:
     assert response.content == b""
     assert api.ctx.collaboration.member_for_user(member_id) is None
     assert _client_capabilities(api, member["client_id"]) == set()
-    assert api.client.get("/v1/runs", headers=_headers(member)).status_code == 403
-    assert api.client.get("/v1/users", headers=_headers(member)).status_code == 403
+    assert api.client.get("/v1/runs", headers=_headers(member)).status_code == 401
+    assert api.client.get("/v1/users", headers=_headers(member)).status_code == 401
     refreshed = api.client.post(
         "/v1/auth/token",
         json={"grant_type": "refresh_token", "refresh_token": member["refresh_token"]},

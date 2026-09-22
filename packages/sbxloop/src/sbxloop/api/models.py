@@ -268,6 +268,9 @@ class OidcProviderOut(ApiModel):
 
 
 class AuthProviders(ApiModel):
+    #: Server-enforced local-auth policy, bounded OIDC sessions and signed logout.
+    policy_version: int = 1
+    oidc_session_max_age_s: int | None = None
     #: Username and password sign-in (``/v1/auth/local/login``) is offered.
     local: bool
     #: The OpenID Connect provider, when one is configured and reachable.
