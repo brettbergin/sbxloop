@@ -231,9 +231,9 @@ def _pin_workspace(config: Config, workspace: Path) -> Config:
     repository.
     """
     sandbox = config.sandbox.model_copy(update={"workspace": workspace})
-    repos = [entry.model_copy(update={"workspace": workspace}) for entry in config.github.repos]
+    repos = [entry.model_copy(update={"workspace": workspace}) for entry in config.repo_list()]
     github = config.github.model_copy(update={"repos": repos})
-    return config.model_copy(update={"sandbox": sandbox, "github": github})
+    return config.with_github(github).model_copy(update={"sandbox": sandbox})
 
 
 def _resolve_repo(config: Config, selector: str | None) -> RepoConfig:
@@ -898,18 +898,12 @@ def run(
         except ValidationError as exc:
             console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
             raise typer.Exit(2) from exc
-        config = config.model_copy(update={"github": github})
-    elif len(config.github.repo_list()) > 1:
+        config = config.with_github(github)
+    elif len(config.repo_list()) > 1:
         # Several repositories are configured but a run targets exactly one:
         # default to the sole enabled repo, else make the operator choose.
         entry = _resolve_repo(config, None)
-        config = config.model_copy(
-            update={
-                "github": config.github.for_repo(
-                    entry.repo, workspace=config.workspace_for_repo(entry.repo)
-                )
-            }
-        )
+        config = config.for_repo(entry.repo, workspace=config.workspace_for_repo(entry.repo))
     if (deliver_base or create_repo or create_public) and not config.github.enabled:
         console.print(
             "[bold red]GitHub integration is not configured.[/] Those options need a "
@@ -2488,7 +2482,7 @@ def daemon(
             github_cfg = GithubConfig.model_validate(
                 {**config.github.model_dump(), "repos": [], "repo": repo}
             )
-            config = config.model_copy(update={"github": github_cfg})
+            config = config.with_github(github_cfg)
         if discord_channel is not None and slack_channel is not None:
             raise ValidationError.from_exception_data(
                 "daemon",

@@ -187,7 +187,8 @@ def test_parse_pairs_each_key_with_its_comment() -> None:
 
 
 def test_doc_for_reads_the_example_and_ignores_indices() -> None:
-    assert doc_for("github.repos[1].enabled") == doc_for("github.repos.enabled")
+    assert doc_for("vcs.repos[1].enabled") == doc_for("vcs.repos.enabled")
+    assert doc_for("vcs.repos.enabled") is not None
     assert doc_for("concierge.timeout_s") == "one message's wall-clock budget"
     assert doc_for("nowhere.at.all") is None
 
@@ -217,7 +218,7 @@ def _model_keys() -> list[str]:
 # Keys the example lists with no comment on or above them. A new key lands
 # here only by being added to the example without a sentence — add the
 # comment instead of growing this number.
-UNDOCUMENTED_KEYS = 102  # +4 with [agent.openai] / [github.repos.openai] (max_retries, …)
+UNDOCUMENTED_KEYS = 85  # every [[vcs.repos]] key carries a comment since #2255
 
 
 def test_every_model_key_has_a_doc_line_or_is_counted() -> None:

@@ -604,11 +604,10 @@ class LoopEngine:
         that config — routes every GitHub call to the same place. An unknown
         selector is a configuration error, not a silent delivery elsewhere.
         """
-        if repo is not None and self.config.github.find_repo(repo) is None:
-            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "none"
+        if repo is not None and self.config.find_repo(repo) is None:
+            known = ", ".join(r.repo for r in self.config.repo_list()) or "none"
             raise StateError(f"repository {repo!r} is not configured (configured: {known})")
-        github = self.config.github.for_repo(repo, workspace=self.config.workspace_for_repo(repo))
-        self.config = self.config.model_copy(update={"github": github})
+        self.config = self.config.for_repo(repo, workspace=self.config.workspace_for_repo(repo))
 
     def resume(self, run_id: str, *, release_provider_hold: bool = True) -> RunResult:
         """Continue a run from the last stage it committed.

@@ -109,8 +109,16 @@ def _looks_like_value(value: str) -> bool:
 
 @cache
 def doc_lines() -> dict[str, str]:
-    """The packaged example's docs, parsed once per process."""
-    return parse(_example_text())
+    """The packaged example's docs, parsed once per process.
+
+    ``[[github.repos]]`` is the legacy spelling of ``[[vcs.repos]]`` (#2255):
+    the example documents the entry once, under the current name, and the
+    legacy path reads the same lines."""
+    docs = parse(_example_text())
+    for key, doc in list(docs.items()):
+        if key == "vcs.repos" or key.startswith("vcs.repos."):
+            docs.setdefault("github" + key.removeprefix("vcs"), doc)
+    return docs
 
 
 def doc_for(dotted: str) -> str | None:

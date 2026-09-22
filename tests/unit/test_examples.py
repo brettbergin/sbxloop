@@ -86,7 +86,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "# allow_insecure_endpoint = ",
         "# api = ",
         "# reasoning_effort = ",
-        "# [github.repos.openai]",
+        "# [vcs.repos.openai]",
     ):
         assert key in DEFAULT_CONFIG_TOML, key
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text()
@@ -97,7 +97,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "`[agent.openai] allow_insecure_endpoint`",
         "`[agent.openai] api`",
         "`[agent.openai] reasoning_effort`",
-        "`[github.repos.openai] base_url`",
+        "`[vcs.repos.openai] base_url`",
     ):
         assert key in guide, key
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
@@ -535,12 +535,15 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             continue  # a multi-line value (the exclude list); covered below
         if section in ("registries", "credentials", "workloads", "schedules", "mcp", "agents"):
             continue  # array-of-tables entries load as whole blocks, below
-        if section == "github.repos":
-            doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
-        elif section == "github.repos.agent_models":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
-        elif section == "github.repos.openai":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
+        if section in ("vcs.repos", "github.repos"):
+            top = section.split(".")[0]
+            doc: dict[str, Any] = {top: {"repos": [{"repo": "you/your-repo", **parsed}]}}
+        elif section in ("vcs.repos.agent_models", "github.repos.agent_models"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
+        elif section in ("vcs.repos.openai", "github.repos.openai"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
         elif section == "agent.models":
             doc = {"agent": {"models": parsed}}
         elif section == "agent.openai":

@@ -64,7 +64,9 @@ class PathError(ValueError):
 def is_model_key(dotted: str) -> bool:
     if dotted in {"model", "concierge.model"}:
         return True
-    match = re.fullmatch(r"(?:agent\.models|github\.repos\[\d+\]\.agent_models)\.([^.]+)", dotted)
+    match = re.fullmatch(
+        r"(?:agent\.models|(?:vcs|github)\.repos\[\d+\]\.agent_models)\.([^.]+)", dotted
+    )
     return match is not None and match.group(1) in AgentModels.model_fields
 
 
