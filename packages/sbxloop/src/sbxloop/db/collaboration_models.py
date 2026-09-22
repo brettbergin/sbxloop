@@ -51,6 +51,12 @@ class LocalUserRow(Base):
     oidc_subject: Mapped[str | None] = mapped_column(Text)
     avatar_url: Mapped[str | None] = mapped_column(Text)
     last_seen_at: Mapped[float | None] = mapped_column(REAL)
+    #: Whether ``email`` came from a path its holder could not steer to
+    #: someone else's address: the installation's first registration, an
+    #: invite addressed to it, or a provider claim marked verified. Cleared
+    #: when the person changes it themselves. A provider identity is linked
+    #: to a local account on a first sign-in only when this is set.
+    email_verified: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
 
 class WorkspaceMemberRow(Base):
