@@ -5,12 +5,17 @@ collaboration channel. Inbound, the bridge turns what people type there into
 channel turns (``sbxloop.daemon.chat``). This is the other direction: every
 message appended to a linked channel — a person's, an agent's, a run's
 delivery — is posted to each surface linked to it, once, under a
-``**author**`` header so a reader can tell who said it.
+``**author**`` header so a reader can tell who said it. A message that
+itself came in over a bridge says so in that header (``via slack``), and a
+guest's says ``guest`` too: a guest's name is whatever they call themselves
+on the other service, and without the marker a guest named after a member
+would read as that member on every other surface.
 
 The one rule that keeps a link from looping: a message that *came from* a
 surface is never posted back to that surface. Its ``origin`` names where it
-arrived, and that surface is skipped; other surfaces on the same channel
-still see it, which is what makes two linked services mirror each other.
+arrived, down to the thread when the link it came through names one, and
+that link is skipped; other links on the same channel still see it, which
+is what makes two linked services mirror each other.
 
 The mirror is a message observer on the collaboration store, so it runs on
 whichever thread wrote the message. It must not block: every post is handed
@@ -33,10 +38,25 @@ log = get_logger(__name__)
 def mirrored_text(message: Message) -> str:
     """One channel message as a bridge post: who said it, then what they
     said. The header is the same ``**name**`` an agent's run chronology
-    carries, so a reader sees one convention on the surface."""
+    carries, so a reader sees one convention on the surface.
+
+    A message that arrived over a bridge carries that in the header: which
+    service it came in over, and ``guest`` when its author has no account
+    here, so the name is their own claim and not a member's."""
     author = message.author
     name = author.display_name or author.id or "sbxloop"
+    backend = _origin_backend(message)
+    if backend:
+        name = f"{name} (guest, via {backend})" if author.id is None else f"{name} (via {backend})"
     return f"**{name}**\n{message.content}".strip()
+
+
+def _origin_backend(message: Message) -> str:
+    """The bridge a message came in over, or "" for one that did not."""
+    origin = message.origin
+    if not isinstance(origin, dict):
+        return ""
+    return str(origin.get("backend") or "")
 
 
 class ChannelMirror:
@@ -78,11 +98,16 @@ class ChannelMirror:
 
     @staticmethod
     def _came_from(message: Message, link: ChannelLink) -> bool:
-        """Did this message arrive on the surface this link names?"""
+        """Did this message arrive through this link? A thread link and a
+        whole-channel link on one surface are different links: what came in
+        through the thread still belongs on the channel, and the other way
+        round."""
         origin = message.origin or {}
+        thread = origin.get("thread_id")
         return (
             str(origin.get("backend") or "") == link.backend
             and str(origin.get("surface_id") or "") == link.surface_id
+            and (None if thread is None else str(thread)) == link.thread_id
         )
 
 
