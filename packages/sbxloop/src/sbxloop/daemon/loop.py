@@ -1693,6 +1693,7 @@ class DaemonLoop:
             poll_interval_s=self.config.daemon.poll_interval_s,
             source=self.source.name,
         )
+        self.narrate_repository_import()
         self._release_request_rejection_hold()
         self._report_restart()
         self._start_warmer()
@@ -2523,19 +2524,28 @@ class DaemonLoop:
     def _activate_repositories(self) -> None:
         """Apply the registry (importing the file's entries at first sight)
         and remember what this process polls: the enabled set now, which
-        is what the sources were built from."""
-        imported = self.repositories.activate()
+        is what the sources were built from. The import is narrated when
+        the daemon starts (:meth:`narrate_repository_import`), beside
+        ``daemon.started``, not here: recovery writes no chronology of its
+        own."""
+        self.repositories.activate()
         self.polled_repos = frozenset(r.repo.casefold() for r in self.config.enabled_repos())
-        if imported:
-            self._notice(
-                "daemon.repositories_imported",
-                f"📦 repositories: imported {', '.join(imported)} from sbxloop.toml — "
-                "registration lives in the daemon's database now (`POST`/`PATCH`/"
-                "`DELETE /v1/repositories` change it live); a `[[vcs.repos]]` entry still "
-                "carries the repository's other settings, and a new entry in the file is "
-                "registered at the next start",
-                repositories=imported,
-            )
+
+    def narrate_repository_import(self) -> None:
+        """Tell the humans, once, which of the file's entries this process
+        imported into the registry, and where registration lives now."""
+        imported = self.repositories.activate()
+        if not imported:
+            return
+        self._notice(
+            "daemon.repositories_imported",
+            f"📦 repositories: imported {', '.join(imported)} from sbxloop.toml — "
+            "registration lives in the daemon's database now (`POST`/`PATCH`/"
+            "`DELETE /v1/repositories` change it live); a `[[vcs.repos]]` entry still "
+            "carries the repository's other settings, and a new entry in the file is "
+            "registered at the next start",
+            repositories=imported,
+        )
 
     def repository_restart_required(self, entry: RepoConfig) -> bool:
         """Whether the registration's enabled state differs from what this

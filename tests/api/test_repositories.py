@@ -58,6 +58,10 @@ class TestTheFileIsImportedOnce:
                 ("o/one", "config", True),
                 ("o/two", "config", False),
             ]
+            # Narrated once the daemon starts, beside `daemon.started`; the
+            # harness never runs the loop, so it asks for the narration.
+            assert not _notices(api, "daemon.repositories_imported")
+            api.loop.narrate_repository_import()
             imported = _notices(api, "daemon.repositories_imported")
             assert len(imported) == 1 and "imported o/one, o/two from" in imported[0]
         api.ctx.close()
@@ -115,6 +119,7 @@ class TestTheFileIsImportedOnce:
             repos = _listed(again, again.bearer())
             assert [r["repository"] for r in repos] == ["o/one", "o/three"]
             assert again.loop.repositories.activate() == ["o/three"]
+            again.loop.narrate_repository_import()
             imported = _notices(again, "daemon.repositories_imported")
             assert "imported o/three from" in imported[-1]
         again.ctx.close()
