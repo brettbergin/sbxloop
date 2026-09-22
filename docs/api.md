@@ -147,7 +147,12 @@ stays archived).
 | `PATCH` | `/v1/agents/{slug}`         | `expected_revision` and changed fields | 200, the agent at the next revision |
 | `POST`  | `/v1/agents/{slug}/archive` | none                                   | 200, the agent with `enabled` false |
 
-All three need `collaboration:write`. A saved agent never takes a slug or an
+All three need `collaboration:write`. An agent belongs to the person who
+saved it: `PATCH` and archive are theirs and a workspace owner's or
+admin's, and anyone else answers 403 `agent_forbidden`. A saved agent
+whose stored spec no longer validates (a later release tightened a rule)
+is left out of listings, answers 422 `invalid_agent` on `PATCH`, and can
+still be archived. A saved agent never takes a slug or an
 alias a built-in, configured or other saved agent already has, and a body
 naming a key the spec does not have (a host list, an egress rule) is
 refused: egress stays the operator's `[policy]`. A spec that names an
@@ -1179,7 +1184,7 @@ request's `X-Request-Id`, and the fields a client needs to act:
 | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                  |
 | 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                     |
-| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                                         |
+| 403    | `forbidden` (with `capability`), `agent_forbidden`, `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                      |
 | 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                                             |
 | 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict` |
 | 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                          |

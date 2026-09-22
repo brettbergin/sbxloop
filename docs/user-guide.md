@@ -1894,9 +1894,13 @@ posts a comment signed with your name, and "close #12 as a duplicate of
 #7" comments and closes it as *not planned* (or *completed*) — but only
 after it has asked and you have said yes naming the issue, and never while
 a run is working that issue. `[concierge] create_issues` gates all of it.
-Actions are otherwise direct — it acts
-with the same authority as `!sbx`, so anyone who can mention it drives the
-daemon; restrict the channel accordingly — and every tool it used is
+Actions are otherwise direct — on the control channel it acts
+with the same authority as `!sbx`, so anyone who can mention it there
+drives the daemon; restrict the channel accordingly. From a product channel
+(the API) an operator command or a config change answers to the asking
+person's workspace role: a member's "pause the daemon" is refused by name,
+an admin's or owner's is done, and the reads work for everyone — and every
+tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
 line under your question, so nothing happens invisibly. Steering a live
 run still happens by @mentioning the bot in that run's thread; asked from

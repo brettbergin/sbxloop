@@ -36,6 +36,7 @@ from sbxloop.daemon.concierge import (
     ConciergeReply,
     concierge_run_id,
 )
+from sbxloop.daemon.controls.principal import ROLE_CAPABILITIES, Principal
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
@@ -264,8 +265,14 @@ def turn(
     author_id: str | None = None,
     on_code_work: Callable[[str, int, str], None] | None = None,
 ) -> ConciergeReply:
+    """One turn as a chat bridge submits it: the control channel is the
+    operator's, so the turn carries an explicit trusted principal."""
     return concierge.submit_turn(
-        text, author=author, author_id=author_id, on_code_work=on_code_work
+        text,
+        author=author,
+        author_id=author_id,
+        principal=Principal.trusted(author, "discord"),
+        on_code_work=on_code_work,
     ).result(timeout=10)
 
 
@@ -608,6 +615,87 @@ class TestTools:
         # JSON blob the concierge could paste into the channel
         assert "{" not in status.text and "consecutive failures: 0" in status.text
         assert "paused: True" in status.text
+
+    @staticmethod
+    def _person(role: str, user_id: str, name: str) -> Principal:
+        """The principal the API builds for a chat turn: the person's id,
+        their display name and what their workspace role grants."""
+        return Principal(
+            kind="client",
+            id=user_id,
+            display=name,
+            via="collaboration",
+            capabilities=ROLE_CAPABILITIES[role],  # type: ignore[index]
+        )
+
+    def test_sbx_control_answers_to_the_turns_principal(self, tmp_path: Path) -> None:
+        """A turn a person started carries that person's principal (#1274):
+        an operator verb is authorized as them, never as the daemon
+        operator. A member reads the status and is refused the pause."""
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("sbx_control", {"command": "pause"}),
+                        ("sbx_control", {"command": "status"}),
+                    ]
+                }
+            ],
+        )
+        concierge.submit_turn(
+            "pause the daemon",
+            author="Guest",
+            author_id="u-guest",
+            principal=self._person("member", "u-guest", "Guest"),
+        ).result(timeout=10)
+        pause, status = client.responses
+        assert pause.text.startswith("(command not accepted) pause refused:"), pause.text
+        assert "u-guest (via concierge) lacks daemon:manage" in pause.text
+        assert loop.paused is False and loop.hold_calls == []
+        assert status.ok and "queued" in status.text and "paused: False" in status.text
+        concierge.close()
+
+    def test_sbx_control_with_an_admins_principal_acts_as_them(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "pause"})]}]
+        )
+        concierge.submit_turn(
+            "pause the daemon",
+            author="Ada",
+            author_id="u-ada",
+            principal=self._person("admin", "u-ada", "Ada"),
+        ).result(timeout=10)
+        (pause,) = client.responses
+        assert pause.ok and "paused" in pause.text
+        # The source-facing attribution is the concierge's, as it always was.
+        assert loop.hold_calls == [("pause", "operator", "Ada (via concierge)")]
+        concierge.close()
+
+    def test_sbx_control_without_a_principal_keeps_the_read_verbs_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """A turn nobody vouched for fails closed: the read verbs answer, an
+        operator's verb does not. A bridge whose channel is the operator's
+        says so by handing over an explicit trusted principal."""
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("sbx_control", {"command": "status"}),
+                        ("sbx_control", {"command": "pause"}),
+                    ]
+                }
+            ],
+        )
+        concierge.submit_turn("pause please", author="Discord user `brett`").result(timeout=10)
+        status, pause = client.responses
+        assert status.ok and "queued" in status.text
+        assert pause.text.startswith("(command not accepted) pause refused:"), pause.text
+        assert "lacks daemon:manage" in pause.text
+        assert loop.paused is False and loop.hold_calls == []
+        concierge.close()
 
     def test_sbx_control_refuses_the_process_level_stop(self, tmp_path: Path) -> None:
         """`stop` ends the daemon process: an operator's verb, never the
@@ -3648,6 +3736,56 @@ class TestSetConfig:
         reply = turn(concierge, "raise the cap")
         (resp,) = client.responses
         return concierge, resp, loop, reply
+
+    def test_the_write_answers_to_the_turns_principal(self, tmp_path: Path) -> None:
+        """The operator's config is a `daemon:manage` write, from a chat
+        turn as from the admin routes (#1274): a member is refused by name
+        before anything is written; an admin's yes is acted on."""
+
+        def person(role: str, user_id: str, name: str) -> Principal:
+            return Principal(
+                kind="client",
+                id=user_id,
+                display=name,
+                via="collaboration",
+                capabilities=ROLE_CAPABILITIES[role],  # type: ignore[index]
+            )
+
+        args = {"key": "daemon.max_runs_per_day", "value": "20", "confirmation": self.YES}
+        concierge, client, _, loop, _ = make(
+            tmp_path / "member", [{"calls": [("set_config", args)], "text": "done"}]
+        )
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 3\n")
+        reply = concierge.submit_turn(
+            "raise the cap",
+            author="Guest",
+            author_id="u-guest",
+            principal=person("member", "u-guest", "Guest"),
+        ).result(timeout=10)
+        (resp,) = client.responses
+        assert resp.text.startswith(
+            "`daemon.max_runs_per_day` is not changed: u-guest (via concierge) lacks daemon:manage"
+        ), resp.text
+        assert resp.text.endswith("Nothing was written.")
+        assert self._text(concierge) == "[daemon]\nmax_runs_per_day = 3\n"
+        assert not loop.restarts and reply.after is None
+
+        concierge, client, _, loop, _ = make(
+            tmp_path / "admin", [{"calls": [("set_config", args)], "text": "done"}]
+        )
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 3\n")
+        reply = concierge.submit_turn(
+            "raise the cap",
+            author="Ada",
+            author_id="u-ada",
+            principal=person("admin", "u-ada", "Ada"),
+        ).result(timeout=10)
+        (resp,) = client.responses
+        assert resp.ok and resp.text.startswith("set `daemon.max_runs_per_day` = 20 in ")
+        assert self._text(concierge) == "[daemon]\nmax_runs_per_day = 20\n"
+        assert reply.after is not None
+        reply.after()
+        assert loop.restarts[0]["by"] == "Ada (via concierge)"
 
     def test_without_the_persons_words_nothing_is_written(self, tmp_path: Path) -> None:
         concierge, resp, loop, _ = self._run(
