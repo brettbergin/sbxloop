@@ -60,6 +60,7 @@ EFFECTS: dict[str, str] = {
     "item.retry": "the item is re-queued with attempts reset",
     "item.requeue": "the item is unpinned and re-queued",
     "repo.resume": "the repository is polled again from the next tick",
+    "repo.labels_sync": "every label the loop applies exists on the repository",
     "daemon.breaker_reset": "the breaker is closed and its failure count is zero",
     "schedule.add": "the schedule exists and fires from the next tick",
     "schedule.remove": "the schedule is gone",

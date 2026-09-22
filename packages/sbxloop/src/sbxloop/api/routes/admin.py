@@ -17,6 +17,7 @@ from sbxloop.api.models import (
     HoldRequest,
     HoldResult,
     RepositoryCreate,
+    RepositoryLabelSync,
     RepositoryResult,
     RepositoryUpdate,
     RestartRequest,
@@ -138,6 +139,24 @@ async def resume_repository(
         request, auth.principal, f"/v1/repositories/{repository_id}/resume", required=False
     )
     return await admin.resume_repository(ctx, auth, repository_id, pair)
+
+
+@router.post("/repositories/{repository_id}/labels/sync", response_model=RepositoryLabelSync)
+async def sync_repository_labels(
+    repository_id: str,
+    request: Request,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("daemon:manage")),  # noqa: B008
+) -> RepositoryLabelSync:
+    """Create the labels sbxloop relies on — the seven lifecycle labels
+    and the follow-up label, under this repository's own names — on a
+    registered repository, and say what it carries now. The repository is
+    read first: one that already carries every one of them is left
+    untouched, and reports itself compliant."""
+    pair = idempotency(
+        request, auth.principal, f"/v1/repositories/{repository_id}/labels/sync", required=False
+    )
+    return await admin.sync_repository_labels(ctx, auth, repository_id, pair)
 
 
 @router.post("/repositories", response_model=RepositoryResult, status_code=201)

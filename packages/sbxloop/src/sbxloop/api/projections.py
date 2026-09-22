@@ -35,6 +35,8 @@ from sbxloop.api.models import (
     Recipe,
     RepoHealth,
     Repository,
+    RepositoryLabel,
+    RepositoryLabels,
     Rounds,
     Run,
     Schedule,
@@ -60,6 +62,7 @@ from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.errors import SbxloopError
 from sbxloop.ghids import is_api_id, is_chat_id, is_schedule_id, try_parse_gh_id
 from sbxloop.recipes import RECIPES
+from sbxloop.vcs.github.labels import lifecycle_specs
 
 if TYPE_CHECKING:
     from sbxloop.api.collaboration import Member
@@ -520,6 +523,7 @@ class Views:
                     created_by=row.created_by if row is not None else None,
                     created_at=rfc3339(row.created_at) if row is not None else None,
                     restart_required=(entry.repo.casefold() in polled) != entry.enabled,
+                    labels=repository_labels(self.config, entry.repo, row),
                 )
             )
         return out
@@ -553,6 +557,50 @@ class Views:
 
 
 # -- administration (#1040) -----------------------------------------------------------
+
+
+def repository_labels(config: Any, repo: str, row: Any | None) -> RepositoryLabels:
+    """Whether ``repo`` carries the labels the loop applies, from the last
+    reading the daemon recorded (``[daemon] label_check_interval_s``, or a
+    label sync).
+
+    Fails closed. A repository nobody has been able to look at is
+    ``unknown``, and so is one whose reading was taken for other names
+    than the ones configured now — a renamed label makes the old answer an
+    answer to another question. Neither is reported as compliant.
+    """
+    specs = lifecycle_specs(config.labels_for(repo), config.landing.followup_label)
+    expected = [spec.name for spec in specs]
+    checked_at = getattr(row, "labels_checked_at", None) if row is not None else None
+    read_for = list(getattr(row, "labels_expected", ()) or ()) if row is not None else []
+    if checked_at is None or read_for != expected:
+        return RepositoryLabels(
+            state="unknown",
+            expected=expected,
+            labels=[
+                RepositoryLabel(
+                    name=spec.name, kind=spec.kind, description=spec.description, color=spec.color
+                )
+                for spec in specs
+            ],
+        )
+    missing = [name for name in getattr(row, "labels_missing", ()) or () if name in expected]
+    return RepositoryLabels(
+        state="incomplete" if missing else "compliant",
+        expected=expected,
+        missing=missing,
+        labels=[
+            RepositoryLabel(
+                name=spec.name,
+                kind=spec.kind,
+                description=spec.description,
+                color=spec.color,
+                present=spec.name not in missing,
+            )
+            for spec in specs
+        ],
+        checked_at=rfc3339(checked_at),
+    )
 
 
 def hold_view(hold: Any) -> Hold:

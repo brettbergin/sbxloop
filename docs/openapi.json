@@ -5590,6 +5590,9 @@
             "title": "Id",
             "type": "string"
           },
+          "labels": {
+            "$ref": "#/components/schemas/RepositoryLabels"
+          },
           "repository": {
             "title": "Repository",
             "type": "string"
@@ -5629,7 +5632,8 @@
           "repository",
           "forge",
           "trigger_label",
-          "workload_label"
+          "workload_label",
+          "labels"
         ],
         "title": "Repository",
         "type": "object"
@@ -5718,6 +5722,139 @@
           "data"
         ],
         "title": "RepositoryDiscovery",
+        "type": "object"
+      },
+      "RepositoryLabel": {
+        "additionalProperties": false,
+        "description": "One label the loop applies to ``repository``'s issues: the name it\ncarries here (a ``[[vcs.repos]]`` rename included), what it is for,\nand whether the repository has it.",
+        "properties": {
+          "color": {
+            "title": "Color",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Present"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "description",
+          "color"
+        ],
+        "title": "RepositoryLabel",
+        "type": "object"
+      },
+      "RepositoryLabelSync": {
+        "additionalProperties": false,
+        "description": "A label sync: the repository as it stands after it, what the sync\ncreated, and \u2014 when the forge refused a creation \u2014 what is still\nmissing.",
+        "properties": {
+          "created": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Created",
+            "type": "array"
+          },
+          "labels": {
+            "$ref": "#/components/schemas/RepositoryLabels"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/OperationOut"
+          },
+          "repository": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Repository"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "labels",
+          "operation"
+        ],
+        "title": "RepositoryLabelSync",
+        "type": "object"
+      },
+      "RepositoryLabels": {
+        "additionalProperties": false,
+        "description": "Whether a repository carries the labels sbxloop relies on.\n\n``compliant``: it carries every one of them, as of ``checked_at``.\n``incomplete``: ``missing`` names the ones it does not carry \u2014 a\nlabel sync creates exactly those. ``unknown``: nobody has been able\nto look yet (no reading has been taken, the forge would not answer,\nor the configured names have changed since the last reading), which\nis never reported as compliant.",
+        "properties": {
+          "checked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checked At"
+          },
+          "expected": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Expected",
+            "type": "array"
+          },
+          "labels": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryLabel"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "compliant",
+              "incomplete",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "RepositoryLabels",
         "type": "object"
       },
       "RepositoryResult": {
@@ -12751,6 +12888,49 @@
           }
         },
         "summary": "Update Repository",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/repositories/{repository_id}/labels/sync": {
+      "post": {
+        "description": "Create the labels sbxloop relies on \u2014 the seven lifecycle labels\nand the follow-up label, under this repository's own names \u2014 on a\nregistered repository, and say what it carries now. The repository is\nread first: one that already carries every one of them is left\nuntouched, and reports itself compliant.",
+        "operationId": "sync_repository_labels_v1_repositories__repository_id__labels_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryLabelSync"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sync Repository Labels",
         "tags": [
           "admin"
         ]

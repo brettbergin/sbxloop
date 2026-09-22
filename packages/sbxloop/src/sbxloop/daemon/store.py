@@ -610,7 +610,13 @@ class StoredSchedule(NamedTuple):
 class StoredRepository(NamedTuple):
     """A registered repository as the store holds it: the registration
     plus its provenance. ``removed_at`` is set on a registration that was
-    removed and whose row stays so the file's copy is not imported again."""
+    removed and whose row stays so the file's copy is not imported again.
+
+    The ``labels_*`` fields are the last look at the repository's sbxloop
+    labels (#630): when it was taken, the names it was taken for, and the
+    ones the repository did not carry. ``labels_checked_at`` of ``None``
+    means no look has been taken — never that the repository carries them.
+    """
 
     repo: str
     kind: str | None
@@ -621,6 +627,21 @@ class StoredRepository(NamedTuple):
     created_at: float
     updated_at: float
     removed_at: float | None = None
+    labels_checked_at: float | None = None
+    labels_expected: tuple[str, ...] = ()
+    labels_missing: tuple[str, ...] = ()
+
+
+def _label_names(raw: str | None) -> tuple[str, ...]:
+    """A stored JSON array of label names; an unreadable one is no names,
+    which reads as a check that has to be taken again."""
+    if not raw:
+        return ()
+    try:
+        names = json.loads(raw)
+    except ValueError:
+        return ()
+    return tuple(str(name) for name in names) if isinstance(names, list) else ()
 
 
 def _row_to_repository(row: RepositoryRow) -> StoredRepository:
@@ -634,6 +655,9 @@ def _row_to_repository(row: RepositoryRow) -> StoredRepository:
         created_at=float(row.created_at),
         updated_at=float(row.updated_at),
         removed_at=row.removed_at,
+        labels_checked_at=row.labels_checked_at,
+        labels_expected=_label_names(row.labels_expected),
+        labels_missing=_label_names(row.labels_missing),
     )
 
 
@@ -3128,6 +3152,37 @@ class DaemonStore:
                 update(RepositoryRow)
                 .where(RepositoryRow.repo == repo, RepositoryRow.removed_at.is_(None))
                 .values(updated_at=now, **values)
+            )
+            return _rowcount(result) == 1
+
+    def record_repository_labels(
+        self,
+        repo: str,
+        *,
+        expected: Sequence[str],
+        missing: Sequence[str],
+        now: float,
+    ) -> bool:
+        """Record the look just taken at ``repo``'s sbxloop labels: the
+        names it was taken for and the ones the repository did not carry.
+        False when ``repo`` is not registered (or was removed).
+
+        Only a look that answered is recorded. A forge that refused the
+        listing leaves the previous record standing, stale and dated, so
+        a reader can tell "last seen set up an hour ago" from "set up".
+        """
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(
+                    func.lower(RepositoryRow.repo) == repo.casefold(),
+                    RepositoryRow.removed_at.is_(None),
+                )
+                .values(
+                    labels_checked_at=now,
+                    labels_expected=json.dumps(list(expected)),
+                    labels_missing=json.dumps(list(missing)),
+                )
             )
             return _rowcount(result) == 1
 
