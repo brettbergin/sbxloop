@@ -5476,13 +5476,20 @@ class LoopEngine:
         """The target fields a chat event carries, when it was addressed.
 
         Empty for an untargeted message, so the events of a run nobody
-        steered by name are unchanged.
+        steered by name are unchanged. The agent is stamped only when the
+        run's assignment has it: the channel credits the reply to the agent
+        its event names, and a steer may name any slug, so a name the run
+        was never given must not leave here as the reply's author. The task
+        needs no check of its own: a message for a task the run does not
+        have, or one that is over, reaches the drain with its task cleared
+        (:meth:`_release_task_chat`).
         """
         target: dict[str, str] = {}
         if message.task_id is not None:
             target["task_id"] = message.task_id
-        if message.agent_slug is not None:
-            target["agent_slug"] = message.agent_slug
+        binding = self._chat_binding(message)
+        if binding is not None:
+            target["agent_slug"] = binding.slug
         return target
 
     def _chat_binding(self, message: ChatMessage) -> AgentBinding | None:
