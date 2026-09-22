@@ -11,6 +11,17 @@ is set, since a box open to every host could not keep a denied one out. The
 planner's bounds say which of these applies, and the validation message names
 the bare-suffix mistake and the `*` alternative.
 
+**The API lists the repositories the host's forge credential can see.**
+`GET /v1/repositories/available` (workspace owner; feature
+`repositories.discover`) reads, on the host and with the connection check's
+credential snapshot, every repository a personal token can see (owned,
+collaborator, organization member) or a GitHub App installation was granted,
+and GitLab's projects by membership, each marked `configured` when the daemon
+already declares it. A client registering a repository offers this list to
+pick from instead of a box to spell `owner/name` into. No credential answers
+`409 discovery_unavailable` naming what to set; a refusal is `502` with the
+status and never the forge's body. Nothing is written.
+
 **The docs say where a repository is declared.** Third part of #2255: the
 deployment guide, the console guide, the architecture map and the user guide
 describe `[[vcs.repos]]` as the one place a repository is declared, name the

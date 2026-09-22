@@ -547,6 +547,27 @@ until it has an execution backend. GitHub App credentials remain host-managed;
 the catalog identifies that auth method, and its check directs the operator to
 `sbxloop doctor` rather than claiming a PAT check verified the App installation.
 
+### Repository discovery
+
+When capability discovery includes `repositories.discover`, a workspace owner
+can ask `GET /v1/repositories/available` which repositories the host's forge
+credential can see, so a client offers a list to pick from instead of a box
+to spell `owner/name` into. `forge` defaults to `[vcs] kind`. The answer is
+`{forge, credential: {mode, login}, data: [...], truncated}`: `mode` is `pat`
+(a personal token, with the account it belongs to) or `app` (a GitHub App
+installation; its own repository list, no login), and every entry carries
+`repository`, `owner`, `name`, `private`, `archived`, `default_branch`,
+`url` and `configured` (already declared to this daemon). The listing is read
+from the forge now, on the host, with the same credential snapshot the
+connection check uses (`GH_TOKEN` / `GITHUB_TOKEN`, else the App; the
+`[vcs] token_env` variable for GitLab); it walks at most two thousand entries
+and says `truncated` past that. Nothing is written. Without a credential the
+route answers `409 discovery_unavailable` naming what to set; a forge that
+refuses the credential is `502 provider_error` with the status and never the
+body; an unreachable one is `502 provider_unreachable`. Registering a
+repository stays on the host's CLI for now; the route is the list to choose
+from.
+
 ### Workspace people
 
 A workspace holds owners, admins and members. These routes are advertised as
@@ -936,6 +957,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
 | `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
 | `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `GET`    | `/v1/repositories/available`                 | owner role             | What the host's forge credential can see, to pick one to register     |
 | `GET`    | `/v1/daemon/holds`                           | `runs:read`            | Standing holds and whose they are                                     |
 | `POST`   | `/v1/daemon/holds`                           | `daemon:manage`        | Take a hold attributed to this client                                 |
 | `DELETE` | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
