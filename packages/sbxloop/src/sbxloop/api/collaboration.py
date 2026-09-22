@@ -3284,14 +3284,20 @@ class CollaborationStore:
         display_name: str | None,
         external_message_id: str,
         now: float,
+        targets: tuple[str, ...] = (),
+        participants: tuple[str, ...] = (),
     ) -> tuple[Turn, Message]:
         """Append a message that arrived on a linked bridge surface, and the
         turn that answers it.
 
         The link is the authorization: whoever may post on the surface the
-        channel's owner linked posts here. A mapped author is credited to
-        their account; a guest (only where the link admits one) is a human
-        with no account, named by the handle they use on that service.
+        channel's owner linked posts here, with no ``post`` check against
+        the channel, and :meth:`recover_turns` honours the same rule after
+        a restart. A mapped author is credited to their account; a guest
+        (only where the link admits one) is a human with no account, named
+        by the handle they use on that service. ``targets`` are the agents
+        the message addresses, as :meth:`accept_turn` records them, and
+        ``participants`` the agents it mentions: each joins the channel.
         """
         origin = bridge_origin(
             link.backend,
@@ -3327,16 +3333,17 @@ class CollaborationStore:
                     channel_id=link.channel_id,
                     input_message_id=message_id,
                     status="accepted",
-                    targets_json=json.dumps([]),
+                    targets_json=json.dumps(list(targets)),
                     intent="conversation",
                     participants_json=json.dumps(
                         [
                             {
-                                "agent_slug": None,
+                                "agent_slug": target,
                                 "status": "queued",
                                 "error": None,
-                                "read_only": False,
+                                "read_only": target == "critic",
                             }
+                            for target in (targets or (None,))
                         ]
                     ),
                     created_at=now,
@@ -3346,6 +3353,24 @@ class CollaborationStore:
                     chain_depth=0,
                 )
             )
+            for slug in dict.fromkeys(participants):
+                if session.get(ChannelParticipantRow, (link.channel_id, slug)) is None:
+                    session.add(
+                        ChannelParticipantRow(
+                            channel_id=link.channel_id,
+                            agent_slug=slug,
+                            mode="mention",
+                            added_by_kind="human",
+                            added_by_id=author_user_id,
+                            created_at=now,
+                        )
+                    )
+                    _event(
+                        session,
+                        "collaboration.participant.added",
+                        now,
+                        data={"channel_id": link.channel_id, "agent_slug": slug},
+                    )
             channel.updated_at = now
             channel.revision += 1
             turn_row = session.get(TurnRow, turn_id)
@@ -3355,7 +3380,7 @@ class CollaborationStore:
                 session,
                 "collaboration.turn.accepted",
                 now,
-                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": []},
+                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": list(targets)},
             )
             _event(
                 session,
@@ -4052,6 +4077,26 @@ class CollaborationStore:
                                 guest_user(_origin_name(origin)),
                                 message.content,
                             )
+                        )
+                    else:
+                        interrupted.append((row.id, False))
+                    continue
+                if row.author_kind == "human" and row.author_id is not None and origin:
+                    # A mapped author on a linked surface: the link was the
+                    # authorization when the turn was accepted, with no
+                    # channel access check, and a restart keeps that rule.
+                    # The membership behind the map still has to hold, as
+                    # it did when the bridge mapped them.
+                    author = _member_in(session, row.author_id)
+                    if (
+                        channel is not None
+                        and channel.state == "active"
+                        and message is not None
+                        and author is not None
+                        and author.user.active
+                    ):
+                        queued.append(
+                            (message.sequence, _turn(session, row), author.user, message.content)
                         )
                     else:
                         interrupted.append((row.id, False))
