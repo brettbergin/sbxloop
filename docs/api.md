@@ -1116,7 +1116,7 @@ also the cursor.
    `Last-Event-ID` (or `?after=`), or `subscribe{after}` on `/v1/ws`.
 4. On a disconnect, reconnect from the last id. The stream says why it
    closed (`stream.closed` / `closing{reason}`: `daemon_stopping`,
-   `client_revoked`, `token_expired`).
+   `client_revoked`, `token_expired`, `access_revoked`).
 
 History is kept for `[api] replay_retention_s`; a cursor older than what
 remains is `410 cursor_expired` with a pointer to the snapshot, never a
@@ -1190,7 +1190,12 @@ and `has_more` means what it always meant:
 A live subscription moves its cursor past events its member may not see,
 so it does not scan them again. Membership changes apply from the next
 read (the stream and the socket re-read the member when they re-check the
-token). `GET /v1/events` and `GET /v1/events/stream` accept
+token). A stream or socket a member opened is pinned to that member: once
+they are removed from the workspace, or their client loses `runs:read`, it
+closes with `access_revoked` at the next re-check (the socket with close
+code 4403) and delivers nothing further, even while their access token
+still verifies; it never widens to the unfiltered view a plain API client
+gets. `GET /v1/events` and `GET /v1/events/stream` accept
 `channel_id=<chn_...>` to follow one channel.
 
 ## Errors
