@@ -6,11 +6,16 @@ import hashlib
 import json
 import time
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from sbxloop.api.channel_file_tools import read_channel_input, search_channel_input
+from sbxloop.api.channel_file_tools import (
+    read_channel_input,
+    search_channel_input,
+    strings_channel_input,
+)
 from sbxloop.backup import create_backup
 from sbxloop.daemon.concierge import ConciergeReply
 
@@ -189,6 +194,7 @@ def test_turn_attaches_files_and_agent_reads_only_its_snapshot(api: Any) -> None
         "list_channel_inputs",
         "read_channel_input",
         "search_channel_input",
+        "strings_channel_input",
     }
     file, chunk = api.ctx.channel_files.read_for_turn(turn_id, first, offset=0, limit=100)
     assert file.id == first and chunk == content
@@ -313,6 +319,8 @@ def test_search_channel_input_is_bounded_and_snapshot_scoped(api: Any) -> None:
 
     with pytest.raises(ToolRejectedError, match="unavailable"):
         search_channel_input(api.ctx, turn_id, {"file_id": later, "query": "test"})
+    with pytest.raises(ToolRejectedError, match="unavailable"):
+        strings_channel_input(api.ctx, turn_id, {"file_id": later})
     with pytest.raises(ToolRejectedError, match="nonempty"):
         search_channel_input(api.ctx, turn_id, {"file_id": first, "query": ""})
     with pytest.raises(ToolRejectedError, match="too long"):
@@ -359,3 +367,92 @@ def test_search_channel_input_limits_results_and_escapes_binary(api: Any) -> Non
         )
     )
     assert [match["offset"] for match in continuation["matches"]] == [61, 64, 67, 70, 73]
+
+
+def test_strings_channel_input_discovers_inert_binary_indicators(api: Any) -> None:
+    class CapturingConcierge:
+        def submit_turn(self, prompt: str, **kwargs: Any) -> Future[ConciergeReply]:
+            result: Future[ConciergeReply] = Future()
+            result.set_result(ConciergeReply("I can inspect the file."))
+            return result
+
+    api.ctx.concierge = CapturingConcierge()
+    headers, channel = _owner(api)
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures/channel_analysis/inert_keylogger_indicators.elf"
+    ).read_bytes()
+    first = _reserve(api, headers, channel, "sample-01.bin", len(fixture))
+    assert (
+        api.client.put(
+            f"/v1/channels/{channel}/files/{first}/content", headers=headers, content=fixture
+        ).status_code
+        == 200
+    )
+    sent = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Inspect this binary", "file_ids": [first], "client_turn_id": "strings-1"},
+    )
+    assert sent.status_code == 202, sent.text
+    turn_id = sent.json()["turn"]["id"]
+
+    result = json.loads(strings_channel_input(api.ctx, turn_id, {"file_id": first}))
+    values = {item["value"] for item in result["strings"]}
+    assert {"GetAsyncKeyState", "SetWindowsHookExA", "/dev/input/event0"} <= values
+    assert result["truncated"] is False
+    for item in result["strings"]:
+        assert fixture[item["offset"] : item["offset"] + len(item["value"])] == item[
+            "value"
+        ].encode("ascii")
+
+    from sbxloop.errors import ToolRejectedError
+
+    assert api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
+    with pytest.raises(ToolRejectedError, match="unavailable"):
+        strings_channel_input(api.ctx, turn_id, {"file_id": first})
+
+
+def test_strings_channel_input_continues_after_scan_and_result_limits(api: Any) -> None:
+    class CapturingConcierge:
+        def submit_turn(self, prompt: str, **kwargs: Any) -> Future[ConciergeReply]:
+            result: Future[ConciergeReply] = Future()
+            result.set_result(ConciergeReply("I can inspect the file."))
+            return result
+
+    api.ctx.concierge = CapturingConcierge()
+    headers, channel = _owner(api)
+    content = b"\x00ABCD\x00" + b"".join(f"S{n:03d}".encode() + b"\x00" for n in range(105))
+    first = _reserve(api, headers, channel, "strings.bin", len(content))
+    assert (
+        api.client.put(
+            f"/v1/channels/{channel}/files/{first}/content", headers=headers, content=content
+        ).status_code
+        == 200
+    )
+    sent = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Find strings", "file_ids": [first], "client_turn_id": "strings-2"},
+    )
+    assert sent.status_code == 202, sent.text
+    turn_id = sent.json()["turn"]["id"]
+
+    boundary = json.loads(
+        strings_channel_input(api.ctx, turn_id, {"file_id": first, "max_bytes": 3})
+    )
+    assert [(item["offset"], item["value"]) for item in boundary["strings"]] == [(1, "ABCD")]
+    assert boundary["next_offset"] == 5
+
+    first_page = json.loads(strings_channel_input(api.ctx, turn_id, {"file_id": first}))
+    assert len(first_page["strings"]) == 100
+    assert first_page["truncated"] is True
+    second_page = json.loads(
+        strings_channel_input(
+            api.ctx, turn_id, {"file_id": first, "offset": first_page["next_offset"]}
+        )
+    )
+    assert [item["value"] for item in second_page["strings"]] == [
+        f"S{n:03d}" for n in range(99, 105)
+    ]
+    assert second_page["truncated"] is False
