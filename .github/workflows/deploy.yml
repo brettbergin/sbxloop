@@ -351,8 +351,11 @@ jobs:
           dist="$(mktemp -d)"
           echo "dist=${dist}" >> "$GITHUB_OUTPUT"
           for attempt in 1 2 3 4 5; do
-            if gh release download "v${VERSION}" --repo "${REPO}" --dir "${dist}" \
-                 --pattern '*.whl' --clobber; then
+            # GitHub's tag lookup can report zero embedded assets even when
+            # the release's dedicated assets endpoint lists every file.
+            # The helper downloads exact wheel names and verifies each size
+            # and SHA-256 digest before the manifest check below.
+            if DIST="${dist}" "${VENV_PYTHON}" "${PIPELINE}" download-wheels; then
               ls -1 "${dist}"
               DIST="${dist}" "${VENV_PYTHON}" "${PIPELINE}" verify-download
               exit 0

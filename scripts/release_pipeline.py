@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ QUIET_SECONDS = 180
 MAX_BATCH_SECONDS = 1800
 DEPLOY_COOLDOWN_SECONDS = 1800
 MANIFEST = "release-manifest.json"
+MAX_RELEASE_ASSET_BYTES = 100_000_000
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -134,6 +136,48 @@ class Github:
                 name,
                 "--clobber",
             )
+
+    def download_assets(self, version: str, directory: Path, names: list[str]) -> None:
+        """Download selected release files without relying on the stale tag asset view."""
+        item = self.latest(version)
+        allowed = set(distribution_names(version)) | {MANIFEST}
+        if any(name not in allowed for name in names):
+            raise ValueError("unexpected release asset name")
+        assets = {asset["name"]: asset for asset in item["assets"]}
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            asset = assets.get(name)
+            if asset is None:
+                raise ValueError(f"missing release asset: {name}")
+            size = asset.get("size")
+            digest = asset.get("digest")
+            url = f"https://github.com/{self.repo}/releases/download/v{version}/{name}"
+            if (
+                asset.get("state") != "uploaded"
+                or type(size) is not int
+                or not 0 < size <= MAX_RELEASE_ASSET_BYTES
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                or asset.get("browser_download_url") != url
+            ):
+                raise ValueError(f"invalid release asset metadata: {name}")
+            target = directory / name
+            partial = directory / f".{name}.partial"
+            checksum = hashlib.sha256()
+            received = 0
+            try:
+                with urllib.request.urlopen(url, timeout=120) as source, partial.open("wb") as out:
+                    for chunk in iter(lambda: source.read(1 << 20), b""):
+                        received += len(chunk)
+                        if received > size:
+                            raise ValueError(f"release asset exceeds reported size: {name}")
+                        checksum.update(chunk)
+                        out.write(chunk)
+                if received != size or f"sha256:{checksum.hexdigest()}" != digest:
+                    raise ValueError(f"release asset checksum mismatch: {name}")
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
 
 
 def validate_release(item: dict) -> None:
@@ -512,6 +556,14 @@ def main() -> None:
         write_json(Path("pipeline/plan.json"), plan)
         output(**plan, proceed=plan["action"] != "noop")
         return
+    if mode == "download-wheels":
+        version = os.environ["VERSION"]
+        api.download_assets(
+            version,
+            Path(os.environ["DIST"]),
+            [name for name in distribution_names(version) if name.endswith(".whl")],
+        )
+        return
     if mode in {"restore", "stage", "publish"}:
         plan = json.loads(Path(os.environ["PLAN"]).read_text())
         version_key(plan["version"])
@@ -594,7 +646,7 @@ def main() -> None:
         item = api.latest(version)
         dist = Path(os.environ["DIST"])
         if any(asset["name"] == MANIFEST for asset in item["assets"]):
-            api.download(version, dist, [MANIFEST])
+            api.download_assets(version, dist, [MANIFEST])
             manifest = json.loads((dist / MANIFEST).read_text())
             if manifest.get("schema") != 1 or manifest.get("version") != version:
                 raise ValueError("invalid release manifest")

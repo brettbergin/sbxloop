@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
@@ -327,6 +329,50 @@ def test_dedicated_assets_remain_authoritative_when_summary_looks_complete(api):
 
     with pytest.raises(ValueError, match="assets"):
         client.latest()
+
+
+@pytest.mark.parametrize("bad_checksum", [False, True])
+def test_direct_release_download_checks_the_dedicated_asset_digest(
+    api, tmp_path, monkeypatch, bad_checksum
+):
+    client, fake = api
+    item = fake.release_payloads[0]
+    names = [name for name in pipeline.distribution_names("1.0.1") if name.endswith(".whl")]
+    files = {name: f"original {name}".encode() for name in [*names, pipeline.MANIFEST]}
+    assets = []
+    for name, content in files.items():
+        checksum = hashlib.sha256(content).hexdigest()
+        if bad_checksum and name == names[0]:
+            checksum = "0" * 64
+        assets.append(
+            {
+                "name": name,
+                "state": "uploaded",
+                "size": len(content),
+                "digest": f"sha256:{checksum}",
+                "browser_download_url": (f"https://github.com/o/r/releases/download/v1.0.1/{name}"),
+            }
+        )
+    for name in pipeline.distribution_names("1.0.1"):
+        if name.endswith(".tar.gz"):
+            assets.append({"name": name, "state": "uploaded", "size": 1})
+    fake.release_asset_payloads[item["id"]] = assets
+    item["assets"] = []  # the stale release-summary response
+    monkeypatch.setattr(
+        pipeline.urllib.request,
+        "urlopen",
+        lambda url, timeout: io.BytesIO(files[url.rsplit("/", 1)[1]]),
+    )
+
+    if bad_checksum:
+        with pytest.raises(ValueError, match="checksum"):
+            client.download_assets("1.0.1", tmp_path, names)
+        assert not (tmp_path / names[0]).exists()
+        assert not (tmp_path / f".{names[0]}.partial").exists()
+    else:
+        client.download_assets("1.0.1", tmp_path, [*names, pipeline.MANIFEST])
+        for name, content in files.items():
+            assert (tmp_path / name).read_bytes() == content
 
 
 @pytest.mark.parametrize("bad", ["../1.0.2", "1.0.2\nchanged=true", "1.0.2rc1", "01.0.2"])
