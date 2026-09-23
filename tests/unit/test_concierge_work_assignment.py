@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sbxloop.daemon.controls.principal import ROLE_CAPABILITIES, Principal
 from sbxloop.daemon.model import WorkItem
 from tests.unit.test_daemon_concierge import FakeGithub, make
 
@@ -27,6 +28,14 @@ def test_a_chat_workload_carries_the_channel_and_the_agents(tmp_path: Path) -> N
         channel_id="chn_kitchen",
         work_lead="concierge",
         work_roles={"planner": "baker"},
+        # A channel's turn carries the member's principal, as the API hands it over.
+        principal=Principal(
+            kind="client",
+            id="u-ana",
+            display="ana",
+            via="collaboration",
+            capabilities=ROLE_CAPABILITIES["member"],
+        ),
     ).result(timeout=10)
     item = dstore.get("chat:m1")
     assert item is not None
@@ -40,7 +49,9 @@ def test_a_turn_that_names_nothing_queues_as_before(tmp_path: Path) -> None:
     concierge, _, _, _, dstore = make(
         tmp_path, [{"calls": [("start_workload", {"ask": "Bake bread"})], "text": "queued"}]
     )
-    concierge.submit_turn("bake", author="ana", message_id="m2").result(timeout=10)
+    concierge.submit_turn(
+        "bake", author="ana", message_id="m2", principal=Principal.trusted("ana", "discord")
+    ).result(timeout=10)
     item = dstore.get("chat:m2")
     assert item is not None
     assert (item.channel_id, item.lead_agent, item.assignment_json) == (None, None, None)
