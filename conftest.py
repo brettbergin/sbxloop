@@ -17,7 +17,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         metavar="I/N",
         help="run only the I-th of N deterministic slices of the collected tests "
-        "(1-based); CI spreads the slow marker over runners this way",
+        "(1-based); CI spreads the full collection over runners this way",
     )
 
 
@@ -37,10 +37,10 @@ def _shard(spec: str) -> tuple[int, int]:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Every test on the fake sbx is process-bound: each ``sbx`` call is
     ``sh`` → interpreter → the fake, and a pipeline test makes ~50 of them
-    plus real worker launches. Those ~950 tests carry the ``slow`` marker
+    plus real worker launches. Those tests carry the ``slow`` marker
     automatically, so the commit gate (``make test-fast`` / ``-m "not slow"``)
-    runs the other ~5700 without them — about three minutes on four cores.
-    CI still runs everything, both halves spread over runners with ``--shard``
+    runs the remaining tests without them.
+    CI still runs everything, in mixed slices spread over runners with ``--shard``
     (#750).
 
     This hook is ``tryfirst`` so the marker lands before pytest's own ``-m``

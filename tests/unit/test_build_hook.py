@@ -51,3 +51,29 @@ def test_built_wheel_embeds_worker_wheel(tmp_path: Path) -> None:
         names = zf.namelist()
     expected = f"sbxloop/_vendor/sbxloop_worker-{sbxloop.__version__}-py3-none-any.whl"
     assert expected in names
+    subprocess.run(
+        ["uv", "build", "--package", "sbxloop-worker", "--wheel", "-o", str(out_dir)],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        timeout=300,
+        env=env,
+    )
+    # Exercise the delivered wheel through a clean install, including CLI
+    # startup, metadata pins, and the exact bytes the host will provision.
+    subprocess.run(
+        [
+            "uv",
+            "run",
+            "--no-sync",
+            "python",
+            str(REPO_ROOT / "scripts/smoke_wheels.py"),
+            str(out_dir),
+            sbxloop.__version__,
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        timeout=300,
+        env=env,
+    )

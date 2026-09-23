@@ -273,6 +273,9 @@ class FakeGithub(GithubOps):
         self.release_api_error: Exception | None = None
         self.release_files: dict[tuple[str, str], bytes] = {}
         self.release_commands: list[tuple[str, ...]] = []
+        self.release_ci_runs: list[dict[str, Any]] = []
+        self.release_ci_jobs: dict[int, list[dict[str, Any]]] = {}
+        self.release_workflow_runs: list[dict[str, Any]] = []
         self.repos_created: list[tuple[str, dict[str, Any]]] = []
         self.contents_written: list[tuple[str, dict[str, Any]]] = []
         self.comments_deleted: list[int] = []
@@ -302,6 +305,23 @@ class FakeGithub(GithubOps):
         if route.startswith("compare/"):
             return {"status": self.release_compare_status}
         resource, _, query = route.partition("?")
+        if resource == "actions/workflows/ci.yml":
+            return {"id": 42, "path": ".github/workflows/ci.yml"}
+        if resource in ("actions/workflows/ci.yml/runs", "actions/workflows/release.yml/runs"):
+            params = parse_qs(query)
+            values = self.release_ci_runs if "ci.yml" in resource else self.release_workflow_runs
+            for key in ("head_sha", "event", "head_branch", "status"):
+                query_key = "branch" if key == "head_branch" else key
+                if query_key in params:
+                    values = [item for item in values if item.get(key) == params[query_key][0]]
+            page = int(params.get("page", ["1"])[0])
+            return {"workflow_runs": values[(page - 1) * 100 : page * 100]}
+        if resource.startswith("actions/runs/"):
+            run_id = int(resource.split("/")[2])
+            if resource.endswith("/jobs"):
+                page = int(parse_qs(query).get("page", ["1"])[0])
+                return {"jobs": self.release_ci_jobs[run_id][(page - 1) * 100 : page * 100]}
+            return next(item for item in self.release_ci_runs if item["id"] == run_id)
         if resource in ("tags", "releases"):
             page = int(parse_qs(query).get("page", ["1"])[0])
             values = self.release_tags if resource == "tags" else self.release_payloads
@@ -311,6 +331,8 @@ class FakeGithub(GithubOps):
     def release_command(self, *args: str) -> str:
         """The gh release file transport used by workflow staging/retry tests."""
         self.release_commands.append(args)
+        if args[:4] == ("gh", "workflow", "run", "release.yml"):
+            return ""
         assert args[:2] == ("gh", "release"), args
         operation, tag = args[2:4]
         item = next((r for r in self.release_payloads if r["tag_name"] == tag), None)
