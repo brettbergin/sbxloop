@@ -436,6 +436,38 @@ class TestShutdown:
         for item_id in ("gh:o/a:issue:1", "gh:o/b:issue:2"):
             assert h.dstore.get(item_id).state == "running"  # type: ignore[union-attr]
 
+    def test_quiesce_returns_when_its_thread_already_holds_the_run_lock(
+        self, tmp_path: Path
+    ) -> None:
+        """A SIGTERM handler runs ``quiesce`` on the main thread, which is
+        also the loop thread and takes the run lock about once a second. A
+        signal landing while that thread holds the lock must still stop the
+        daemon and ask every run to cancel, not block on its own lock."""
+        h = _harness(tmp_path, shutdown_grace_s=WAIT_S)
+        gate = Gate(h)
+        h.loop._runner = gate.runner
+        h.source.items = [_item("o/a", "1"), _item("o/b", "2")]
+        h.loop.tick()
+        gate.wait_started("gh:o/a:issue:1")
+        gate.wait_started("gh:o/b:issue:2")
+        engines = [r.engine for r in h.loop.runs]
+
+        def interrupted_loop_thread() -> None:
+            # The signal handler re-entering the thread mid-``with``.
+            with h.loop._current_lock:
+                h.loop.quiesce()
+
+        handler = threading.Thread(target=interrupted_loop_thread, daemon=True)
+        handler.start()
+        handler.join(WAIT_S)
+        if handler.is_alive():
+            gate.finish_all()  # let the run threads end; the handler is stuck for good
+        assert not handler.is_alive(), "quiesce deadlocked on the run lock its thread holds"
+        assert all(e._cancel_event.is_set() for e in engines)
+        h.loop.drain()
+        for item_id in ("gh:o/a:issue:1", "gh:o/b:issue:2"):
+            assert h.dstore.get(item_id).state == "running"  # type: ignore[union-attr]
+
 
 class TestLiveRunIds:
     def test_orphan_steering_is_settled_except_for_every_live_run(self, tmp_path: Path) -> None:
