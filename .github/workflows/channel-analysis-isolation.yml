@@ -22,7 +22,7 @@ permissions:
 
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
-  SBXLOOP_APP_NAME: sbxloop-analysis-isolation
+  SBXLOOP_APP_NAME: sbxloop-analysis
   SBX_PROBE_NAME: analysis-isolation-${{ github.run_id }}
   XDG_STATE_HOME: /tmp/sbx-analysis-state
   SBXLOOP_ANALYSIS_HOST_SENTINEL: host-only-probe
