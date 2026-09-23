@@ -2307,10 +2307,32 @@ class TestStaleRunReconciliation:
             self._age(h, run_id, h.clock.t - 99999.0)
         h.loop._current = RunHandle(gh_item("2"), "r_live", cast(Any, None), EventBus())
         h.loop._reconcile_stale_runs(h.clock.t)
-        # A live run means the daemon is working: nothing is swept.
-        for run_id in ("r_live", "r_other"):
-            assert h.store.get_run(run_id).state == "awaiting_ci"
+        # The live run is left alone; a stale run beside it is still swept.
+        assert h.store.get_run("r_live").state == "awaiting_ci"
+        assert [e.type for _, e in h.store.events("r_live")] == []
+        other = h.store.get_run("r_other")
+        assert other.state == "failed"
+        assert other.reason is not None and "stale" in other.reason
+        assert [e.type for _, e in h.store.events("r_other")] == ["run.reconciled"]
+
+    def test_stale_run_swept_while_other_runs_are_live(self, tmp_path: Path) -> None:
+        """Under concurrent load some run is live on almost every tick: the
+        sweep must still close a stale run, and never a live one."""
+        h = self._stale_harness(tmp_path)
+        for run_id in ("r_live1", "r_live2", "r_stale"):
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "decomposing")
+            self._age(h, run_id, h.clock.t - 99999.0)
+        for number, run_id in (("2", "r_live1"), ("3", "r_live2")):
+            h.loop._register(RunHandle(gh_item(number), run_id, cast(Any, None), EventBus()))
+        h.loop._reconcile_stale_runs(h.clock.t)
+        for run_id in ("r_live1", "r_live2"):
+            assert h.store.get_run(run_id).state == "decomposing"
             assert [e.type for _, e in h.store.events(run_id)] == []
+        stale = h.store.get_run("r_stale")
+        assert stale.state == "failed"
+        assert stale.reason is not None and "stale" in stale.reason
+        assert [e.type for _, e in h.store.events("r_stale")] == ["run.reconciled"]
 
     def test_zero_threshold_disables_the_sweep(self, tmp_path: Path) -> None:
         config = Config.model_validate(
