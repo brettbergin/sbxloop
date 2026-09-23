@@ -53,6 +53,12 @@ class SbxNotFoundError(SbxError):
     """The sbx binary is missing, or a referenced sandbox does not exist."""
 
 
+class SbxSettleTimeoutError(SbxError):
+    """``sbx rm`` succeeded but sbx still listed the sandbox when the settle
+    wait ran out: a teardown the backend accepted and is still reaping. Slow,
+    not refused, so a caller retries it rather than giving up on the name."""
+
+
 class SbxAuthError(SbxError):
     """sbx refused because nobody is signed in to Docker on the host: a
     session that expired, or a host that never ran ``sbx login``. Every

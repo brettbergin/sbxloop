@@ -9,6 +9,7 @@ twice -- is refused by name, before anything is admitted or filed.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -487,6 +488,185 @@ class TestDedupeSurvivesTheTurn:
             offered(later, agent, parent_item_id="api:p"), "start_run", kind="code", ask="fix  it"
         )
         assert "already" in text
+        assert len(github.created) == 1
+
+
+class TestAnAskCanBeAskedAgain:
+    """A duplicate is the same ask still in flight, or already started today
+    and not ended in failure -- not every wording the agent ever used."""
+
+    def test_the_same_ask_after_the_first_run_failed_is_accepted(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path)
+        ask = "run the dependency audit"
+        assert "queued workload" in call(
+            offered(work, scout(), channel_id="ch1"), "start_run", kind="workload", ask=ask
+        )
+        (item,) = harness.dstore.items()
+        harness.dstore.set_state(item.item_id, "failed", harness.clock())
+        # Someone else, in another channel, on a later turn.
+        later = AgentWorkService(harness.loop, clock=harness.clock)
+        text = call(
+            offered(later, scout(), channel_id="ch2"), "start_run", kind="workload", ask=ask
+        )
+        assert "queued workload" in text
+        assert [i.state for i in harness.dstore.items()] == ["queued"]
+
+    def test_the_same_issue_filed_yesterday_is_filed_today(self, tmp_path: Path) -> None:
+        work, harness, github = service(tmp_path)
+        assert "filed issue" in call(
+            offered(work, scout()), "file_issue", repo="o/r", title="Flaky test", body="It fails."
+        )
+        harness.clock.t += 86_400
+        later = AgentWorkService(harness.loop, clock=harness.clock)
+        text = call(
+            offered(later, scout()), "file_issue", repo="o/r", title="Flaky test", body="Again."
+        )
+        assert "filed issue" in text
+        assert len(github.created) == 2
+
+    def test_a_workload_done_yesterday_can_be_asked_for_today(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path)
+        tools = offered(work, scout())
+        assert "queued workload" in call(
+            tools, "start_run", kind="workload", ask="the weekly digest"
+        )
+        (item,) = harness.dstore.items()
+        harness.dstore.set_state(item.item_id, "done", harness.clock())
+        # The same day, a finished ask is still one the agent already made.
+        assert "already" in call(tools, "start_run", kind="workload", ask="the weekly digest")
+        harness.clock.t += 86_400
+        text = call(tools, "start_run", kind="workload", ask="the weekly digest")
+        assert "queued workload" in text
+        assert [i.state for i in harness.dstore.items()] == ["queued"]
+
+    def test_the_ledger_does_not_keep_earlier_days(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path)
+        tools = offered(work, scout())
+        assert "filed issue" in call(tools, "file_issue", repo="o/r", title="One", body="a")
+        harness.clock.t += 86_400
+        assert "filed issue" in call(tools, "file_issue", repo="o/r", title="Two", body="b")
+        assert len(harness.dstore.values_with_prefix("agent_work:")) == 1
+
+
+class Crash(BaseException):
+    """The process dying mid-call: nothing in the daemon catches it."""
+
+
+class HeldGithub(FakeGithub):
+    """Holds the first ``issue_create`` open until released, so a second
+    turn runs while the first is between its checks and its record."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def issue_create(
+        self, repo: str, title: str, body: str, labels: list[str] | None = None
+    ) -> FakeIssueRef:
+        if not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10)
+        return super().issue_create(repo, title, body, labels)
+
+
+class CrashingGithub(FakeGithub):
+    """Files the issue, then the process dies before the call returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.crash = True
+
+    def call(self, fn: Any) -> Any:
+        result = fn(self)
+        if self.crash:
+            raise Crash
+        return result
+
+
+class TestTheCapAndTheDedupeAreExact:
+    """Two turns of one agent run at once (two channels, parallel tool
+    calls), and a process can die between filing and noting that it filed:
+    neither may start more than the cap or the same ask twice."""
+
+    @staticmethod
+    def _race(tmp_path: Path, first: str, second: str, **sections: Any) -> tuple[str, str, int]:
+        work, harness, _ = service(tmp_path, **sections)
+        github = HeldGithub()
+        harness.loop.github = github
+        answers: dict[str, str] = {}
+
+        def first_turn() -> None:
+            answers["first"] = call(
+                offered(work, scout()), "file_issue", repo="o/r", title=first, body="a"
+            )
+
+        thread = threading.Thread(target=first_turn)
+        thread.start()
+        try:
+            assert github.entered.wait(10)
+            other = AgentWorkService(harness.loop, clock=harness.clock)
+            answers["second"] = call(
+                offered(other, scout()), "file_issue", repo="o/r", title=second, body="b"
+            )
+        finally:
+            github.release.set()
+            thread.join(10)
+        return answers["first"], answers["second"], len(github.created)
+
+    def test_two_concurrent_asks_under_a_cap_of_one_start_one(self, tmp_path: Path) -> None:
+        first, second, created = self._race(
+            tmp_path, "One", "Two", agent_team={"max_agent_runs_per_day": 1}
+        )
+        assert "filed issue" in first
+        assert "max_agent_runs_per_day" in second
+        assert created == 1
+
+    def test_the_same_ask_twice_at_once_is_filed_once(self, tmp_path: Path) -> None:
+        first, second, created = self._race(tmp_path, "Flaky test", "Flaky  test")
+        assert "filed issue" in first
+        assert "already" in second
+        assert created == 1
+
+    def test_a_crash_after_filing_still_counts_and_is_not_filed_again(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path, agent_team={"max_agent_runs_per_day": 2})
+        github = CrashingGithub()
+        harness.loop.github = github
+        with pytest.raises(Crash):
+            call(offered(work, scout()), "file_issue", repo="o/r", title="Flaky", body="a")
+        github.crash = False
+        later = AgentWorkService(harness.loop, clock=harness.clock)
+        tools = offered(later, scout())
+        assert "already" in call(tools, "file_issue", repo="o/r", title="Flaky", body="a")
+        assert "filed issue" in call(tools, "file_issue", repo="o/r", title="Other", body="b")
+        assert "max_agent_runs_per_day" in call(
+            tools, "file_issue", repo="o/r", title="3", body="c"
+        )
+        assert len(github.created) == 2
+
+    def test_a_crash_before_filing_does_not_block_the_ask_forever(self, tmp_path: Path) -> None:
+        work, harness, github = service(tmp_path)
+        github.fail = Crash()
+        with pytest.raises(Crash):
+            call(offered(work, scout()), "file_issue", repo="o/r", title="Flaky", body="a")
+        github.fail = None
+        harness.clock.t += 3600
+        later = AgentWorkService(harness.loop, clock=harness.clock)
+        text = call(offered(later, scout()), "file_issue", repo="o/r", title="Flaky", body="a")
+        assert "filed issue" in text
+        assert len(github.created) == 1
+
+    def test_a_forge_refusal_frees_the_ask_at_once(self, tmp_path: Path) -> None:
+        from sbxloop.errors import GithubOpsError
+
+        work, _, github = service(tmp_path, agent_team={"max_agent_runs_per_day": 1})
+        tools = offered(work, scout())
+        github.fail = GithubOpsError("rate limited")
+        assert "filing the issue failed" in call(
+            tools, "file_issue", repo="o/r", title="Flaky", body="a"
+        )
+        github.fail = None
+        assert "filed issue" in call(tools, "file_issue", repo="o/r", title="Flaky", body="a")
         assert len(github.created) == 1
 
 

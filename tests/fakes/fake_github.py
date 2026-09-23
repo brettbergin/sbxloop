@@ -269,6 +269,7 @@ class FakeGithub(GithubOps):
         self.release_heads: list[str] = ["a" * 40]
         self.release_tags: list[dict[str, Any]] = []
         self.release_payloads: list[dict[str, Any]] = []
+        self.release_asset_payloads: dict[int, list[dict[str, Any]]] = {}
         self.release_compare_status = "ahead"
         self.release_api_error: Exception | None = None
         self.release_files: dict[tuple[str, str], bytes] = {}
@@ -322,6 +323,13 @@ class FakeGithub(GithubOps):
                 page = int(parse_qs(query).get("page", ["1"])[0])
                 return {"jobs": self.release_ci_jobs[run_id][(page - 1) * 100 : page * 100]}
             return next(item for item in self.release_ci_runs if item["id"] == run_id)
+        assets_match = re.fullmatch(r"releases/(\d+)/assets", resource)
+        if assets_match:
+            release_id = int(assets_match[1])
+            item = next(r for r in self.release_payloads if r.get("id") == release_id)
+            values = self.release_asset_payloads.get(release_id, item["assets"])
+            page = int(parse_qs(query).get("page", ["1"])[0])
+            return values[(page - 1) * 100 : page * 100]
         if resource in ("tags", "releases"):
             page = int(parse_qs(query).get("page", ["1"])[0])
             values = self.release_tags if resource == "tags" else self.release_payloads

@@ -1,5 +1,33 @@
 ## [Unreleased]
 
+**An agent's daily cap and its "already asked" check hold when two turns
+start work at once, and a failed or day-old ask can be asked again.** An
+agent that may start work (`can_start`) was refused the same wording
+forever, by anyone in any channel, because every start it ever made was
+kept and matched whatever became of it, even when that run failed; and the
+cap read and parsed that whole history on every call. The check now
+matches only work still in flight, or work started today that did not end
+in failure, and earlier days are dropped from the record. Separately, the
+cap and the check ran with nothing held and the start was noted only after
+the issue was filed, so two turns at once could both pass either one, and
+a daemon that died right after filing left an issue that was neither
+counted nor recognised. The start is now reserved under one lock before
+anything is admitted or filed and filled in afterwards; a refused start
+gives its reservation back, and one a crash cut short stops blocking the
+same ask after ten minutes (it still counts for the day). (#1242, #1243)
+
+**A slow sandbox teardown is no longer reported as a wedged box.** After
+`sbx rm` succeeds the daemon waits up to 30s for sbx to stop listing the box;
+a backend still reaping it at that point used to be handled like one that
+cannot remove it at all: `github_sandbox.wedged` at ERROR with a "restart
+sbx-sandboxd" hint, and the name retired for the life of the process, so
+every slow teardown burned another generation. A settle timeout is now its
+own error: the daemon's forge box logs it as a warning
+(`github_sandbox.stale_settling` or `github_sandbox.remove_settling`), keeps
+the name, steps past it for that one provision rather than creating over a
+teardown still in flight, and retries the removal at the next cleanup. A
+removal `sbx rm` itself fails still retires the name as before. (#1228)
+
 **`doctor --deep --fail-on-drift` stops failing on a verdict change it
 already reported, and on one that came from an older probe.** A verdict that
 changed between sbx versions was reported on every run for as long as the

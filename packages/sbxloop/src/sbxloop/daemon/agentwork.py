@@ -18,14 +18,22 @@ Two shapes of start:
   repository's trigger label. Discovery picks it up like any other labelled
   issue, and reads the origin back out of the marker in its body.
 
-Every start is written to a small durable ledger in ``daemon_state`` the
-moment it happens, because the two things the guardrails ask about cannot
+Every start is written to a small durable ledger in ``daemon_state``
+before it happens, because the two things the guardrails ask about cannot
 be answered from the work itself. A filed issue leaves no row in the
 store until a poll discovers it minutes or hours later, so counting items
 would let an agent file all day before the cap noticed; and a service is
 built fresh for every participant of every turn, so an in-memory note of
 what was already filed is empty again on the next message. The ledger is
 what makes ``runs_started_today`` and :meth:`duplicate` answer across both.
+
+A row is reserved (``pending``, no ref) under one lock every turn shares,
+after the checks and before the side effect, and filled in with what the
+start produced once it has one. So two turns at once cannot both pass the
+cap or the same ask, and a process that dies after filing still has the
+filing counted and recognised. The rows are keyed by the pool's day and
+the agent, so the cap reads only today's rows for one agent, and each
+reservation drops the rows of earlier days: a day-old ask is a new ask.
 
 Refusals are :class:`ToolRejectedError`, whose text the agent reads and
 can act on; nothing here raises a bare exception at a session.
@@ -34,7 +42,9 @@ can act on; nothing here raises a bare exception at a session.
 from __future__ import annotations
 
 import json
+import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from sbxloop.agents.origin import origin_footer, origin_marker, strip_origin_markers
@@ -50,12 +60,17 @@ from sbxloop.daemon.controls.intake import WorkloadAdmission
 from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.controls.results import ControlError
 from sbxloop.daemon.controls.service import ControlService
+from sbxloop.daemon.store import TERMINAL_ITEM_STATES
 from sbxloop.errors import DaemonError, GithubOpsError, SbxError, ToolRejectedError, WorkerError
+from sbxloop.ghids import issue_item_id
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from sbxloop.agents.definition import AgentDefinition
     from sbxloop.config import Config
+    from sbxloop.daemon.model import WorkItem
 
 __all__ = ["AgentWorkService"]
 
@@ -65,10 +80,23 @@ log = get_logger(__name__)
 #: rides the id, so the store itself makes one ask idempotent forever.
 _KEY_PREFIX = "agent-"
 
-#: The ``daemon_state`` key prefix of the ledger: one row per piece of work
-#: an agent started, keyed by its dedupe key (which already folds in the
-#: agent and the parent, so the key alone identifies the ask).
+#: The ``daemon_state`` key prefix of the ledger: one row per start, keyed
+#: ``<day start>:<agent>:<dedupe key>:<nonce>``, so a prefix reads one day,
+#: one agent's day, or one ask's day.
 _LEDGER_PREFIX = "agent_work:started:"
+
+#: How long a reserved row with no ref stands for a start still in flight.
+#: A start fills its row within seconds; one older than this was cut short
+#: by a crash, and no longer blocks the ask (it still counts for the day).
+_PENDING_TTL_S = 600.0
+
+#: The ends of an item that did not produce what was asked: the same ask
+#: may be asked again.
+_UNSUCCESSFUL_STATES = TERMINAL_ITEM_STATES - {"done"}
+
+#: Held across the checks and the reservation. One daemon per process, and
+#: a service is built fresh per turn, so the lock is the module's.
+_ADMITTING = threading.Lock()
 
 
 class AgentWorkService:
@@ -129,13 +157,10 @@ class AgentWorkService:
         """How much work ``agent_slug`` has started since the pool's day
         began -- read from the ledger, so a restart does not hand an agent a
         fresh allowance and a queued issue counts from the moment it is
-        filed rather than from whenever a poll happens to discover it."""
-        start, _ = self.loop.usage_pool.day(self.clock())
-        return sum(
-            1
-            for entry in self._ledger().values()
-            if entry.get("agent") == agent_slug and float(entry.get("ts") or 0.0) >= start
-        )
+        filed rather than from whenever a poll happens to discover it. A
+        reserved row counts too: that is what keeps two turns at once under
+        the cap."""
+        return len(self.loop.dstore.values_with_prefix(f"{self._today()}{agent_slug}:"))
 
     def budget_refusal(self) -> str | None:
         admission = self.loop.usage_pool.admit_run(None, self.clock())
@@ -148,17 +173,75 @@ class AgentWorkService:
         )
         return f"{which} ([daemon] {admission.reason})"
 
-    def duplicate(self, dedupe_key: str) -> str | None:
-        raw = self.loop.dstore.get_value(f"{_LEDGER_PREFIX}{dedupe_key}")
-        if raw is not None:
-            entry = self._entry(raw)
-            ref = entry.get("ref") if entry else None
-            if isinstance(ref, str) and ref:
-                return ref
+    def duplicate(self, agent_slug: str, dedupe_key: str) -> str | None:
+        """What this ask already produced that still stands: a workload
+        still in flight whenever it was asked, or a start today that is in
+        flight or did not end in failure. A failed ask, or one from an
+        earlier day, is asked again."""
         item = self.loop.dstore.get(f"api:{_KEY_PREFIX}{dedupe_key}")
-        return item.item_id if item is not None else None
+        if item is not None and item.state not in TERMINAL_ITEM_STATES:
+            return str(item.item_id)
+        now = self.clock()
+        rows = self.loop.dstore.values_with_prefix(f"{self._today()}{agent_slug}:{dedupe_key}:")
+        for raw in rows.values():
+            entry = self._entry(raw)
+            ref = entry.get("ref")
+            if not isinstance(ref, str) or not ref:
+                if now - float(entry.get("ts") or 0.0) < _PENDING_TTL_S:
+                    return "a start of the same ask that is still in progress"
+                continue
+            produced = self._produced(entry)
+            if produced is not None and produced.state in _UNSUCCESSFUL_STATES:
+                continue
+            return ref
+        return None
+
+    def admitting(self) -> AbstractContextManager[object]:
+        return _ADMITTING
+
+    def reserve(self, agent_slug: str, dedupe_key: str) -> str:
+        today = self._today()
+        self._prune(today)
+        reservation = f"{today}{agent_slug}:{dedupe_key}:{uuid.uuid4().hex[:12]}"
+        self.loop.dstore.set_value(
+            reservation,
+            json.dumps({"agent": agent_slug, "ts": self.clock(), "state": "pending"}),
+        )
+        return reservation
+
+    def release(self, reservation: str) -> None:
+        if reservation.startswith(_LEDGER_PREFIX):
+            self.loop.dstore.set_value(reservation, None)
 
     # -- the ledger -----------------------------------------------------------
+
+    def _today(self) -> str:
+        """The key prefix of the ledger rows for the pool's current day."""
+        start, _ = self.loop.usage_pool.day(self.clock())
+        return f"{_LEDGER_PREFIX}{int(start)}:"
+
+    def _prune(self, today: str) -> None:
+        """Drop every row an earlier day wrote: nothing reads them again,
+        so the ledger holds one day, not the daemon's whole history."""
+        for key in self.loop.dstore.values_with_prefix(_LEDGER_PREFIX):
+            if not key.startswith(today):
+                self.loop.dstore.set_value(key, None)
+
+    def _produced(self, entry: dict[str, Any]) -> WorkItem | None:
+        """The item a start became, when the store has it: the workload
+        itself, or the issue once a poll discovered it."""
+        item_id = entry.get("item")
+        if isinstance(item_id, str) and item_id:
+            found: WorkItem | None = self.loop.dstore.get(item_id)
+            return found
+        number, repo = entry.get("number"), entry.get("repo")
+        if not isinstance(number, int) or not isinstance(repo, str):
+            return None
+        for candidate in (issue_item_id(number, repo), issue_item_id(number)):
+            item: WorkItem | None = self.loop.dstore.get(candidate)
+            if item is not None and (item.repo or repo) == repo:
+                return item
+        return None
 
     @staticmethod
     def _entry(raw: str) -> dict[str, Any]:
@@ -168,30 +251,29 @@ class AgentWorkService:
             return {}
         return entry if isinstance(entry, dict) else {}
 
-    def _ledger(self) -> dict[str, dict[str, Any]]:
-        """Every start this daemon has recorded, by dedupe key."""
-        rows = self.loop.dstore.values_with_prefix(_LEDGER_PREFIX)
-        return {
-            key[len(_LEDGER_PREFIX) :]: entry
-            for key, raw in rows.items()
-            if (entry := self._entry(raw))
-        }
+    def _record(
+        self, request: StartRequest | IssueRequest, ref: str, kind: str, **produced: Any
+    ) -> None:
+        """Fill in the row reserved for this start with what it produced,
+        before the tool answers.
 
-    def _record(self, request: StartRequest | IssueRequest, ref: str, kind: str) -> None:
-        """Note that this ask has been started, before the tool answers.
-
-        This is what the daily cap counts and what :meth:`duplicate` finds,
-        so it lands for every shape of start -- a workload, a queued issue
-        and an unqueued one alike.
+        The reserved row is what the daily cap counts and what
+        :meth:`duplicate` finds, so it lands for every shape of start -- a
+        workload, a queued issue and an unqueued one alike -- and
+        ``produced`` says where to look for how the work ended.
         """
+        agent = request.origin.agent_slug
+        reservation = request.reservation or self.reserve(agent, request.dedupe_key)
         self.loop.dstore.set_value(
-            f"{_LEDGER_PREFIX}{request.dedupe_key}",
+            reservation,
             json.dumps(
                 {
-                    "agent": request.origin.agent_slug,
+                    "agent": agent,
                     "ts": self.clock(),
                     "ref": ref,
                     "kind": kind,
+                    "state": "started",
+                    **produced,
                 },
                 sort_keys=True,
             ),
@@ -252,7 +334,7 @@ class AgentWorkService:
             outcome = ControlService(self.loop).admit(principal, admission)
         except ControlError as exc:
             raise ToolRejectedError(exc.message) from exc
-        self._record(request, outcome.item.item_id, "workload")
+        self._record(request, outcome.item.item_id, "workload", item=outcome.item.item_id)
         log.info(
             "agent_work.started",
             agent=request.origin.agent_slug,
@@ -285,6 +367,7 @@ class AgentWorkService:
             channel_id=request.channel_id,
             dedupe_key=request.dedupe_key,
             on_behalf_of=request.on_behalf_of,
+            reservation=request.reservation,
         )
         return self.file_issue(issue)
 
@@ -309,7 +392,13 @@ class AgentWorkService:
             )
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             raise ToolRejectedError(f"filing the issue failed: {exc}") from exc
-        self._record(request, str(ref.url or ref.number), "code" if request.queue else "issue")
+        self._record(
+            request,
+            str(ref.url or ref.number),
+            "code" if request.queue else "issue",
+            repo=request.repo,
+            number=ref.number,
+        )
         self._note_channel(request, str(ref.number))
         log.info(
             "agent_work.issue_filed",
