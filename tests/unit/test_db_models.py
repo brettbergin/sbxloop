@@ -17,7 +17,8 @@ from sqlalchemy import Engine, inspect
 import sbxloop.db.api_models
 import sbxloop.db.collaboration_models
 import sbxloop.db.daemon_models
-import sbxloop.db.engine_models  # noqa: F401  - registers the models on Base
+import sbxloop.db.engine_models
+import sbxloop.db.job_models  # noqa: F401  - registers the models on Base
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db import Base, open_engine
 from sbxloop.engine.store import StateStore
@@ -46,6 +47,7 @@ DAEMON_TABLES = (
     "daemon_pending_clarifications",
     "daemon_local_messages",
     "daemon_schedules",
+    "daemon_repositories",
     "daemon_holds",
     "workspace_usage",
 )
@@ -55,6 +57,8 @@ API_TABLES = (
     "api_clients",
     "api_refresh_tokens",
     "api_token_revocations",
+    "api_oidc_sessions",
+    "api_oidc_logouts",
     "api_public_ids",
     "api_steering",
     "api_artifacts",
@@ -66,6 +70,7 @@ COLLABORATION_TABLES = (
     "collaboration_channel_participants",
     "collaboration_messages",
     "collaboration_message_artifacts",
+    "collaboration_input_files",
     "collaboration_channel_summaries",
     "collaboration_turns",
     "collaboration_teams",
@@ -78,6 +83,10 @@ COLLABORATION_TABLES = (
     "collaboration_channel_links",
     "collaboration_external_identities",
     "channel_run_posts",
+    "collaboration_jobs",
+    "collaboration_job_items",
+    "collaboration_job_runs",
+    "collaboration_job_pending",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 

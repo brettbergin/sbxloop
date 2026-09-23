@@ -259,6 +259,75 @@ class TestReviewApproval:
         assert len(followup_events(h, run_id)) == 1
 
 
+def finishing_filer(h: Harness, seen: list[dict[str, Any]]) -> type:
+    """A FollowupFiler stand-in that records what the daemon had already
+    written about the run when the filing began, then fails the way a
+    long GitHub pass interrupted by a restart or an outage would."""
+
+    class Filer:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def file(self, run: Any, rounds: Any, *, issues_enabled: Any = None) -> None:
+            item_id = h.dstore.item_for_run(run.run_id)
+            assert item_id is not None
+            item = h.dstore.get(item_id)
+            assert item is not None
+            seen.append(
+                {
+                    "state": item.state,
+                    "ledger_finished": run.run_id in h.dstore.finished_run_ids([run.run_id]),
+                    "reported": any(c[0] == "merged" for c in h.source.calls),
+                }
+            )
+            raise RuntimeError("GitHub is unreachable")
+
+    return Filer
+
+
+class TestFilingAfterTheFinish:
+    """Once the PR is merged the item is finished and its report delivered
+    before any follow-up is filed: a restart during the filing pass then
+    leaves nothing gated, and recovery has nothing left to settle."""
+
+    def test_an_approved_gate_finishes_the_item_before_filing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h, fake, run_id = gate_ready(tmp_path)
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr("sbxloop.daemon.loop.FollowupFiler", finishing_filer(h, seen))
+        approve(h, run_id)
+        assert fake.merges
+        assert seen == [{"state": "done", "ledger_finished": True, "reported": True}]
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "done"
+        assert item.pending_report is None
+        assert h.dstore.merge_gate_for(run_id).state == "merged"  # type: ignore[union-attr]
+        assert fake.issues_created == []
+
+    def test_an_approved_review_wait_finishes_the_item_before_filing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h, fake = review_harness(tmp_path)
+        run_id = park_for_review(h)
+        seed_review(h, run_id, followup())
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr("sbxloop.daemon.loop.FollowupFiler", finishing_filer(h, seen))
+        fake.reviews_payload = [
+            human_review("alice", "APPROVED", "", id=1),
+            human_review("bob", "APPROVED", "", id=2),
+        ]
+        h.clock.t += 600
+        h.loop.tick()
+        hold = landed(h, run_id)
+        assert hold.state == "merged" and fake.merges
+        assert seen == [{"state": "done", "ledger_finished": True, "reported": True}]
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "done"
+        assert item.pending_report is None
+        assert fake.issues_created == []
+
+
 class TestIssueBody:
     def _candidate(self) -> Any:
         (cand,) = collect_followups(

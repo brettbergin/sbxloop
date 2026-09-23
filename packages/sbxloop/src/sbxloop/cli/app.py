@@ -47,6 +47,7 @@ from sbxloop.config import (
 )
 from sbxloop.configedit import Change, ConfigEditError, ConfigEditor, applies_for
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
+from sbxloop.daemon.repositories import RepositoryRegistry
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.data import config_presets, render_config_template
@@ -2642,6 +2643,15 @@ def daemon(
     archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
     dstore = DaemonStore(db_path)
+    # Where a repository is registered: the daemon's database. The file's
+    # entries are imported at first sight, and everything below — the
+    # repository guard, the item attribution, the sources — reads the
+    # registry's list. The loop shares this registry and narrates the
+    # import once it recovers.
+    registry = RepositoryRegistry(config, dstore)
+    imported = registry.activate()
+    if imported:
+        log.info("daemon.repositories_imported", repositories=imported)
     # Schedules live in the store (#818): a daemon with stored schedules
     # and nothing else is a valid daemon, as one with `[[schedules]]` was.
     if (
@@ -2822,7 +2832,15 @@ def daemon(
                 github.close()
         raise typer.Exit(code)
 
-    loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
+    loop = DaemonLoop(
+        config,
+        store=store,
+        dstore=dstore,
+        source=source,
+        sbx=sbx,
+        github=github,
+        repositories=registry,
+    )
     polled = source.github
     if isinstance(polled, MultiRepoIssueSource):
         polled.notify = loop.source_notice

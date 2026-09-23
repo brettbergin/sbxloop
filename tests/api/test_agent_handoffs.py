@@ -16,6 +16,7 @@ from sbxloop.api.context import _visible_agent_reply
 from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.errors import ToolRejectedError
 from sbxloop.log import configure_logging
+from tests.api.conftest import build
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_controls import Blocking
 from tests.api.test_collaboration_recovery import settled
@@ -487,3 +488,119 @@ def test_prose_mentions_alone_do_not_dispatch_a_peer_into_this_turn(api: Any) ->
     assert api.ctx.turns.wait_idle(timeout=5)
     again = api.client.get(f"{route}/{turn['id']}", headers=headers).json()
     assert [p["agent_slug"] for p in again["participants"]] == ["planner"]
+
+
+class WorkHandoffConcierge(FakeConcierge):
+    """Each participant, in order, hands the person's ask to the next peer
+    in ``chain``; the transport records what every participant was offered."""
+
+    def __init__(self, chain: tuple[str, ...]) -> None:
+        super().__init__()
+        self.chain = chain
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        index = len(self.calls)
+        if index < len(self.chain):
+            kwargs["handoff"](self.chain[index], f"Carry on with step {index + 1}")
+        return super().submit_turn(text, **kwargs)
+
+
+SCOUT_SPEC: dict[str, Any] = {
+    "slug": "scout",
+    "name": "Scout",
+    "instructions": "Gather the facts first.",
+    "roles": ["planner"],
+    "can_start": ["workload"],
+}
+
+
+def _start_run(call: dict[str, Any], ask: str) -> str:
+    """Invoke the ``start_run`` a participant was offered; the refusal text
+    when it was refused, else the text the agent reads."""
+    (tool,) = [tool for tool in call["agent_tools"] if tool.spec.name == "start_run"]
+    try:
+        return str(tool.impl({"kind": "workload", "ask": ask}))
+    except ToolRejectedError as exc:
+        return f"refused: {exc}"
+
+
+def test_a_handoff_peer_starts_work_one_hop_deeper_than_the_agent_that_handed_off(
+    tmp_path: Path,
+) -> None:
+    """Agent-started work counts its chain depth through handoffs: a person's
+    turn is depth 0, so the agent the person asked starts work at depth 1,
+    and a peer it hands off to sits at depth 1 and would start at depth 2.
+    With ``max_chain_depth = 1`` the peer's start is what the knob refuses."""
+    built = build(
+        tmp_path,
+        config={
+            "agent_team": {"max_chain_depth": 1},
+            "workloads": [{"name": "research", "sinks": ["chat"]}],
+        },
+    )
+    with built.client:
+        concierge = WorkHandoffConcierge(("helper",))
+        built.ctx.concierge = concierge
+        headers = bearer(register(built))
+        for spec in (SCOUT_SPEC, {**SCOUT_SPEC, "slug": "helper", "name": "Helper"}):
+            created = built.client.post("/v1/agents", json=spec, headers=headers)
+            assert created.status_code == 201, created.text
+        channel = built.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        accepted = built.client.post(
+            f"/v1/channels/{channel}/turns",
+            headers=headers,
+            json={"content": "@scout research the options", "intent": "delegate"},
+        ).json()
+        done = settled(built.client, headers, channel, accepted["turn"]["id"])
+        assert done["status"] == "completed", done
+        assert [c["session_key"] for c in concierge.calls] == [
+            f"{channel}:scout",
+            f"{channel}:helper",
+        ]
+        assert [p["requested_by"] for p in done["participants"]] == [None, "scout"]
+        # The agent the person asked is at depth 0: the chain-depth knob
+        # does not refuse its start.
+        assert "max_chain_depth" not in _start_run(concierge.calls[0], "compare the options")
+        # Its peer is one hop deeper, which is the knob's limit.
+        refusal = _start_run(concierge.calls[1], "compare them again")
+        assert refusal.startswith("refused: ")
+        assert "1 agent-started hop deep" in refusal
+        assert "max_chain_depth is 1" in refusal
+    built.ctx.close()
+
+
+def test_a_handoff_from_an_agent_that_may_start_work_keeps_every_peer_guarded(api: Any) -> None:
+    """A handoff never grants a peer more starting power than the agent that
+    handed off had. An agent whose starts answer to its ``can_start``
+    guardrails is never offered the concierge's unguarded start tools, so
+    the peers it hands off to (a built-in, and through it Angie) are not
+    offered them either; the peers are still not demoted to read-only. A
+    handoff from an agent that declares no ``can_start`` is unchanged."""
+    concierge = WorkHandoffConcierge(("planner", "concierge"))
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    assert api.client.post("/v1/agents", json=SCOUT_SPEC, headers=headers).status_code == 201
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@scout file and label an issue for the options", "intent": "delegate"},
+    ).json()
+    done = settled(api.client, headers, channel, accepted["turn"]["id"])
+    assert done["status"] == "completed", done
+    assert [p["agent_slug"] for p in done["participants"]] == ["scout", "planner", "concierge"]
+    assert [c["guarded_start"] for c in concierge.calls] == [False, True, True]
+    assert [c["read_only"] for c in concierge.calls] == [False, False, False]
+    assert [c["start_work"] for c in concierge.calls] == [True, True, True]
+
+    concierge = WorkHandoffConcierge(("concierge",))
+    api.ctx.concierge = concierge
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@planner file and label an issue for the options", "intent": "delegate"},
+    ).json()
+    done = settled(api.client, headers, channel, accepted["turn"]["id"])
+    assert done["status"] == "completed", done
+    assert [p["agent_slug"] for p in done["participants"]] == ["planner", "concierge"]
+    assert [c["guarded_start"] for c in concierge.calls] == [False, False]

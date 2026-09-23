@@ -145,6 +145,23 @@ class TestAdmitTurn:
         assert admission.ok is False and admission.reason == "token_budget"
         assert admission.retry_at == day_window(NOON, "UTC")[1]
 
+    def test_a_refusal_is_described_with_the_budget_and_when_it_resets(
+        self, tmp_path: Path
+    ) -> None:
+        """What a person is told: the day's spend against the budget and
+        the boundary at which chat and runs resume, in the pool's zone."""
+        h = _harness_at_noon(tmp_path, daily_token_budget=10, run_cap_timezone="Europe/Paris")
+        pool = _pool(h)
+        pool.charge(
+            source="turn", ref_id="t1", agent_slug=None, channel_id=None, usage=_tokens(7, 5)
+        )
+        admission = pool.admit_turn("ch-1", None, NOON)
+        assert admission.ok is False
+        assert pool.refusal_text(admission, NOON) == (
+            "the workspace token budget is spent for today (Europe/Paris): "
+            "12/10 tokens; chat turns and new runs resume at 00:00 Europe/Paris"
+        )
+
     def test_the_run_cap_does_not_apply_to_turns(self, tmp_path: Path) -> None:
         h = _harness_at_noon(tmp_path, max_runs_per_day=1)
         h.source.items = [gh_item("1")]

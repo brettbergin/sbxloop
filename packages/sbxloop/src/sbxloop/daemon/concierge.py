@@ -71,6 +71,7 @@ from sbxloop.daemon.chat_choices import (
 )
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
+from sbxloop.daemon.controls.principal import Capability, Principal
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.model import WorkItem, live_runs, requested_roles_json
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -198,6 +199,12 @@ class TurnContext:
     #: context instead.
     owner: object = field(default=None, compare=False, repr=False)
     author_id: str | None = None
+    #: Who the turn acts as when a tool runs an operator command or writes
+    #: the config: the person who asked, holding what their role grants
+    #: (#1274). ``None`` is a turn nobody vouched for, which such tools
+    #: treat as read-only; a surface that trusts its channel says so with
+    #: an explicit :meth:`Principal.trusted`.
+    principal: Principal | None = None
     via: str | None = None
     message_id: str | None = None
     session_key: str | None = None
@@ -210,6 +217,11 @@ class TurnContext:
     start_work: bool = True
     role: Role = "concierge"
     read_only: bool = False
+    #: The turn descends, through handoffs, from an agent whose starts
+    #: answer to the agent-team guardrails (its ``can_start``): the
+    #: concierge's own start tools, which check none of them, are withheld
+    #: from it as they are from that agent.
+    guarded_start: bool = False
     handoff: Callable[[str, str], str] | None = None
     #: The agents ``handoff_agent`` offers; ``None`` offers the built-ins.
     handoff_agents: tuple[str, ...] | None = None
@@ -247,6 +259,12 @@ class TurnContext:
 
 #: Who ``handoff_agent`` may address when the turn does not say.
 _HANDOFF_BUILTINS = ("concierge", "planner", "builder", "critic", "operator")
+
+#: What a turn with no principal may do through ``sbx_control``: the read
+#: verbs (``status``, ``queue``, ``items``, ``schedules``, ``log``) and
+#: nothing that acts. Failing closed here means a caller that forgets to
+#: say who is asking cannot drive the daemon as its operator.
+_UNVOUCHED_CAPABILITIES: frozenset[Capability] = frozenset({"runs:read", "diagnostics:read"})
 
 _CURRENT_TURN: ContextVar[TurnContext | None] = ContextVar("sbxloop_concierge_turn", default=None)
 
@@ -557,6 +575,10 @@ class Concierge:
         return self._turn.read_only
 
     @property
+    def _turn_guarded_start(self) -> bool:
+        return self._turn.guarded_start
+
+    @property
     def _turn_handoff(self) -> Callable[[str, str], str] | None:
         return self._turn.handoff
 
@@ -588,6 +610,27 @@ class Concierge:
     def _turn_model(self) -> ModelSelection:
         return self._turn.model
 
+    def _turn_principal(self, by: str) -> Principal:
+        """Who an operator command or config write on this turn runs as.
+
+        The turn's principal keeps its identity, capabilities and workspace,
+        so the control service refuses what the person's role does not
+        grant and the audit record names them; its attribution becomes the
+        ``by`` the tool composed (``<author> (via concierge)``), so the
+        source hears the sentence it always heard. A turn with no principal
+        gets the read verbs alone.
+        """
+        principal = self._turn.principal
+        if principal is None:
+            return Principal(
+                kind="system",
+                id="unvouched",
+                display=by,
+                via="concierge",
+                capabilities=_UNVOUCHED_CAPABILITIES,
+            )
+        return replace(principal, display=by, via="concierge")
+
     @property
     def _via(self) -> str:
         return self._turn_via or self._default_via
@@ -606,6 +649,7 @@ class Concierge:
         *,
         author: str,
         author_id: str | None = None,
+        principal: Principal | None = None,
         on_tool: ToolCallback | None = None,
         via: str | None = None,
         message_id: str | None = None,
@@ -616,6 +660,7 @@ class Concierge:
         history: str | None = None,
         agent_role: Role = "concierge",
         read_only: bool = False,
+        guarded_start: bool = False,
         handoff: Callable[[str, str], str] | None = None,
         on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
         on_code_work: Callable[[str, int, str], None] | None = None,
@@ -631,7 +676,12 @@ class Concierge:
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
-        recorded as the requester of any issue this turn files; ``via`` is
+        recorded as the requester of any issue this turn files;
+        ``principal`` is who the turn's operator command or config write is
+        authorized as (the person who asked, with what their role grants):
+        a turn without one may only read through those tools, so a surface
+        whose channel is the operator's passes ``Principal.trusted``
+        explicitly; ``via`` is
         the bridge the message came in on, so the reply is worded for it;
         ``message_id`` is the transport's id for the message, the key of a
         workload this turn starts (#760) so asking twice queues once.
@@ -643,7 +693,10 @@ class Concierge:
         it answers and the agent that speaks (the role when unset);
         ``agent_tools`` are the answering agent's own tools (its memory),
         offered only when the turn may act. ``start_work`` false withholds
-        the tools that start managed work, so the turn can only reply.
+        the tools that start managed work, so the turn can only reply;
+        ``guarded_start`` withholds only the concierge's own start tools,
+        for a turn an agent with ``can_start`` handed off to, so the
+        handoff is not the way round that agent's guardrails.
         ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
         this turn starts is admitted with: the channel it answers to, the
         lead and the agent per run role (already checked by the caller).
@@ -664,6 +717,7 @@ class Concierge:
                 model=self._idle_turn.model,
                 owner=self,
                 author_id=author_id,
+                principal=principal,
                 via=via,
                 message_id=message_id,
                 session_key=session_key,
@@ -673,6 +727,7 @@ class Concierge:
                 start_work=start_work,
                 role=agent_role,
                 read_only=read_only,
+                guarded_start=guarded_start,
                 handoff=handoff,
                 handoff_agents=None if handoff_agents is None else tuple(handoff_agents),
                 model_override=model,
@@ -1340,11 +1395,15 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
-        if any(tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools):
+        if self._turn_guarded_start or any(
+            tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools
+        ):
             # An agent offered its own guarded start_run / file_issue starts
             # work only through them: these check none of its can_start,
             # chain depth, daily cap or dedupe, so leaving them beside the
-            # guarded pair would make every one of those a suggestion.
+            # guarded pair would make every one of those a suggestion. A
+            # peer such an agent handed off to is not offered them either,
+            # or the handoff would be the way round the same guardrails.
             for name in UNGUARDED_START_TOOLS:
                 available.pop(name, None)
         for tool in self._turn_agent_tools:
@@ -2055,8 +2114,15 @@ class Concierge:
                 "process itself — and is not available from here; `cancel` stops the current "
                 "run, `pause` keeps the daemon from claiming more."
             )
+        # Authorized as the person the turn belongs to (#1274): `dispatch`
+        # would otherwise trust the concierge completely, whoever asked.
         reply = dispatch(
-            self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
+            self.loop,
+            command,
+            prefix=self._chat.command_prefix,
+            by=by,
+            via="concierge",
+            principal=self._turn_principal(by),
         )
         if reply.after is not None:
             # Not here: the model has not composed its answer yet, and a
@@ -2633,6 +2699,14 @@ class Concierge:
         if error is not None:
             return error
         assert dotted is not None
+        # The operator's config is a `daemon:manage` write, as it is on the
+        # admin routes: the person the turn belongs to must hold it (#1274).
+        principal = self._turn_principal(by)
+        if not principal.can("daemon:manage"):
+            return (
+                f"`{dotted}` is not changed: {principal.id} (via {principal.via}) lacks "
+                "daemon:manage. Nothing was written."
+            )
         unset = bool(args.get("unset", False))
         value = str(args.get("value") if args.get("value") is not None else "")
         if not unset and not value.strip():
@@ -2674,6 +2748,7 @@ class Concierge:
             new=change.new,
             unset=unset,
             by=by,
+            principal=principal.audit(),
             confirmation=confirmation,
             backup=str(backup) if backup else None,
         )

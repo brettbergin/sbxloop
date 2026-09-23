@@ -238,6 +238,9 @@ def test_merge_moves_everything_the_second_account_made(served: Api, idp: FakeId
     assert json.loads(event.data_json or "{}") == {
         "source_user_id": source_id,
         "target_user_id": target_id,
+        "previous_role": "owner",
+        "role": "owner",
+        "readmitted": False,
     }
 
 
@@ -273,7 +276,9 @@ def test_the_source_accounts_tokens_stop_working(served: Api, idp: FakeIdP) -> N
         json={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
     )
     assert refreshed.status_code == 401, refreshed.text
-    assert _me(served, tokens).status_code in {401, 403}
+    me = _me(served, tokens)
+    assert me.status_code == 401, me.text
+    assert me.json()["code"] == "user_inactive"
 
 
 def test_a_dry_run_reports_and_writes_nothing(served: Api, idp: FakeIdP) -> None:
@@ -391,6 +396,125 @@ def test_a_target_with_another_provider_identity_is_refused(served: Api, idp: Fa
         assert source is not None and source.active == 1 and source.oidc_subject == "bergs"
 
 
+def test_a_deactivated_sources_role_is_not_taken(served: Api, idp: FakeIdP) -> None:
+    """A merge takes nothing from an account somebody deliberately shut off."""
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    store = _store(served)
+    # A third account owns the workspace, so the two being merged can
+    # hold any role between them.
+    keeper = _user(served, _sign_in(served, idp, "keeper", email=None)["client_id"])
+    store.set_role(str(keeper.id), "owner")
+    store.set_role(target_id, "member")
+    store.set_role(source_id, "admin")
+    store.update_member(source_id, active=False, now=served.clock())
+
+    report = store.merge_users(source_id, target_id, served.clock())
+
+    assert report.role == "member"
+    member = store.member_for_user(target_id)
+    assert member is not None and member.role == "member"
+
+
+def test_a_target_outside_the_workspace_is_not_re_admitted_silently(
+    served: Api, idp: FakeIdP
+) -> None:
+    """Removing a person from the workspace outlives a merge into them,
+    unless the operator asks for the re-admission on purpose."""
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    store = _store(served)
+    store.set_role(source_id, "owner")
+    assert store.remove_member(target_id, now=served.clock()) is True
+
+    with pytest.raises(CollaborationError) as caught:
+        store.merge_users(source_id, target_id, served.clock())
+
+    assert caught.value.code == "merge_target_not_member"
+    assert store.member_for_user(target_id) is None
+    assert _merged_events(served) == []
+    with _store(served).dstore.read() as session:
+        source = session.get(LocalUserRow, source_id)
+        assert source is not None and source.active == 1
+
+
+def test_an_explicit_re_admission_brings_the_target_back(served: Api, idp: FakeIdP) -> None:
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    store = _store(served)
+    store.set_role(source_id, "owner")
+    assert store.remove_member(target_id, now=served.clock()) is True
+
+    report = store.merge_users(source_id, target_id, served.clock(), readmit=True)
+
+    assert report.readmitted is True
+    assert (report.previous_role, report.role) == (None, "owner")
+    member = store.member_for_user(target_id)
+    assert member is not None and member.role == "owner"
+
+
+def test_the_merge_event_names_the_operator_and_the_role_change(served: Api, idp: FakeIdP) -> None:
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    store = _store(served)
+    store.set_role(source_id, "owner")
+    store.set_role(target_id, "member")
+    actor = {"kind": "operator", "id": "opsy", "via": "cli"}
+
+    store.merge_users(source_id, target_id, served.clock(), actor=actor)
+
+    (event,) = _merged_events(served)
+    assert json.loads(event.actor_json or "null") == actor
+    assert json.loads(event.data_json or "{}") == {
+        "source_user_id": source_id,
+        "target_user_id": target_id,
+        "previous_role": "member",
+        "role": "owner",
+        "readmitted": False,
+    }
+
+
+def test_a_selector_that_is_both_a_user_id_and_a_username_is_refused(
+    served: Api, idp: FakeIdP
+) -> None:
+    """A username nobody should have been allowed to take cannot stand in
+    for the user whose id it spells."""
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    store = _store(served)
+    with store.dstore.transaction() as session:
+        source = session.get(LocalUserRow, source_id)
+        assert source is not None
+        source.username = target_id
+
+    with pytest.raises(CollaborationError) as caught:
+        store.find_user(target_id)
+
+    assert caught.value.code == "ambiguous_selector"
+
+
+def test_the_merged_accounts_token_is_refused_as_an_inactive_user(
+    served: Api, idp: FakeIdP
+) -> None:
+    """The merged-away account keeps no way in, not even to the routes that
+    need nothing but a principal."""
+    _local, tokens, source_id, target_id = _twins(served, idp)
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    assert served.client.get("/v1/capabilities", headers=headers).status_code == 200
+
+    _store(served).merge_users(source_id, target_id, served.clock())
+
+    refused = served.client.get("/v1/capabilities", headers=headers)
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["code"] == "user_inactive"
+
+
+def test_a_client_with_no_user_behind_it_still_authenticates(served: Api, idp: FakeIdP) -> None:
+    """Only an inactive *user* is refused: a machine client has no member
+    row and never had one."""
+    _local, _tokens, source_id, target_id = _twins(served, idp)
+    _store(served).merge_users(source_id, target_id, served.clock())
+
+    response = served.client.get("/v1/capabilities", headers=served.bearer())
+
+    assert response.status_code == 200, response.text
+
+
 # -- the command -------------------------------------------------------------------
 
 runner = CliRunner()
@@ -477,3 +601,49 @@ def test_the_command_refuses_an_unknown_user(home: SbxloopHome) -> None:
     result = runner.invoke(app, ["users", "merge", "--from", "nobody", "--into", "bergs"])
     assert result.exit_code == 2
     assert "nobody" in result.output
+
+
+def test_the_command_refuses_a_target_that_left_the_workspace(home: SbxloopHome) -> None:
+    source_id, target_id = _seed(home)
+    dstore = DaemonStore(home.state_db)
+    try:
+        store = CollaborationStore(dstore)
+        store.set_role(source_id, "owner")
+        store.remove_member(target_id, now=4.0)
+    finally:
+        dstore.close()
+
+    result = runner.invoke(app, ["users", "merge", "--from", "bergs2", "--into", "bergs", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "merge_target_not_member" in result.output
+    assert _source_state(home, source_id) == (1, "bergs")
+
+    again = runner.invoke(
+        app,
+        ["users", "merge", "--from", "bergs2", "--into", "bergs", "--readmit", "--yes"],
+    )
+
+    assert again.exit_code == 0, again.output
+    assert "re-admitted" in again.output
+    assert _source_state(home, source_id) == (0, None)
+
+
+def test_the_command_records_the_operator_on_the_event(home: SbxloopHome) -> None:
+    source_id, _target_id = _seed(home)
+
+    result = runner.invoke(app, ["users", "merge", "--from", source_id, "--into", "bergs", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    dstore = DaemonStore(home.state_db)
+    try:
+        with dstore.read() as session:
+            event = session.scalars(
+                select(ApiEventRow).where(ApiEventRow.type == "collaboration.user.merged")
+            ).one()
+            actor = json.loads(event.actor_json or "null")
+    finally:
+        dstore.close()
+    assert actor is not None
+    assert (actor["kind"], actor["via"]) == ("operator", "cli")
+    assert actor["id"]

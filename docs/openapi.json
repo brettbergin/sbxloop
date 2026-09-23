@@ -844,6 +844,22 @@
                 "type": "null"
               }
             ]
+          },
+          "oidc_session_max_age_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oidc Session Max Age S"
+          },
+          "policy_version": {
+            "default": 1,
+            "title": "Policy Version",
+            "type": "integer"
           }
         },
         "required": [
@@ -893,6 +909,73 @@
           "kind"
         ],
         "title": "AuthorOut",
+        "type": "object"
+      },
+      "AvailableRepository": {
+        "additionalProperties": false,
+        "description": "A repository the host's forge credential can see: what a\nperson picks from when registering one. ``configured`` says whether\nit is declared to this daemon already.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "private": {
+            "default": false,
+            "title": "Private",
+            "type": "boolean"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "repository",
+          "forge",
+          "owner",
+          "name"
+        ],
+        "title": "AvailableRepository",
         "type": "object"
       },
       "BridgeOut": {
@@ -1032,6 +1115,256 @@
           }
         },
         "title": "ChannelCreate",
+        "type": "object"
+      },
+      "ChannelFileOut": {
+        "additionalProperties": false,
+        "properties": {
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "uploaded_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uploaded At"
+          }
+        },
+        "required": [
+          "id",
+          "channel_id",
+          "name",
+          "size",
+          "sha256",
+          "status",
+          "message_id",
+          "created_at",
+          "uploaded_at"
+        ],
+        "title": "ChannelFileOut",
+        "type": "object"
+      },
+      "ChannelFilePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelFileOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelFilePage",
+        "type": "object"
+      },
+      "ChannelJobOut": {
+        "additionalProperties": false,
+        "description": "Additive all-jobs view, including real runs without a work item.",
+        "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "historical": {
+            "default": false,
+            "title": "Historical",
+            "type": "boolean"
+          },
+          "item_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Actions",
+            "type": "array"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
+          },
+          "item_revision": {
+            "default": 0,
+            "title": "Item Revision",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "run_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Run Actions",
+            "type": "array"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "run_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Revision"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ExternalWorkSourceOut"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Id"
+          },
+          "unavailable": {
+            "default": false,
+            "title": "Unavailable",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "work_id": {
+            "title": "Work Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_id",
+          "channel_id",
+          "title",
+          "kind",
+          "state",
+          "source",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ChannelJobOut",
         "type": "object"
       },
       "ChannelLinkCreate": {
@@ -1304,6 +1637,16 @@
               }
             ],
             "title": "Created By"
+          },
+          "external_work": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExternalWorkOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "id": {
             "title": "Id",
@@ -2215,6 +2558,36 @@
         "title": "DetailOut",
         "type": "object"
       },
+      "DiscoveryCredential": {
+        "additionalProperties": false,
+        "description": "The credential a discovery listed with: a personal token (``pat``,\nwith the account it belongs to) or a GitHub App installation (``app``;\nthe installation, not a person, so no login).",
+        "properties": {
+          "login": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login"
+          },
+          "mode": {
+            "enum": [
+              "pat",
+              "app"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "DiscoveryCredential",
+        "type": "object"
+      },
       "EventOut": {
         "additionalProperties": false,
         "description": "One public event. ``id`` is the replay cursor (``evt_<seq>``);\n``native_seq`` is the engine's own sequence when the event is a\nprojection of the run's chronology; ``actor`` is absent where nothing\ntruthful can be said.",
@@ -2380,6 +2753,124 @@
           "data"
         ],
         "title": "ExternalIdentityPage",
+        "type": "object"
+      },
+      "ExternalWorkOut": {
+        "additionalProperties": false,
+        "description": "Durable job identity and import baseline for a job conversation.",
+        "properties": {
+          "historical": {
+            "title": "Historical",
+            "type": "boolean"
+          },
+          "read_baseline": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Read Baseline",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ExternalWorkSourceOut"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "system_created": {
+            "title": "System Created",
+            "type": "boolean"
+          },
+          "work_id": {
+            "title": "Work Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_id",
+          "source",
+          "system_created",
+          "historical"
+        ],
+        "title": "ExternalWorkOut",
+        "type": "object"
+      },
+      "ExternalWorkSourceOut": {
+        "additionalProperties": false,
+        "description": "Known admission provenance; an absent source link is not invented.",
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "repository": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repository"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ExternalWorkSourceOut",
+        "type": "object"
+      },
+      "FileReserve": {
+        "additionalProperties": false,
+        "properties": {
+          "client_upload_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Upload Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          }
+        },
+        "required": [
+          "client_upload_id",
+          "name"
+        ],
+        "title": "FileReserve",
         "type": "object"
       },
       "Gate": {
@@ -2712,6 +3203,36 @@
         "title": "HoldResult",
         "type": "object"
       },
+      "InputFileRefOut": {
+        "additionalProperties": false,
+        "description": "A user-supplied original stored privately for this channel.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "size",
+          "sha256"
+        ],
+        "title": "InputFileRefOut",
+        "type": "object"
+      },
       "IssueIntake": {
         "additionalProperties": false,
         "properties": {
@@ -2824,6 +3345,17 @@
             },
             "title": "Available Actions",
             "type": "array"
+          },
+          "channel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Id"
           },
           "created_at": {
             "title": "Created At",
@@ -3054,6 +3586,17 @@
             "default": "",
             "title": "Body",
             "type": "string"
+          },
+          "channel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Id"
           },
           "created_at": {
             "title": "Created At",
@@ -3812,7 +4355,7 @@
       },
       "MessageOriginOut": {
         "additionalProperties": false,
-        "description": "The bridge surface a message arrived on, for a message that did.",
+        "description": "The bridge surface a message arrived on, for a message that did.\n``thread_id`` is set when it came in through a link to one thread.",
         "properties": {
           "backend": {
             "title": "Backend",
@@ -3832,6 +4375,17 @@
           "surface_id": {
             "title": "Surface Id",
             "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
           }
         },
         "required": [
@@ -3876,6 +4430,17 @@
             "title": "Channel Id",
             "type": "string"
           },
+          "client_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Message Id"
+          },
           "content": {
             "title": "Content",
             "type": "string"
@@ -3884,9 +4449,21 @@
             "title": "Created At",
             "type": "string"
           },
+          "historical": {
+            "default": false,
+            "title": "Historical",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "input_files": {
+            "items": {
+              "$ref": "#/components/schemas/InputFileRefOut"
+            },
+            "title": "Input Files",
+            "type": "array"
           },
           "kind": {
             "title": "Kind",
@@ -3939,6 +4516,28 @@
           "sequence": {
             "title": "Sequence",
             "type": "integer"
+          },
+          "source_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Run Id"
+          },
+          "source_work_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Work Id"
           },
           "turn_id": {
             "anyOf": [
@@ -5117,6 +5716,28 @@
       "Repository": {
         "additionalProperties": false,
         "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
           "deliver_base": {
             "anyOf": [
               {
@@ -5151,9 +5772,28 @@
             "title": "Id",
             "type": "string"
           },
+          "labels": {
+            "$ref": "#/components/schemas/RepositoryLabels"
+          },
           "repository": {
             "title": "Repository",
             "type": "string"
+          },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           },
           "trigger_label": {
             "title": "Trigger Label",
@@ -5174,26 +5814,288 @@
           "repository",
           "forge",
           "trigger_label",
-          "workload_label"
+          "workload_label",
+          "labels"
         ],
         "title": "Repository",
+        "type": "object"
+      },
+      "RepositoryCreate": {
+        "additionalProperties": false,
+        "description": "A registration: ``owner/name`` (``group/subgroup/project`` on\nGitLab), the forge it lives on (``[vcs] kind`` when unset), whether it\nis polled and run, and the branch it delivers to (the repository's\ndefault when unset).",
+        "properties": {
+          "deliver_base": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deliver Base"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "forge": {
+            "anyOf": [
+              {
+                "enum": [
+                  "github",
+                  "gitlab",
+                  "gitea"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forge"
+          },
+          "repository": {
+            "maxLength": 200,
+            "minLength": 3,
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "RepositoryCreate",
+        "type": "object"
+      },
+      "RepositoryDiscovery": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/DiscoveryCredential"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AvailableRepository"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "forge": {
+            "title": "Forge",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "default": "local",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "forge",
+          "credential",
+          "data"
+        ],
+        "title": "RepositoryDiscovery",
+        "type": "object"
+      },
+      "RepositoryLabel": {
+        "additionalProperties": false,
+        "description": "One label the loop applies to ``repository``'s issues: the name it\ncarries here (a ``[[vcs.repos]]`` rename included), what it is for,\nand whether the repository has it.",
+        "properties": {
+          "color": {
+            "title": "Color",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Present"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "description",
+          "color"
+        ],
+        "title": "RepositoryLabel",
+        "type": "object"
+      },
+      "RepositoryLabelSync": {
+        "additionalProperties": false,
+        "description": "A label sync: the repository as it stands after it, what the sync\ncreated, and \u2014 when the forge refused a creation \u2014 what is still\nmissing.",
+        "properties": {
+          "created": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Created",
+            "type": "array"
+          },
+          "labels": {
+            "$ref": "#/components/schemas/RepositoryLabels"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/OperationOut"
+          },
+          "repository": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Repository"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "labels",
+          "operation"
+        ],
+        "title": "RepositoryLabelSync",
+        "type": "object"
+      },
+      "RepositoryLabels": {
+        "additionalProperties": false,
+        "description": "Whether a repository carries the labels sbxloop relies on.\n\n``compliant``: it carries every one of them, as of ``checked_at``.\n``incomplete``: ``missing`` names the ones it does not carry \u2014 a\nlabel sync creates exactly those. ``unknown``: nobody has been able\nto look yet (no reading has been taken, the forge would not answer,\nor the configured names have changed since the last reading), which\nis never reported as compliant.",
+        "properties": {
+          "checked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checked At"
+          },
+          "expected": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Expected",
+            "type": "array"
+          },
+          "labels": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryLabel"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "compliant",
+              "incomplete",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "RepositoryLabels",
         "type": "object"
       },
       "RepositoryResult": {
         "additionalProperties": false,
         "properties": {
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
           "operation": {
             "$ref": "#/components/schemas/OperationOut"
           },
           "repository": {
-            "$ref": "#/components/schemas/Repository"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Repository"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
-          "repository",
           "operation"
         ],
         "title": "RepositoryResult",
+        "type": "object"
+      },
+      "RepositoryUpdate": {
+        "additionalProperties": false,
+        "description": "A change to a registration: only the fields sent change;\n``deliver_base: null`` clears it.",
+        "properties": {
+          "deliver_base": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deliver Base"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          }
+        },
+        "title": "RepositoryUpdate",
         "type": "object"
       },
       "RestartRequest": {
@@ -6827,10 +7729,18 @@
             "title": "Client Turn Id"
           },
           "content": {
+            "default": "",
             "maxLength": 100000,
-            "minLength": 1,
             "title": "Content",
             "type": "string"
+          },
+          "file_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "File Ids",
+            "type": "array"
           },
           "intent": {
             "default": "conversation",
@@ -6853,9 +7763,6 @@
             "type": "array"
           }
         },
-        "required": [
-          "content"
-        ],
         "title": "TurnCreate",
         "type": "object"
       },
@@ -8546,6 +9453,45 @@
         ]
       }
     },
+    "/v1/auth/oidc/backchannel-logout": {
+      "post": {
+        "description": "An authenticated, signed provider event; no browser or bearer session needed.",
+        "operationId": "backchannel_logout_v1_auth_oidc_backchannel_logout_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "logout_token": {
+                    "maxLength": 16384,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "logout_token"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Backchannel Logout",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/v1/auth/oidc/token": {
       "post": {
         "description": "Redeem an OpenID Connect authorization code (Authorization Code +\nPKCE, run by the browser) for a token pair. The daemon authenticates to\nthe provider as the confidential client, validates the ID token, and\ncreates the account on a first sign-in. Needs no token.",
@@ -9045,6 +9991,335 @@
           }
         },
         "summary": "Download Channel Artifact",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files": {
+      "get": {
+        "operationId": "list_files_v1_channels__channel_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFilePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Files",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "operationId": "reserve_file_v1_channels__channel_id__files_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve File",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files/{file_id}": {
+      "delete": {
+        "operationId": "cancel_file_v1_channels__channel_id__files__file_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel File",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "get": {
+        "operationId": "get_file_v1_channels__channel_id__files__file_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get File",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files/{file_id}/content": {
+      "get": {
+        "operationId": "download_file_v1_channels__channel_id__files__file_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download File",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "put": {
+        "operationId": "upload_file_v1_channels__channel_id__files__file_id__content_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload File",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/jobs": {
+      "get": {
+        "operationId": "channel_jobs_v1_channels__channel_id__jobs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChannelJobOut"
+                  },
+                  "title": "Response Channel Jobs V1 Channels  Channel Id  Jobs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Channel Jobs",
         "tags": [
           "collaboration"
         ]
@@ -9751,7 +11026,7 @@
     },
     "/v1/channels/{channel_id}/stop": {
       "post": {
-        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced until\n``resume`` or a ``silence`` of its own lifts it.",
+        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled and the work it queued is abandoned through the daemon's\ncontrol service (scoped to this channel's own work, so a member who\nmay post needs no run control), and the channel is silenced for an\nhour (``sbxloop.api.context.STOP_SILENCE_S``) until ``resume`` or a\n``silence`` of its own lifts it. A ``/stop`` typed in the channel goes\nthrough the same :meth:`ApiContext.stop_channel`.",
         "operationId": "stop_channel_v1_channels__channel_id__stop_post",
         "parameters": [
           {
@@ -11896,6 +13171,238 @@
         "summary": "List Repositories",
         "tags": [
           "catalog"
+        ]
+      },
+      "post": {
+        "description": "Register a repository: admitted for work now, polled from the next\ndaemon start (the answer says so). A name registered already, one that\nis not a repository on its forge, or an unknown forge is refused.",
+        "operationId": "create_repository_v1_repositories_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositoryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Repository",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/repositories/available": {
+      "get": {
+        "description": "The repositories the host's forge credential can see, each marked\nwith whether it is configured here already: what an owner picks from\nwhen registering one. Read from the forge now, on the host, with the\nsame credential snapshot the connection check uses; ``forge`` defaults\nto ``[vcs] kind``.",
+        "operationId": "available_repositories_v1_repositories_available_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "forge",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "github",
+                    "gitlab",
+                    "gitea"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Forge"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryDiscovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Available Repositories",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/v1/repositories/{repository_id}": {
+      "delete": {
+        "description": "Forget a registration: no longer admitted for work; work already\nqueued or running for it is untouched, and polling stops at the next\ndaemon start.",
+        "operationId": "remove_repository_v1_repositories__repository_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Repository",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "description": "Change whether a registered repository is enabled, or the branch it\ndelivers to; only the fields sent change, live.",
+        "operationId": "update_repository_v1_repositories__repository_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositoryUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Repository",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/repositories/{repository_id}/labels/sync": {
+      "post": {
+        "description": "Create the labels sbxloop relies on \u2014 the seven lifecycle labels\nand the follow-up label, under this repository's own names \u2014 on a\nregistered repository, and say what it carries now. The repository is\nread first: one that already carries every one of them is left\nuntouched, and reports itself compliant.",
+        "operationId": "sync_repository_labels_v1_repositories__repository_id__labels_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryLabelSync"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sync Repository Labels",
+        "tags": [
+          "admin"
         ]
       }
     },

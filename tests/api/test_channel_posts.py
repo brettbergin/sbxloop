@@ -17,6 +17,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
+import pytest
 from sqlalchemy import insert, update
 
 from sbxloop.agents.posts import ArtifactRef, ChannelPost, ChannelPoster, RunPostLedger
@@ -652,6 +653,103 @@ def test_a_channels_members_read_the_files_of_its_runs(api: Any) -> None:
     assert api.client.get("/v1/artifacts/art_nope", headers=guest).status_code == 403
     for everyone in (owner, api.bearer()):
         assert reads(everyone, private_run, "art_private") == [200, 200, 410]
+
+
+class _LabelConcierge:
+    """A turn that labels an existing issue for a run, as the concierge's
+    ``label_issue_for_run`` tool does: it leaves the admission note the
+    next poll consumes and links the turn's participant to the issue."""
+
+    def __init__(self, api: Any, number: int) -> None:
+        self.api = api
+        self.number = number
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+        self.api.harness.dstore.note_admission(
+            str(self.number),
+            self.api.clock(),
+            repo="owner/repo",
+            channel_id=kwargs["channel_id"],
+        )
+        kwargs["on_code_work"]("owner/repo", self.number, f"Issue #{self.number}")
+        future: Future[ConciergeReply] = Future()
+        future.set_result(ConciergeReply("Labelled the issue for a run."))
+        return future
+
+
+def _issue_run(api: Any, item: WorkItem, artifact_id: str) -> str:
+    """Poll the labelled issue ``item`` ten seconds on and run it to a
+    merge, cataloguing one file of the run; returns the run id."""
+    api.clock.t += 10
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.harness.source.items = [item]
+    api.harness.outcomes = ["merged"]
+    api.loop.tick()
+    run_id = str(api.harness.runs[-1][0])
+    _file(api, run_id, artifact_id)
+    return run_id
+
+
+@pytest.mark.parametrize("filed_from", ["host", "channel"])
+def test_labelling_an_existing_issue_grants_only_the_runs_that_follow(
+    api: Any, filed_from: str
+) -> None:
+    """Labelling an issue for a run from a channel grants that channel the
+    runs created after that turn, never the runs that already existed:
+    one an operator ran from the host, or one another channel filed."""
+    owner, guest, _admin = _people(api)
+    item = WorkItem(
+        item_id=issue_item_id(42, "owner/repo"),
+        source_key="42",
+        repo="owner/repo",
+        title="Rotate the keys",
+        body="Rotate the deploy keys",
+        kind="code",
+    )
+    if filed_from == "channel":
+        filing = _channel(api, owner)
+        api.ctx.concierge = _LabelConcierge(api, 42)
+        accepted = api.client.post(
+            f"/v1/channels/{filing}/turns",
+            headers=owner,
+            json={"content": "Run issue 42", "intent": "code"},
+        ).json()
+        settled(api.client, owner, filing, accepted["turn"]["id"])
+    first = _issue_run(api, item, "art_first")
+
+    def reads(headers: dict[str, str], run_id: str, artifact_id: str) -> list[int]:
+        return [
+            api.client.get(f"/v1/runs/run_{run_id}/artifacts", headers=headers).status_code,
+            api.client.get(f"/v1/artifacts/{artifact_id}", headers=headers).status_code,
+            api.client.get(f"/v1/artifacts/{artifact_id}/content", headers=headers).status_code,
+        ]
+
+    # Nobody in the guest's channels asked for the first run.
+    assert reads(guest, first, "art_first") == [403, 403, 403]
+    if filed_from == "channel":
+        assert reads(owner, first, "art_first") == [200, 200, 410]
+
+    # The guest labels the same issue for a run from their own channel.
+    theirs = _channel(api, guest)
+    api.ctx.concierge = _LabelConcierge(api, 42)
+    api.clock.t += 10
+    accepted = api.client.post(
+        f"/v1/channels/{theirs}/turns",
+        headers=guest,
+        json={"content": "Run issue 42 again", "intent": "code"},
+    ).json()
+    settled(api.client, guest, theirs, accepted["turn"]["id"])
+    # The label is on the forge and not yet polled: the run that already
+    # existed is still not theirs.
+    assert reads(guest, first, "art_first") == [403, 403, 403]
+    # The poll re-queues the issue and runs it again: that run is theirs.
+    second = _issue_run(api, item, "art_second")
+    assert second != first
+    assert reads(guest, second, "art_second") == [200, 200, 410]
+    # The earlier run stays with whoever asked for it.
+    assert reads(guest, first, "art_first") == [403, 403, 403]
+    if filed_from == "channel":
+        assert reads(owner, first, "art_first") == [200, 200, 410]
 
 
 def test_a_channels_members_read_the_events_of_a_run_admitted_with_it(api: Any) -> None:

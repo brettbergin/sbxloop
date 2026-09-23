@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy import case, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sbxloop.agents.posts import POST_KINDS, TERMINAL_POST_KINDS, PostKind
@@ -40,6 +40,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
     AgentMemoryRow,
+    ChannelInputFileRow,
     ChannelLinkRow,
     ChannelMemberRow,
     ChannelParticipantRow,
@@ -59,6 +60,7 @@ from sbxloop.db.collaboration_models import (
 )
 from sbxloop.db.daemon_models import WorkItemRow
 from sbxloop.db.event_scope import channel_for_run, turn_for_item
+from sbxloop.db.job_scope import external_metadata
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -66,6 +68,10 @@ log = get_logger(__name__)
 
 #: Characters a provider-suggested username may not keep.
 _USERNAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+#: User ids read ``usr_<token>`` and are public (``GET /v1/users``),
+#: so no username may spell one: a selector an operator types resolves
+#: to one account, never to whichever of two a lookup order picks.
+_USERNAME_LIKE_ID = re.compile(r"^usr_", re.IGNORECASE)
 MAX_HANDOFFS_PER_TURN = 6
 MAX_HANDOFFS_PER_RESPONSE = 2
 # Four hops admit a bounded review return path such as coordinator -> author
@@ -162,6 +168,8 @@ class Channel:
     #: Messages past the reader's last read sequence; None for a reader
     #: with no membership to track it against (a plain API client).
     unread_count: int | None = None
+    #: Stable presentation identity and the baseline for imported messages.
+    external_work: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +209,16 @@ class ArtifactRef:
     relpath: str
     media_type: str
     size: int
+
+
+@dataclass(frozen=True, slots=True)
+class InputFileRef:
+    """An immutable original a person committed to a channel message."""
+
+    id: str
+    name: str
+    size: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +279,7 @@ class Message:
     reactions: tuple[str, ...] = ()
     author: Author = SYSTEM_AUTHOR
     artifacts: tuple[ArtifactRef, ...] = ()
+    input_files: tuple[InputFileRef, ...] = ()
     origin: dict[str, Any] | None = None
     #: What an ``agent_update`` a run posted is; None for every other message.
     post_kind: PostKind | None = None
@@ -361,6 +380,9 @@ class MergeReport:
     #: The target's workspace role before and after the merge.
     previous_role: Role | None
     role: Role
+    #: Whether the merge put a target that had left the workspace back
+    #: in, which only an explicit ``readmit`` allows.
+    readmitted: bool = False
 
 
 #: Workspace roles, weakest first: a merge keeps the stronger of two.
@@ -453,7 +475,10 @@ def invite_token_hash(raw_token: str) -> str:
 
 
 def _channel(
-    row: ChannelRow, my_role: ChannelRole | None = None, unread_count: int | None = None
+    row: ChannelRow,
+    my_role: ChannelRole | None = None,
+    unread_count: int | None = None,
+    external_work: dict[str, Any] | None = None,
 ) -> Channel:
     return Channel(
         id=str(row.id),
@@ -470,6 +495,7 @@ def _channel(
         silenced_until=None if row.silenced_until is None else float(row.silenced_until),
         my_role=my_role,
         unread_count=unread_count,
+        external_work=external_work,
     )
 
 
@@ -484,10 +510,17 @@ def message_author(role: str, kind: str, agent_slug: str | None, owner_id: str |
 
 
 def bridge_origin(
-    backend: str, surface_id: str, external_message_id: str, author_name: str | None = None
+    backend: str,
+    surface_id: str,
+    external_message_id: str,
+    author_name: str | None = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     """Where a message that arrived over a bridge came from. ``author_name``
-    rides along for a guest, who has no account to read a name from."""
+    rides along for a guest, who has no account to read a name from.
+    ``thread_id`` is the thread the link it arrived through names, when it
+    names one: a thread link and a whole-channel link on the same surface
+    are two origins, and the mirror echoes to neither its own."""
     origin: dict[str, Any] = {
         "backend": backend,
         "surface_id": surface_id,
@@ -495,6 +528,8 @@ def bridge_origin(
     }
     if author_name:
         origin["author_name"] = author_name
+    if thread_id is not None:
+        origin["thread_id"] = thread_id
     return origin
 
 
@@ -628,40 +663,77 @@ def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRol
     return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
 
 
-def _unread(session: Any, channel_id: str, member: Member | None) -> int | None:
+def _read_baseline(external_work: dict[str, Any] | None) -> int:
+    return 0 if external_work is None else int(external_work["read_baseline"])
+
+
+def _unread(
+    session: Any,
+    channel_id: str,
+    member: Member | None,
+    external_work: dict[str, Any] | None = None,
+) -> int | None:
     """Messages after the member's last read sequence. ``None`` when there
-    is no membership to measure against, so a plain API client and a
-    workspace member who has not joined read the same as before."""
+    is no membership to measure against, except for external jobs whose
+    durable import baseline applies even before someone joins."""
     if member is None:
         return None
     row = session.get(ChannelMemberRow, (channel_id, member.user.id))
-    if row is None:
+    if row is None and external_work is None:
         return None
-    return int(
-        session.scalar(
-            select(func.count())
-            .select_from(MessageRow)
-            .where(
-                MessageRow.channel_id == channel_id,
-                MessageRow.sequence > int(row.last_read_sequence or 0),
-            )
+    sequence = max(
+        _read_baseline(external_work), 0 if row is None else int(row.last_read_sequence or 0)
+    )
+    statement = (
+        select(func.count())
+        .select_from(MessageRow)
+        .where(MessageRow.channel_id == channel_id, MessageRow.sequence > sequence)
+    )
+    # Replay can append history to an existing private conversation, or
+    # after live progress. Exclude those entries individually in every
+    # channel: raising the baseline would also read intervening live
+    # messages. Ordinary messages have no historical provenance.
+    historical = case(
+        (
+            func.json_valid(MessageRow.origin_json) == 1,
+            func.json_extract(MessageRow.origin_json, "$.historical"),
+        ),
+        else_=None,
+    )
+    statement = statement.where(func.coalesce(historical, 0) != 1)
+    return int(session.scalar(statement) or 0)
+
+
+def _standing_members(channel_id: str) -> Any:
+    """The channel's member rows whose user is an active workspace member.
+    A row left behind by someone removed from the workspace or deactivated
+    counts for nothing: not as an owner, not as someone left behind."""
+    return (
+        select(ChannelMemberRow)
+        .join(WorkspaceMemberRow, WorkspaceMemberRow.user_id == ChannelMemberRow.user_id)
+        .join(LocalUserRow, LocalUserRow.id == ChannelMemberRow.user_id)
+        .where(
+            ChannelMemberRow.channel_id == channel_id,
+            WorkspaceMemberRow.workspace_id == WORKSPACE_ID,
+            LocalUserRow.active != 0,
         )
-        or 0
     )
 
 
 def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
-    """Whether the channel has an owner besides ``user_id``."""
-    found = session.scalar(
-        select(ChannelMemberRow.user_id)
-        .where(
-            ChannelMemberRow.channel_id == channel_id,
-            ChannelMemberRow.user_id != user_id,
-            ChannelMemberRow.role == "owner",
-        )
+    """Whether the channel has an owner besides ``user_id`` who is still an
+    active workspace member."""
+    found = session.scalars(
+        _standing_members(channel_id)
+        .where(ChannelMemberRow.user_id != user_id, ChannelMemberRow.role == "owner")
         .limit(1)
-    )
+    ).first()
     return found is not None
+
+
+def _outranks(role: str, other: str) -> bool:
+    """Whether workspace role ``role`` is above ``other``."""
+    return ROLES.index(_role(role)) < ROLES.index(_role(other))
 
 
 def _channel_member(row: ChannelMemberRow, user: LocalUserRow) -> ChannelMember:
@@ -779,6 +851,7 @@ def _history_line(
     row: Any,
     files: tuple[ArtifactRef, ...],
     directory: _Directory = _NO_DIRECTORY,
+    input_files: tuple[InputFileRef, ...] = (),
 ) -> str:
     """One message as a turn's history carries it.
 
@@ -810,6 +883,11 @@ def _history_line(
             {"id": ref.id, "name": ref.relpath, "media_type": ref.media_type, "size": ref.size}
             for ref in files
         ]
+    if input_files:
+        line["input_files"] = [
+            {"id": ref.id, "name": ref.name, "size": ref.size, "sha256": ref.sha256}
+            for ref in input_files
+        ]
     return json.dumps(line, ensure_ascii=False)
 
 
@@ -829,11 +907,33 @@ def _attachments(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[Ar
     return {key: tuple(value) for key, value in found.items()}
 
 
+def _input_files(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[InputFileRef, ...]]:
+    found: dict[str, list[InputFileRef]] = {}
+    if not message_ids:
+        return {}
+    rows = session.scalars(
+        select(ChannelInputFileRow)
+        .where(
+            ChannelInputFileRow.message_id.in_(list(message_ids)),
+            ChannelInputFileRow.status == "attached",
+        )
+        .order_by(ChannelInputFileRow.position.asc())
+    )
+    for row in rows:
+        if row.size is None or row.sha256 is None:
+            continue
+        found.setdefault(str(row.message_id), []).append(
+            InputFileRef(str(row.id), str(row.display_name), int(row.size), str(row.sha256))
+        )
+    return {key: tuple(value) for key, value in found.items()}
+
+
 def _message(
     session: Any,
     row: MessageRow,
     attachments: Mapping[str, tuple[ArtifactRef, ...]] | None = None,
     directory: _Directory = _NO_DIRECTORY,
+    input_files: Mapping[str, tuple[InputFileRef, ...]] | None = None,
 ) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
@@ -875,6 +975,11 @@ def _message(
             _attachments(session, [str(row.id)]).get(str(row.id), ())
             if attachments is None
             else attachments.get(str(row.id), ())
+        ),
+        input_files=(
+            _input_files(session, [str(row.id)]).get(str(row.id), ())
+            if input_files is None
+            else input_files.get(str(row.id), ())
         ),
         origin=origin,
         # A kind this build does not know (a later build's) reads as none:
@@ -1011,6 +1116,8 @@ class CollaborationStore:
         email = email.strip().casefold()
         if not username or not email:
             raise CollaborationError("invalid_profile", "username and email are required")
+        if _USERNAME_LIKE_ID.match(username):
+            raise CollaborationError("invalid_profile", "a username may not begin with usr_")
         if len(password) < 8:
             raise CollaborationError("weak_password", "password must contain at least 8 characters")
         user_id = "usr_" + _token(12)
@@ -1025,8 +1132,7 @@ class CollaborationStore:
                         raise CollaborationError(
                             "local_user_exists", "this installation already has a local user"
                         )
-                    invite = self._open_invite(session, invite_token, now, email=email)
-                    role = _role(str(invite.role))
+                    invite, role = self._open_invite(session, invite_token, now, email=email)
                     capabilities_json = _capabilities_json(ROLE_CAPABILITIES[role])
                 session.execute(
                     insert(ClientRow).values(
@@ -1048,6 +1154,10 @@ class CollaborationStore:
                         timezone=timezone.strip() or "UTC",
                         created_at=now,
                         updated_at=now,
+                        # The first registration is the operator's own, and an
+                        # invite addressed to the email vouches for it. An open
+                        # invite vouches for the person, not for the address.
+                        email_verified=1 if invite is None or invite.email is not None else 0,
                     )
                 )
                 session.add(
@@ -1090,6 +1200,8 @@ class CollaborationStore:
     @staticmethod
     def _free_username(session: Any, hint: str) -> str:
         base = _USERNAME_UNSAFE.sub("-", hint.strip()).strip("-.")[:64] or "user"
+        # A provider hint that spells a user id gives up the prefix.
+        base = _USERNAME_LIKE_ID.sub("", base).strip("-.") or "user"
         taken = set(
             session.scalars(
                 select(LocalUserRow.username).where(
@@ -1123,17 +1235,22 @@ class CollaborationStore:
         on first sign-in.
 
         An account already bound to ``(issuer, subject)`` is used as is,
-        with its email and name refreshed. Otherwise, with
-        ``link_verified_email``, an unlinked local account whose email
-        matches is linked, but only when the provider has verified the
-        email. Failing both, a new account is provisioned when
-        ``auto_provision`` allows: the installation's first user owns the
-        workspace, anyone else takes ``role_from_groups`` or
-        ``default_role``. An email another account already holds is not
-        given to the new account, which gets an undeliverable one instead.
-        For an existing member, ``role_from_groups`` (when not ``None``)
-        replaces the role, except that the last owner is never demoted. An
-        inactive user, or one no longer in the workspace, is refused.
+        with its name refreshed, and its email too when the provider has
+        verified it. Otherwise, with ``link_verified_email``, an unlinked
+        local account whose email matches is linked, but only when the
+        provider has verified the email and the local account's
+        ``email_verified`` is set (its address came from the first
+        registration, an addressed invite or an earlier verified claim,
+        never from the person editing it). Failing both, a new account is
+        provisioned when ``auto_provision`` allows: the installation's first
+        user owns the workspace, anyone else takes ``role_from_groups`` or
+        ``default_role``. An email another account already holds, or one the
+        provider has not verified, is not given to the new account, which
+        gets an undeliverable one instead. For an existing member,
+        ``role_from_groups`` (when not ``None``) replaces the role, except
+        that the last owner is never demoted and the sign-in that links
+        never changes it. An inactive user, or one no longer in the
+        workspace, is refused.
         """
         email = email.strip().casefold() if email and email.strip() else None
         try:
@@ -1179,27 +1296,40 @@ class CollaborationStore:
                 )
             ).first()
             created = False
-            new_email = email
-            if row is None and email is not None:
+            linked = False
+            # An address the provider has not checked is never stored: the
+            # account keeps the one it has, or gets an undeliverable one.
+            new_email = email if email_verified else None
+            if row is None and new_email is not None:
                 holder: LocalUserRow | None = session.scalars(
-                    select(LocalUserRow).where(LocalUserRow.email == email)
+                    select(LocalUserRow).where(LocalUserRow.email == new_email)
                 ).first()
                 if (
                     holder is not None
                     and link_verified_email
-                    and email_verified
                     and holder.oidc_subject is None
+                    and holder.email_verified
                 ):
-                    # The password keeps working, so the account stays
-                    # ``local``; the provider identity is recorded beside it.
+                    # Both sides vouch for the address. The password keeps
+                    # working, so the account stays ``local``; the provider
+                    # identity is recorded beside it.
                     holder.oidc_issuer = issuer
                     holder.oidc_subject = subject
                     holder.updated_at = now
                     row = holder
+                    linked = True
                     _event(session, "auth.oidc.linked", now, data={"user_id": holder.id})
                 elif holder is not None:
                     # Not linkable: the person gets an account of their own,
                     # and the address stays with the account that holds it.
+                    if link_verified_email and holder.oidc_subject is None:
+                        # Its holder typed the address in, so it proves
+                        # nothing about who the provider is vouching for.
+                        log.info(
+                            "auth.oidc_link_refused",
+                            user_id=holder.id,
+                            reason="local_email_unverified",
+                        )
                     new_email = None
             if row is None:
                 if not auto_provision:
@@ -1221,19 +1351,26 @@ class CollaborationStore:
             if not row.active or member is None:
                 raise CollaborationError("oidc_account_disabled", "this account is disabled")
             if not created:
-                self._refresh_identity(session, row, email, full_name, now)
-                if role_from_groups is not None and role_from_groups != member.role:
-                    if member.role == "owner" and self._owner_count(session) <= 1:
-                        log.info("auth.oidc_last_owner_kept", user_id=row.id)
-                    else:
-                        member.role = role_from_groups
-                        self._grant_role(session, row, role_from_groups)
-                        _event(
-                            session,
-                            "workspace.member.role_changed",
-                            now,
-                            data={"user_id": row.id, "role": role_from_groups},
-                        )
+                self._refresh_identity(session, row, new_email, full_name, now)
+            # Groups are followed from the next sign-in on: the sign-in that
+            # links never changes what the linked account may do.
+            if (
+                not created
+                and not linked
+                and role_from_groups is not None
+                and role_from_groups != member.role
+            ):
+                if member.role == "owner" and self._owner_count(session) <= 1:
+                    log.info("auth.oidc_last_owner_kept", user_id=row.id)
+                else:
+                    member.role = role_from_groups
+                    self._grant_role(session, row, role_from_groups)
+                    _event(
+                        session,
+                        "workspace.member.role_changed",
+                        now,
+                        data={"user_id": row.id, "role": role_from_groups},
+                    )
             _event(session, "auth.oidc.login", now, data={"user_id": row.id})
             session.flush()
             return _user(row)
@@ -1242,6 +1379,8 @@ class CollaborationStore:
     def _refresh_identity(
         session: Any, row: LocalUserRow, email: str | None, full_name: str | None, now: float
     ) -> None:
+        """Follow the provider's name, and its email when ``email`` is the
+        address it has verified (``None`` otherwise)."""
         changed = False
         if email is not None and email != row.email:
             clash = session.scalars(
@@ -1251,6 +1390,7 @@ class CollaborationStore:
             ).first()
             if clash is None:
                 row.email = email
+                row.email_verified = 1
                 changed = True
             else:
                 log.info("auth.oidc_email_kept", user_id=row.id)
@@ -1278,9 +1418,13 @@ class CollaborationStore:
         user_id = "usr_" + _token(12)
         client_id = "local_" + _token(12)
         name = self._free_username(session, username)
+        # Only an address the provider has verified, and nobody else holds,
+        # reaches here; anything else is the placeholder below.
+        verified = email is not None
         if email is None:
             # The column is required and unique; a provider that shares no
-            # address gets one that can never receive mail.
+            # address, or no verified one, gets one that can never receive
+            # mail.
             digest = hashlib.sha256(f"{issuer}\n{subject}".encode()).hexdigest()[:24]
             email = f"oidc-{digest}@users.invalid"
         session.execute(
@@ -1308,6 +1452,7 @@ class CollaborationStore:
                 auth_source="oidc",
                 oidc_issuer=issuer,
                 oidc_subject=subject,
+                email_verified=1 if verified else 0,
             )
         )
         session.add(
@@ -1339,20 +1484,37 @@ class CollaborationStore:
             return None if row is None else _user(row)
 
     def find_user(self, selector: str) -> LocalUser | None:
-        """The user a selector names: a user id, or else a username."""
+        """The user a selector names: a user id, or else a username.
+
+        A selector that is at once one account's id and another's
+        username names neither (``ambiguous_selector``): no lookup
+        order may decide which of two people an operator meant.
+        """
         selector = selector.strip()
         with self.dstore.read() as session:
             row = session.get(LocalUserRow, selector)
-            if row is None:
-                row = session.scalars(
-                    select(LocalUserRow).where(LocalUserRow.username == selector)
-                ).first()
-            return None if row is None else _user(row)
+            named = session.scalars(
+                select(LocalUserRow).where(LocalUserRow.username == selector)
+            ).first()
+            if row is not None and named is not None and str(named.id) != str(row.id):
+                raise CollaborationError(
+                    "ambiguous_selector",
+                    f"{selector!r} is one account's id and another's username",
+                )
+            found = row if row is not None else named
+            return None if found is None else _user(found)
 
     # -- merging two accounts --------------------------------------------------------
 
     def merge_users(
-        self, source_id: str, target_id: str, now: float, *, dry_run: bool = False
+        self,
+        source_id: str,
+        target_id: str,
+        now: float,
+        *,
+        dry_run: bool = False,
+        readmit: bool = False,
+        actor: dict[str, Any] | None = None,
     ) -> MergeReport:
         """Fold ``source_id`` into ``target_id``, in one immediate transaction.
 
@@ -1365,7 +1527,8 @@ class CollaborationStore:
         value wins a clash), workflows, agent memories the source authored,
         the invites it created, its bridge identities and the events meant
         for it alone. The target keeps the stronger of the two workspace
-        roles.
+        roles, except that a deactivated source lends none: an account
+        somebody shut off hands on nothing it could no longer use.
 
         The source's provider identity moves onto the target, which keeps
         its username, email, password and ``auth_source``: an account that
@@ -1374,19 +1537,31 @@ class CollaborationStore:
         sign-in methods reach the target afterwards. The source is then
         deactivated, loses its membership, its provider identity and every
         capability, and its refresh tokens are revoked, as a removed member's
-        are. The audit event names the two ids and nothing else.
+        are. The audit event names ``actor`` (who asked for the merge), the
+        two ids, the target's role before and after, and whether the merge
+        re-admitted it.
 
         Refused: merging a user into itself (``merge_same_user``), a user
         that does not exist (``user_not_found``), an inactive target
-        (``merge_target_inactive``), and a target already bound to a
-        different provider identity than the source's
+        (``merge_target_inactive``), a target that is no longer a
+        workspace member (``merge_target_not_member``, unless ``readmit``
+        says to bring it back in on purpose), and a target already bound
+        to a different provider identity than the source's
         (``merge_identity_conflict``). ``dry_run`` does all of it inside the
         transaction and rolls it back, so the report is exactly what a real
         merge would do and nothing is written.
         """
         try:
             with self.dstore.immediate_transaction() as session:
-                report = self._merge(session, source_id, target_id, now, dry_run=dry_run)
+                report = self._merge(
+                    session,
+                    source_id,
+                    target_id,
+                    now,
+                    dry_run=dry_run,
+                    readmit=readmit,
+                    actor=actor,
+                )
                 if dry_run:
                     raise _DryRun(report)
                 return report
@@ -1394,7 +1569,15 @@ class CollaborationStore:
             return unwound.report
 
     def _merge(
-        self, session: Any, source_id: str, target_id: str, now: float, *, dry_run: bool
+        self,
+        session: Any,
+        source_id: str,
+        target_id: str,
+        now: float,
+        *,
+        dry_run: bool,
+        readmit: bool = False,
+        actor: dict[str, Any] | None = None,
     ) -> MergeReport:
         if source_id == target_id:
             raise CollaborationError("merge_same_user", "a user cannot be merged into itself")
@@ -1406,6 +1589,14 @@ class CollaborationStore:
         if not target.active:
             raise CollaborationError(
                 "merge_target_inactive", "the account to merge into is deactivated"
+            )
+        if self._member_row(session, target_id) is None and not readmit:
+            # Somebody took this person out of the workspace; a merge is
+            # not the place to quietly put them back.
+            raise CollaborationError(
+                "merge_target_not_member",
+                "the account to merge into is not a member of the workspace; "
+                "ask for the re-admission explicitly",
             )
         source_identity = (
             None
@@ -1584,14 +1775,18 @@ class CollaborationStore:
         source = session.get(LocalUserRow, source_id)
         target = session.get(LocalUserRow, target_id)
         assert source is not None and target is not None  # nosec B101 - read above
-        # Workspace membership: the target keeps the stronger role.
+        # Workspace membership: the target keeps the stronger role, and a
+        # deactivated source lends none of its own.
         source_member = self._member_row(session, source_id)
         target_member = self._member_row(session, target_id)
         previous_role: Role | None = (
             None if target_member is None else _role(str(target_member.role))
         )
-        candidates = [str(m.role) for m in (source_member, target_member) if m is not None]
+        candidates: list[str] = [] if target_member is None else [str(target_member.role)]
+        if source_member is not None and source.active:
+            candidates.append(str(source_member.role))
         role = _role(max(candidates, key=lambda r: _ROLE_RANK[r]) if candidates else "member")
+        readmitted = target_member is None
         if target_member is None:
             session.add(
                 WorkspaceMemberRow(
@@ -1626,7 +1821,14 @@ class CollaborationStore:
                 session,
                 "collaboration.user.merged",
                 now,
-                data={"source_user_id": source_id, "target_user_id": target_id},
+                actor=actor,
+                data={
+                    "source_user_id": source_id,
+                    "target_user_id": target_id,
+                    "previous_role": previous_role,
+                    "role": role,
+                    "readmitted": readmitted,
+                },
             )
         return MergeReport(
             source_id=source_id,
@@ -1641,6 +1843,7 @@ class CollaborationStore:
             identity=source_identity,
             previous_role=previous_role,
             role=role,
+            readmitted=readmitted,
         )
 
     def user_by_client(self, client_id: str) -> LocalUser | None:
@@ -1666,8 +1869,11 @@ class CollaborationStore:
                 ).first()
                 if row is None or not row.active:
                     raise CollaborationError("profile_not_found", "local profile not found")
-                if email is not None:
+                if email is not None and email.strip().casefold() != row.email:
+                    # Typed in by its holder: nobody has shown the address is
+                    # theirs, so no provider identity may be linked to it.
                     row.email = email.strip().casefold()
+                    row.email_verified = 0
                 if full_name is not None:
                     row.full_name = full_name.strip() or None
                 if timezone is not None:
@@ -1687,13 +1893,16 @@ class CollaborationStore:
 
     # -- workspace membership ------------------------------------------------------
 
-    @staticmethod
     def _open_invite(
-        session: Any, raw_token: str, now: float, *, email: str | None
-    ) -> WorkspaceInviteRow:
-        """The unspent, unexpired invite behind ``raw_token``. An invite
-        addressed to an email admits only that address, compared without
-        regard to case."""
+        self, session: Any, raw_token: str, now: float, *, email: str | None
+    ) -> tuple[WorkspaceInviteRow, Role]:
+        """The unspent, unexpired invite behind ``raw_token`` and the role
+        it grants today. An invite addressed to an email admits only that
+        address, compared without regard to case. An invite stands only
+        while its creator does: one whose creator is no longer an active
+        member admits nobody, and one above its creator's current role
+        grants that role instead. A plain operator client's invite
+        (``client:<id>``) is not measured against a membership."""
         row: WorkspaceInviteRow | None = session.scalars(
             select(WorkspaceInviteRow).where(
                 WorkspaceInviteRow.token_hash == invite_token_hash(raw_token),
@@ -1708,7 +1917,18 @@ class CollaborationStore:
             raise CollaborationError(
                 "invite_email_mismatch", "the invite is addressed to another email"
             )
-        return row
+        role = _role(str(row.role))
+        creator = str(row.created_by)
+        if not creator.startswith("client:"):
+            member = self._member_row(session, creator)
+            user = session.get(LocalUserRow, creator)
+            if member is None or user is None or not user.active:
+                raise CollaborationError(
+                    "invite_invalid", "the invite's creator is no longer a member"
+                )
+            if _outranks(role, str(member.role)):
+                role = _role(str(member.role))
+        return row, role
 
     @staticmethod
     def _grant_role(session: Any, user: LocalUserRow, role: Role | None) -> None:
@@ -1732,6 +1952,89 @@ class CollaborationStore:
             .where(RefreshTokenRow.client_id == client_id, RefreshTokenRow.revoked_at.is_(None))
             .values(revoked_at=now)
         )
+
+    @staticmethod
+    def _end_channel_memberships(session: Any, user_id: str, now: float | None) -> None:
+        """Take the user out of every channel, inside the caller's
+        transaction. Where they were a channel's last standing owner, the
+        longest-standing member still in the workspace becomes its owner;
+        a channel nobody else is in is left without a member. Events are
+        recorded when ``now`` is known."""
+        rows = session.scalars(
+            select(ChannelMemberRow)
+            .where(ChannelMemberRow.user_id == user_id)
+            .order_by(ChannelMemberRow.joined_at, ChannelMemberRow.channel_id)
+        ).all()
+        for row in rows:
+            channel_id = str(row.channel_id)
+            was_owner = row.role == "owner"
+            session.delete(row)
+            session.flush()
+            if now is not None:
+                _event(
+                    session,
+                    "collaboration.member.removed",
+                    now,
+                    data={"channel_id": channel_id, "user_id": user_id},
+                )
+            if not was_owner or _other_owner(session, channel_id, user_id):
+                continue
+            heir = session.scalars(
+                _standing_members(channel_id)
+                .where(ChannelMemberRow.user_id != user_id)
+                .order_by(ChannelMemberRow.joined_at, ChannelMemberRow.user_id)
+                .limit(1)
+            ).first()
+            if heir is None:
+                continue
+            heir.role = "owner"
+            session.flush()
+            if now is not None:
+                _event(
+                    session,
+                    "collaboration.member.updated",
+                    now,
+                    data={"channel_id": channel_id, "user_id": str(heir.user_id)},
+                )
+
+    @staticmethod
+    def _revoke_invites(
+        session: Any,
+        user_id: str,
+        now: float | None,
+        *,
+        reason: str,
+        actor: dict[str, Any] | None = None,
+        above: Role | None = None,
+    ) -> None:
+        """Withdraw the unspent invites ``user_id`` created, inside the
+        caller's transaction: every one of them, or with ``above`` only
+        those granting more than that role. Spent invites stay on record.
+        Each withdrawal is a ``workspace.invite.revoked`` event with its
+        ``reason`` when ``now`` is known."""
+        rows = session.scalars(
+            select(WorkspaceInviteRow)
+            .where(
+                WorkspaceInviteRow.workspace_id == WORKSPACE_ID,
+                WorkspaceInviteRow.created_by == user_id,
+                WorkspaceInviteRow.accepted_at.is_(None),
+            )
+            .order_by(WorkspaceInviteRow.created_at, WorkspaceInviteRow.id)
+        ).all()
+        for row in rows:
+            if above is not None and not _outranks(str(row.role), above):
+                continue
+            invite_id, role = str(row.id), str(row.role)
+            session.delete(row)
+            if now is not None:
+                _event(
+                    session,
+                    "workspace.invite.revoked",
+                    now,
+                    actor=actor,
+                    data={"invite_id": invite_id, "role": role, "reason": reason},
+                )
+        session.flush()
 
     @staticmethod
     def _owner_count(session: Any, *, besides: str | None = None) -> int:
@@ -1839,7 +2142,10 @@ class CollaborationStore:
         reactivated, when it holds the role's capabilities again. The
         workspace always keeps an active owner. Without ``owner_ok`` the
         change may neither touch an owner nor grant the owner role
-        (``owner_required``).
+        (``owner_required``). Deactivation takes the user out of every
+        channel and withdraws the invites they created; a demotion
+        withdraws those above the new role. All of it lands in the one
+        transaction.
         """
         role = None if role is None else _role(role)
         with self.dstore.transaction() as session:
@@ -1855,6 +2161,7 @@ class CollaborationStore:
             if losing_owner and not self._owner_count(session, besides=user_id):
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
             data: dict[str, Any] = {"user_id": user_id}
+            previous = _role(str(row.role))
             if role is not None:
                 row.role = role
                 data["role"] = role
@@ -1867,6 +2174,15 @@ class CollaborationStore:
             if not user.active:
                 self._revoke_refresh(session, str(user.client_id), now)
             session.flush()
+            if active is False:
+                self._end_channel_memberships(session, user_id, now)
+                self._revoke_invites(
+                    session, user_id, now, reason="creator_deactivated", actor=actor
+                )
+            elif _outranks(previous, current):
+                self._revoke_invites(
+                    session, user_id, now, reason="creator_demoted", actor=actor, above=current
+                )
             _event(session, "workspace.member.updated", now, actor=actor, data=data)
             return _member(user, row)
 
@@ -1878,7 +2194,9 @@ class CollaborationStore:
         actor: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
-        """End a membership; the user's API client keeps no capability.
+        """End a membership; the user's API client keeps no capability, they
+        are out of every channel and the invites they created are withdrawn,
+        all in one transaction, so a later invite starts them from nothing.
         Without ``owner_ok`` an owner cannot be removed (``owner_required``)."""
         with self.dstore.transaction() as session:
             row = self._member_row(session, user_id)
@@ -1890,11 +2208,14 @@ class CollaborationStore:
                 raise CollaborationError("last_owner", "the workspace must keep an owner")
             role = str(row.role)
             session.delete(row)
+            session.flush()
             user = session.get(LocalUserRow, user_id)
             if user is not None:
                 self._grant_role(session, user, None)
                 if now is not None:
                     self._revoke_refresh(session, str(user.client_id), now)
+            self._end_channel_memberships(session, user_id, now)
+            self._revoke_invites(session, user_id, now, reason="creator_removed", actor=actor)
             if now is not None:
                 _event(
                     session,
@@ -1979,10 +2300,8 @@ class CollaborationStore:
             user = session.get(LocalUserRow, user_id)
             if user is None:
                 raise CollaborationError("user_not_found", "user not found")
-            invite = self._open_invite(session, raw_token, now, email=str(user.email))
-            member = self._insert_member(
-                session, user_id, _role(str(invite.role)), str(invite.created_by), now
-            )
+            invite, role = self._open_invite(session, raw_token, now, email=str(user.email))
+            member = self._insert_member(session, user_id, role, str(invite.created_by), now)
             invite.accepted_at = now
             _event(
                 session,
@@ -2073,8 +2392,12 @@ class CollaborationStore:
                 )
             except CollaborationError:
                 return None
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def list_channels(
@@ -2107,14 +2430,17 @@ class CollaborationStore:
                 .offset(offset)
                 .limit(limit)
             ).all()
-            channels = [
-                _channel(
-                    row,
-                    None if role is None else ("owner" if role == "owner" else "member"),
-                    _unread(session, str(row.id), member),
+            channels = []
+            for row, role in rows:
+                metadata = external_metadata(session, str(row.id))
+                channels.append(
+                    _channel(
+                        row,
+                        None if role is None else ("owner" if role == "owner" else "member"),
+                        _unread(session, str(row.id), member, metadata),
+                        metadata,
+                    )
                 )
-                for row, role in rows
-            ]
             return channels, total
 
     def update_channel(
@@ -2145,8 +2471,12 @@ class CollaborationStore:
             row.revision += 1
             session.flush()
             _event(session, "collaboration.channel.updated", now, data={"channel_id": channel_id})
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
@@ -2251,14 +2581,12 @@ class CollaborationStore:
                     "channel_member_not_found", "the user is not in this channel"
                 )
             if row.role == "owner":
-                others = list(
-                    session.scalars(
-                        select(ChannelMemberRow.role).where(
-                            ChannelMemberRow.channel_id == channel_id,
-                            ChannelMemberRow.user_id != user_id,
-                        )
+                others = [
+                    str(other.role)
+                    for other in session.scalars(
+                        _standing_members(channel_id).where(ChannelMemberRow.user_id != user_id)
                     )
-                )
+                ]
                 if others and "owner" not in others:
                     raise CollaborationError(
                         "last_channel_owner",
@@ -2665,8 +2993,12 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "silenced_until": row.silenced_until},
             )
+            metadata = external_metadata(session, channel_id)
             return _channel(
-                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+                row,
+                _my_role(session, channel_id, member),
+                _unread(session, channel_id, member, metadata),
+                metadata,
             )
 
     def set_read_sequence(
@@ -2684,7 +3016,8 @@ class CollaborationStore:
             newest = session.scalar(
                 select(func.max(MessageRow.sequence)).where(MessageRow.channel_id == channel_id)
             )
-            capped = min(int(sequence), int(newest or 0))
+            baseline = _read_baseline(external_metadata(session, channel_id))
+            capped = min(max(int(sequence), baseline), int(newest or 0))
             entry.last_read_sequence = max(int(entry.last_read_sequence or 0), capped)
             _event(
                 session,
@@ -2796,16 +3129,27 @@ class CollaborationStore:
         chain_depth: int,
         now: float,
     ) -> Turn | None:
-        """Accept a turn one agent started by addressing another.
+        """Accept a turn one agent started by addressing another, or by
+        volunteering on a message nobody sent it.
 
-        No new message is appended: the agent's own reply, named by
-        ``source_message_id``, is the turn's input. ``None`` when the
-        channel is gone.
+        No new message is appended: the message named by
+        ``source_message_id`` is the turn's input. ``None`` when the channel
+        is gone or silenced, or when ``parent_turn_id`` names a turn that is
+        no longer live: those are decided here, inside the transaction, and
+        not only by the guardrails earlier, because a stop or a cancel that
+        lands while the follow-up is still being decided (a relevance call
+        in flight) has to win over it.
         """
         with self.dstore.immediate_transaction() as session:
             channel = session.get(ChannelRow, channel_id)
             if channel is None or channel.state != "active":
                 return None
+            if channel.silenced_until is not None and float(channel.silenced_until) > now:
+                return None
+            if parent_turn_id is not None:
+                parent = session.get(TurnRow, parent_turn_id)
+                if parent is None or parent.status not in {"accepted", "running"}:
+                    return None
             turn_id = "trn_" + _token(16)
             session.execute(
                 insert(TurnRow).values(
@@ -2907,8 +3251,9 @@ class CollaborationStore:
                 )
             )
             attachments = _attachments(session, [str(row.id) for row in rows])
+            input_files = _input_files(session, [str(row.id) for row in rows])
             known = _directory(session, rows)
-            return [_message(session, row, attachments, known) for row in rows]
+            return [_message(session, row, attachments, known, input_files) for row in rows]
 
     def accept_turn(
         self,
@@ -2924,6 +3269,7 @@ class CollaborationStore:
         intent: str = "conversation",
         participants: tuple[str, ...] = (),
         assignees: dict[str, str] | None = None,
+        file_ids: tuple[str, ...] = (),
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
@@ -2934,6 +3280,10 @@ class CollaborationStore:
         the run roles those mentions declare on a turn that may start managed
         work; they ride the first participant slot, where admission reads them.
         """
+        if not content.strip() and not file_ids:
+            raise CollaborationError("empty_turn", "a turn needs text or at least one file")
+        if len(file_ids) > 16 or len(set(file_ids)) != len(file_ids):
+            raise CollaborationError("invalid_file_ids", "a turn accepts up to 16 distinct files")
         with self.dstore.immediate_transaction() as session:
             channel, _ = _access(session, channel_id, user_id, "post", now=now)
             if client_turn_id:
@@ -2951,6 +3301,13 @@ class CollaborationStore:
                         or tuple(json.loads(existing.targets_json)) != targets
                         or existing.intent != intent
                         or message.client_message_id != client_message_id
+                        or tuple(
+                            ref.id
+                            for ref in _input_files(session, [str(message.id)]).get(
+                                str(message.id), ()
+                            )
+                        )
+                        != file_ids
                     ):
                         raise CollaborationError(
                             "idempotency_conflict",
@@ -3007,6 +3364,21 @@ class CollaborationStore:
                     chain_depth=0,
                 )
             )
+            for position, file_id in enumerate(file_ids):
+                file = session.get(ChannelInputFileRow, file_id)
+                if (
+                    file is None
+                    or file.channel_id != channel_id
+                    or file.uploader_id != user_id
+                    or file.status != "uploaded"
+                    or file.message_id is not None
+                    or file.size is None
+                    or file.sha256 is None
+                ):
+                    raise CollaborationError("input_file_not_found", "uploaded file not found")
+                file.message_id = message_id
+                file.position = position
+                file.status = "attached"
             for slug in dict.fromkeys(participants):
                 if session.get(ChannelParticipantRow, (channel_id, slug)) is None:
                     session.add(
@@ -3063,20 +3435,27 @@ class CollaborationStore:
         display_name: str | None,
         external_message_id: str,
         now: float,
+        targets: tuple[str, ...] = (),
+        participants: tuple[str, ...] = (),
     ) -> tuple[Turn, Message]:
         """Append a message that arrived on a linked bridge surface, and the
         turn that answers it.
 
         The link is the authorization: whoever may post on the surface the
-        channel's owner linked posts here. A mapped author is credited to
-        their account; a guest (only where the link admits one) is a human
-        with no account, named by the handle they use on that service.
+        channel's owner linked posts here, with no ``post`` check against
+        the channel, and :meth:`recover_turns` honours the same rule after
+        a restart. A mapped author is credited to their account; a guest
+        (only where the link admits one) is a human with no account, named
+        by the handle they use on that service. ``targets`` are the agents
+        the message addresses, as :meth:`accept_turn` records them, and
+        ``participants`` the agents it mentions: each joins the channel.
         """
         origin = bridge_origin(
             link.backend,
             link.surface_id,
             external_message_id,
             None if author_user_id else display_name,
+            thread_id=link.thread_id,
         )
         with self.dstore.immediate_transaction() as session:
             channel = session.get(ChannelRow, link.channel_id)
@@ -3106,16 +3485,17 @@ class CollaborationStore:
                     channel_id=link.channel_id,
                     input_message_id=message_id,
                     status="accepted",
-                    targets_json=json.dumps([]),
+                    targets_json=json.dumps(list(targets)),
                     intent="conversation",
                     participants_json=json.dumps(
                         [
                             {
-                                "agent_slug": None,
+                                "agent_slug": target,
                                 "status": "queued",
                                 "error": None,
-                                "read_only": False,
+                                "read_only": target == "critic",
                             }
+                            for target in (targets or (None,))
                         ]
                     ),
                     created_at=now,
@@ -3125,6 +3505,24 @@ class CollaborationStore:
                     chain_depth=0,
                 )
             )
+            for slug in dict.fromkeys(participants):
+                if session.get(ChannelParticipantRow, (link.channel_id, slug)) is None:
+                    session.add(
+                        ChannelParticipantRow(
+                            channel_id=link.channel_id,
+                            agent_slug=slug,
+                            mode="mention",
+                            added_by_kind="human",
+                            added_by_id=author_user_id,
+                            created_at=now,
+                        )
+                    )
+                    _event(
+                        session,
+                        "collaboration.participant.added",
+                        now,
+                        data={"channel_id": link.channel_id, "agent_slug": slug},
+                    )
             channel.updated_at = now
             channel.revision += 1
             turn_row = session.get(TurnRow, turn_id)
@@ -3134,7 +3532,7 @@ class CollaborationStore:
                 session,
                 "collaboration.turn.accepted",
                 now,
-                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": []},
+                data={"channel_id": link.channel_id, "turn_id": turn_id, "targets": list(targets)},
             )
             _event(
                 session,
@@ -3447,11 +3845,18 @@ class CollaborationStore:
                 )
             )
             carried = _attachments(session, [str(message.id) for message in newest])
+            input_files = _input_files(session, [str(message.id) for message in newest])
             known = _directory(session, newest)
             kept: list[int] = []
             held = 0
             for message in newest:
-                line = _history_line(session, message, carried.get(str(message.id), ()), known)
+                line = _history_line(
+                    session,
+                    message,
+                    carried.get(str(message.id), ()),
+                    known,
+                    input_files.get(str(message.id), ()),
+                )
                 held += len(line) + 1
                 if kept and held > max_chars:
                     break
@@ -3545,6 +3950,11 @@ class CollaborationStore:
         Returns the message id, or None when the channel is gone or
         silenced. A silenced channel still hears a run that has finished
         or stopped: ``delivery`` and ``notice`` are posted anyway.
+
+        A post stored here is told to the observers like any other message,
+        once the write has committed, so the surfaces linked to the channel
+        mirror it. A replay under a key already posted returns the message
+        it posted before and tells nobody: the run said it once.
         """
         if kind not in POST_KINDS:
             # ``PostKind`` is a type, not a check: a caller naming a kind
@@ -3619,7 +4029,9 @@ class CollaborationStore:
                     "run_id": run_public_id(run_id) if run_id else None,
                 },
             )
-            return message_id
+            appended = _message(session, row)
+        self._appended(appended)
+        return message_id
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:
@@ -3809,10 +4221,20 @@ class CollaborationStore:
                 message = session.get(MessageRow, row.input_message_id)
                 stored_origin = message.origin_json if message is not None else None
                 origin = json.loads(stored_origin) if stored_origin else None
-                if row.author_kind == "human" and row.author_id is None and origin:
-                    # A guest on a linked surface: the turn runs for the same
-                    # stand-in it would have run for live, never for the
-                    # channel's owner, whose identity would answer a stranger.
+                guest_input = bool(origin) and (
+                    (row.author_kind == "human" and row.author_id is None)
+                    or (
+                        message is not None
+                        and message.author_kind == "human"
+                        and message.author_id is None
+                    )
+                )
+                if guest_input:
+                    # A guest on a linked surface, or an agent's own turn on
+                    # the guest's message (a listener that volunteered): the
+                    # turn runs for the same stand-in it would have run for
+                    # live, never for the channel's owner, whose identity
+                    # would answer a stranger.
                     if channel and channel.state == "active" and message:
                         queued.append(
                             (
@@ -3821,6 +4243,26 @@ class CollaborationStore:
                                 guest_user(_origin_name(origin)),
                                 message.content,
                             )
+                        )
+                    else:
+                        interrupted.append((row.id, False))
+                    continue
+                if row.author_kind == "human" and row.author_id is not None and origin:
+                    # A mapped author on a linked surface: the link was the
+                    # authorization when the turn was accepted, with no
+                    # channel access check, and a restart keeps that rule.
+                    # The membership behind the map still has to hold, as
+                    # it did when the bridge mapped them.
+                    author = _member_in(session, row.author_id)
+                    if (
+                        channel is not None
+                        and channel.state == "active"
+                        and message is not None
+                        and author is not None
+                        and author.user.active
+                    ):
+                        queued.append(
+                            (message.sequence, _turn(session, row), author.user, message.content)
                         )
                     else:
                         interrupted.append((row.id, False))
@@ -3894,11 +4336,18 @@ class CollaborationStore:
             dropped = len(rows) > HISTORY_MESSAGES
             rows = rows[:HISTORY_MESSAGES]
             attachments = _attachments(session, [str(row.id) for row in rows])
+            input_files = _input_files(session, [str(row.id) for row in rows])
             known = _directory(session, rows)
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                chunk = _history_line(session, row, attachments.get(str(row.id), ()), known)
+                chunk = _history_line(
+                    session,
+                    row,
+                    attachments.get(str(row.id), ()),
+                    known,
+                    input_files.get(str(row.id), ()),
+                )
                 if len(chunk) > remaining:
                     dropped = True
                     break

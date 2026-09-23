@@ -220,6 +220,38 @@ def test_a_task_names_its_own_agent_over_its_role() -> None:
     assert _kinds(poster)[1] == ("progress", "runner")
 
 
+def test_a_reply_stamped_with_a_slug_not_on_the_run_is_told_in_the_steering_voice() -> None:
+    """A reply names the agent that answered it only when that agent is on
+    the run. A stamp the team does not have (a steer can name any agent) is
+    not an author: the post is credited to the run's own steering agent."""
+    clock = Clock()
+    chronicle, poster = _chronicle(clock)
+
+    chronicle.on_event(
+        Event.now(
+            HostEventTypes.CHAT_REPLY,
+            RUN,
+            message_id="stm_9",
+            reply="Approved, ship it.",
+            action="continue",
+            agent_slug="reviewer-bot",
+        )
+    )
+
+    assert _kinds(poster) == [("reply", "baker")]
+    assert poster.posts[0].text == "Approved, ship it."
+
+
+def test_a_task_stamped_with_a_slug_not_on_the_run_is_credited_to_its_role() -> None:
+    clock = Clock()
+    chronicle, poster = _chronicle(clock)
+
+    chronicle.on_event(_tasks(2))
+    chronicle.on_event(_task_end(1, agent="reviewer-bot"))
+
+    assert _kinds(poster)[1] == ("progress", "kneader")
+
+
 def test_a_task_that_failed_or_was_skipped_is_not_announced_as_finished() -> None:
     """A task ends in whatever state it reached. Only work that finished
     counts towards the run's progress, and only a failure is worth its own

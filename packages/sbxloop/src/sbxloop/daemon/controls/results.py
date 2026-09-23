@@ -160,6 +160,28 @@ class ScheduleOutcome(Outcome):
     message: str
 
 
+class RepositoryOutcome(Outcome):
+    """A registration added, changed or removed; ``repo`` as registered."""
+
+    verb: Literal["add", "update", "remove"]
+    repo: str
+    message: str
+
+
+class RepositoryLabelsOutcome(Outcome):
+    """One repository's sbxloop labels after a sync: what the set is, what
+    the repository carries, what this sync created, and what it could not
+    create (``missing`` — empty means the repository is set up)."""
+
+    repo: str
+    state: Literal["compliant", "incomplete"]
+    expected: list[str]
+    present: list[str]
+    created: list[str]
+    missing: list[str]
+    checked_at: float
+
+
 class LogTailOutcome(Outcome):
     text: str
 

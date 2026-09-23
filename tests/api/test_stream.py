@@ -14,6 +14,7 @@ import json
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -124,6 +125,38 @@ class TestFrames:
         seen = asyncio.run(go())
         assert seen[0].startswith("id: evt_")
         assert seen[-1] == 'event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'
+
+    @pytest.mark.parametrize("batch_size", [1, 200], ids=["next-batch", "paused-batch"])
+    def test_rechecks_revocation_before_sending_more_backlogged_events(
+        self, api: Api, monkeypatch: pytest.MonkeyPatch, batch_size: int
+    ) -> None:
+        monkeypatch.setattr(events_route, "STREAM_BATCH", batch_size)
+        reads = Mock(wraps=events_route.follow)
+        monkeypatch.setattr(events_route, "follow", reads)
+        pair = api.token()
+        first = api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 1})
+        api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 2})
+        api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 3})
+        auth = resolve_token(api.ctx, pair["access_token"])
+
+        async def go() -> None:
+            gen = sse_frames(api.ctx, auth, after=0, run_id=None, type_prefix=None)
+            try:
+                assert (await gen.__anext__()).startswith(f"id: evt_{first}\n")
+                # A backlog must not postpone the check, nor may a client
+                # paused midway through a batch keep receiving stale frames.
+                api.clock.t += events_route.ACCESS_RECHECK_S
+                api.auth.revoke_client(pair["client_id"], api.clock())
+                assert await gen.__anext__() == (
+                    'event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'
+                )
+                assert reads.call_count == 1
+                with pytest.raises(StopAsyncIteration):
+                    await gen.__anext__()
+            finally:
+                await gen.aclose()
+
+        asyncio.run(go())
 
     def test_stopping_ends_every_stream(self, api: Api) -> None:
         headers = api.bearer()

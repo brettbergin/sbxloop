@@ -43,7 +43,8 @@ class FakeIssueRef:
 
 
 class FakeGithub:
-    """The daemon's github handle, narrowed to what filing needs."""
+    """The daemon's github handle, narrowed to what filing needs — and to
+    the ``ops``/``note_failure`` pair the tick's label reading uses."""
 
     def __init__(self) -> None:
         self.created: list[tuple[str, str, str, list[str]]] = []
@@ -51,6 +52,15 @@ class FakeGithub:
 
     def call(self, fn: Any) -> Any:
         return fn(self)
+
+    def ops(self) -> FakeGithub:
+        return self
+
+    def note_failure(self, exc: BaseException) -> bool:
+        return False
+
+    def labels_list(self, repo: str) -> list[Any]:
+        return []
 
     def issue_create(
         self, repo: str, title: str, body: str, labels: list[str] | None = None
@@ -145,12 +155,35 @@ class TestStartRefusals:
         assert "max_agent_runs_per_day" in text
         assert len(harness.dstore.items()) == 1
 
-    def test_a_spec_cap_overrides_the_team_default(self, tmp_path: Path) -> None:
+    def test_a_spec_cap_below_the_team_cap_lowers_it(self, tmp_path: Path) -> None:
+        """An agent's own ``max_runs_per_day`` may lower the team cap: the
+        refusal names the agent's own knob, since that is the one that bit."""
         work, harness, _ = service(tmp_path, agent_team={"max_agent_runs_per_day": 4})
         tools = offered(work, scout(max_runs_per_day=1))
         assert "queued workload" in call(tools, "start_run", kind="workload", ask="first")
         assert "max_runs_per_day" in call(tools, "start_run", kind="workload", ask="second")
         assert len(harness.dstore.items()) == 1
+
+    def test_a_spec_cap_above_the_team_cap_never_raises_it(self, tmp_path: Path) -> None:
+        """``[agent_team] max_agent_runs_per_day`` is a ceiling: an agent whose
+        spec names a higher cap (one a member chose through the API) still
+        stops at the team's number, and the refusal names the team knob."""
+        work, harness, _ = service(tmp_path, agent_team={"max_agent_runs_per_day": 3})
+        tools = offered(work, scout(max_runs_per_day=10))
+        for ask in ("first", "second", "third"):
+            assert "queued workload" in call(tools, "start_run", kind="workload", ask=ask)
+        text = call(tools, "start_run", kind="workload", ask="fourth")
+        assert "[agent_team] max_agent_runs_per_day is 3" in text
+        assert len(harness.dstore.items()) == 3
+
+    def test_a_spec_cap_equal_to_the_team_cap_is_the_agents_own(self, tmp_path: Path) -> None:
+        work, harness, _ = service(tmp_path, agent_team={"max_agent_runs_per_day": 2})
+        tools = offered(work, scout(max_runs_per_day=2))
+        assert "queued workload" in call(tools, "start_run", kind="workload", ask="first")
+        assert "queued workload" in call(tools, "start_run", kind="workload", ask="second")
+        text = call(tools, "start_run", kind="workload", ask="third")
+        assert "your max_runs_per_day is 2" in text
+        assert len(harness.dstore.items()) == 2
 
     def test_the_workspace_budget_refuses_before_anything_is_admitted(self, tmp_path: Path) -> None:
         from tests.unit.test_daemon_loop import gh_item
@@ -517,7 +550,9 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
         assert self.UNGUARDED == UNGUARDED_START_TOOLS
 
     @staticmethod
-    def _offered(tmp_path: Path, agent_tools: list[Any], *, start_work: bool = True) -> set[str]:
+    def _offered(
+        tmp_path: Path, agent_tools: list[Any], *, start_work: bool = True, **turn: Any
+    ) -> set[str]:
         from tests.unit.test_daemon_concierge import FakeGithub as ConciergeGithub, make
 
         concierge, client, *_ = make(tmp_path, [{"text": "ok"}], github=ConciergeGithub())
@@ -528,6 +563,7 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
             start_work=start_work,
             agent_role="planner",
             agent_tools=agent_tools,
+            **turn,
         ).result(timeout=10)
         (job,) = client.jobs
         return {tool.name for tool in job.host_tools}
@@ -551,3 +587,15 @@ class TestAnAgentThatMayStartWorkStartsItOnlyThroughItsGuards:
     def test_an_agent_that_declares_nothing_keeps_the_tools_it_had(self, tmp_path: Path) -> None:
         names = self._offered(tmp_path, [])
         assert names >= self.UNGUARDED
+
+    def test_a_turn_handed_off_from_a_guarded_agent_is_offered_no_unguarded_start(
+        self, tmp_path: Path
+    ) -> None:
+        """A peer an agent with ``can_start`` hands off to (Angie, or an agent
+        that declares nothing) is not offered the start tools that agent was
+        denied, or a handoff would be the way round its guardrails. Every
+        other tool the turn had stays."""
+        plain = self._offered(tmp_path / "plain", [])
+        guarded = self._offered(tmp_path / "guarded", [], guarded_start=True)
+        assert guarded.isdisjoint(self.UNGUARDED)
+        assert guarded == plain - self.UNGUARDED

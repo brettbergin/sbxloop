@@ -32,7 +32,7 @@ import signal
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -50,7 +50,15 @@ from sbxloop.agents.chronicle import RunChronicle
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.posts import ChannelPoster, RunArtifacts
 from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
-from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
+from sbxloop.config import (
+    VCS_KINDS,
+    Config,
+    GithubConfig,
+    RepoConfig,
+    SandboxConfig,
+    ScheduleConfig,
+    VcsKind,
+)
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
     GENERATION_KEY,
@@ -80,10 +88,12 @@ from sbxloop.daemon.model import (
     is_planned_assignment,
     requested_roles,
 )
+from sbxloop.daemon.repositories import RepositoryRegistry
 from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.daemon.usagepool import UsagePool, fairness_key
+from sbxloop.db.event_scope import channel_for_item, channel_for_run
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
@@ -114,11 +124,13 @@ from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
+    GithubOpsError,
     ProvisionError,
     RunCancelledError,
     SbxError,
     SbxloopError,
     StateError,
+    WorkerError,
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
@@ -140,6 +152,13 @@ from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 from sbxloop.sbx.warm import Warmer
+from sbxloop.vcs.github.labels import (
+    LabelReport,
+    LabelSpec,
+    audit_labels,
+    lifecycle_specs,
+    sync_labels,
+)
 
 log = get_logger(__name__)
 
@@ -380,6 +399,7 @@ class DaemonLoop:
         worker_python: str | None = None,
         install_workers: bool | None = None,
         poster: ChannelPoster | None = None,
+        repositories: RepositoryRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -464,6 +484,12 @@ class DaemonLoop:
         self._source_failures = 0
         self._source_next_poll = 0.0
         self._last_gc: float | None = None
+        # The label reading (#630) visits one repository per tick at most,
+        # round-robin from where the last one left off; a forge that would
+        # not answer holds the whole reading off for one interval rather
+        # than costing a failed call every tick.
+        self._labels_cursor = 0
+        self._labels_retry_at = 0.0
         # Warm sandbox sets (#47): kept ready by a thread of their own when
         # `[daemon] warm_pairs` asks for them; a fresh dispatch takes one.
         self._warmer: Warmer | None = (
@@ -485,6 +511,15 @@ class DaemonLoop:
         # The import is reached from the loop thread (a tick) and from a
         # concierge command alike; one of them does it.
         self._schedules_lock = threading.Lock()
+        # Where a repository is registered: the daemon's database. The
+        # start-up that built the sources shares its registry (the file's
+        # entries it imported are narrated once, at recovery); a loop built
+        # on its own gets one of its own.
+        self.repositories = repositories or RepositoryRegistry(config, dstore, clock=clock)
+        # What this process polls: the enabled repositories at start, which
+        # the sources were built from. A registration that changes this set
+        # takes effect at the next start, and says so.
+        self.polled_repos: frozenset[str] = frozenset()
         # The workspace budget pool: the daily run cap and token budget
         # every dispatch is admitted against, and what runs spend.
         self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
@@ -987,6 +1022,23 @@ class DaemonLoop:
 
     # -- mentions ------------------------------------------------------------------
 
+    def _conversation_channels(self, handles: Sequence[RunHandle]) -> dict[str, str | None]:
+        """Resolve live presentation after releasing the run lock.
+
+        External work can acquire its conversation after dispatch. Looking
+        up the durable association keeps controls current without rewriting
+        the handle's admission, assignment, or scheduling fairness lane.
+        """
+        if not handles:
+            return {}
+        with self.dstore.read() as session:
+            return {
+                handle.run_id: channel_for_run(session, handle.run_id)
+                or handle.item.channel_id
+                or channel_for_item(session, handle.item.item_id)
+                for handle in handles
+            }
+
     def live_runs_for_agent(self, channel_id: str, agent_slug: str) -> list[MentionTarget]:
         """Every run in flight for ``channel_id`` that ``agent_slug`` works
         on, with the tasks bound to that agent which are still in flight.
@@ -997,8 +1049,9 @@ class DaemonLoop:
         targets: list[MentionTarget] = []
         with self._current_lock:
             handles = list(self._runs.values())
+        channels = self._conversation_channels(handles)
         for handle in handles:
-            if (handle.item.channel_id or "") != channel_id:
+            if channels.get(handle.run_id) != channel_id:
                 continue
             if not is_planned_assignment(handle.item.assignment_json):
                 continue
@@ -1036,11 +1089,9 @@ class DaemonLoop:
     def live_runs_in_channel(self, channel_id: str) -> list[str]:
         """Every run in flight that answers to ``channel_id``."""
         with self._current_lock:
-            return [
-                handle.run_id
-                for handle in self._runs.values()
-                if (handle.item.channel_id or "") == channel_id
-            ]
+            handles = list(self._runs.values())
+        channels = self._conversation_channels(handles)
+        return [handle.run_id for handle in handles if channels.get(handle.run_id) == channel_id]
 
     def stop_channel(
         self,
@@ -1676,6 +1727,9 @@ class DaemonLoop:
         )
         self._release_request_rejection_hold()
         self._report_restart()
+        # After the restart's own line, so a restart still reads as
+        # "started, restarted by ..." and the import follows it.
+        self.narrate_repository_import()
         self._start_warmer()
         ticks = 0
         try:
@@ -1825,6 +1879,10 @@ class DaemonLoop:
         # even while paused or with the breaker open.
         self._deliver_pending_reports()
         self._maybe_gc(now)
+        # One repository's labels read back per tick at most (#630): a
+        # console shows a repository as set up (or not) without a forge
+        # call of its own, and a paused daemon keeps that answer current.
+        self._maybe_check_labels(now)
         # Liveness safety net for phantom active runs (#374); sweeps even while
         # paused, the very state the field report was filed from.
         self._reconcile_stale_runs(now)
@@ -2498,6 +2556,262 @@ class DaemonLoop:
             profile=spec.profile,
         )
         return f"schedule {spec.name} updated: {spec.cadence_text}, profile `{spec.profile}`."
+
+    # -- the registered repositories ------------------------------------------------
+
+    def _activate_repositories(self) -> None:
+        """Apply the registry (importing the file's entries at first sight)
+        and remember what this process polls: the enabled set now, which
+        is what the sources were built from. The import is narrated when
+        the daemon starts (:meth:`narrate_repository_import`), beside
+        ``daemon.started``, not here: recovery writes no chronology of its
+        own."""
+        self.repositories.activate()
+        self.polled_repos = frozenset(r.repo.casefold() for r in self.config.enabled_repos())
+
+    def narrate_repository_import(self) -> None:
+        """Tell the humans, once, which of the file's entries this process
+        imported into the registry, and where registration lives now."""
+        imported = self.repositories.activate()
+        if not imported:
+            return
+        self._notice(
+            "daemon.repositories_imported",
+            f"📦 repositories: imported {', '.join(imported)} from sbxloop.toml — "
+            "registration lives in the daemon's database now (`POST`/`PATCH`/"
+            "`DELETE /v1/repositories` change it live); a `[[vcs.repos]]` entry still "
+            "carries the repository's other settings, and a new entry in the file is "
+            "registered at the next start",
+            repositories=imported,
+        )
+
+    def repository_restart_required(self, entry: RepoConfig) -> bool:
+        """Whether the registration's enabled state differs from what this
+        process polls, so polling follows at the next start."""
+        return (entry.repo.casefold() in self.polled_repos) != entry.enabled
+
+    def add_repository(
+        self,
+        repo: str,
+        *,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        by: str | None,
+        source: str,
+    ) -> tuple[str, str]:
+        """Register a repository: admitted for work now, polled from the
+        next start. Returns the name as registered and the line to answer
+        with; ``ValueError`` says why not."""
+        forge = kind if kind in VCS_KINDS else self.config.vcs.kind
+        row = self.repositories.add(
+            repo,
+            kind=cast(VcsKind | None, kind),
+            enabled=enabled,
+            deliver_base=deliver_base,
+            by=by,
+            source=source,
+        )
+        who = by or "operator"
+        polling = (
+            "polled from the next daemon start (restart to begin)"
+            if enabled
+            else "disabled: not polled, not run, until enabled"
+        )
+        self._notice(
+            "daemon.repository_added",
+            f"📦 repository {row.repo} ({forge}) registered by {who}; {polling}",
+            repo=row.repo,
+            forge=forge,
+            by=by,
+            source=source,
+            enabled=enabled,
+        )
+        return row.repo, f"repository {row.repo} registered; {polling}."
+
+    def update_repository(
+        self, repo: str, changes: Mapping[str, Any], *, by: str | None
+    ) -> tuple[str, str]:
+        """Change a registration's ``enabled`` / ``deliver_base``, live.
+        ``KeyError`` names an unknown repository, ``ValueError`` a refused
+        change."""
+        row = self.repositories.update(repo, changes, by=by)
+        who = by or "operator"
+        what = ", ".join(f"{key} = {value!r}" for key, value in changes.items()) or "nothing"
+        entry = self.config.find_repo(row.repo)
+        follows = (
+            "; polling follows at the next daemon start"
+            if entry is not None and self.repository_restart_required(entry)
+            else ""
+        )
+        self._notice(
+            "daemon.repository_updated",
+            f"📦 repository {row.repo} changed by {who}: {what}{follows}",
+            repo=row.repo,
+            by=by,
+            changes=dict(changes),
+        )
+        return row.repo, f"repository {row.repo} updated: {what}{follows}."
+
+    def remove_repository(self, repo: str, *, by: str | None) -> tuple[str, str]:
+        """Forget a registration: no longer admitted for work; work already
+        queued or running for it is untouched. ``KeyError`` names an
+        unknown repository."""
+        row = self.repositories.remove(repo, by=by)
+        who = by or "operator"
+        stops = (
+            "; polling stops at the next daemon start"
+            if row.repo.casefold() in self.polled_repos
+            else ""
+        )
+        self._notice(
+            "daemon.repository_removed",
+            f"📦 repository {row.repo} removed by {who}{stops}",
+            repo=row.repo,
+            by=by,
+        )
+        return (
+            row.repo,
+            f"repository {row.repo} removed; work already queued or running for it is "
+            f"untouched{stops}.",
+        )
+
+    # -- the labels a repository carries (#630) --------------------------------------
+
+    def _label_specs(self, repo: str) -> list[LabelSpec]:
+        """The labels ``repo``'s issues need: its lifecycle set (the
+        repository's own ``[[vcs.repos]]`` renames over ``[daemon]``) and
+        the follow-up label."""
+        return lifecycle_specs(self.config.labels_for(repo), self.config.landing.followup_label)
+
+    def _record_labels(self, repo: str, report: LabelReport, now: float) -> None:
+        self.dstore.record_repository_labels(
+            repo, expected=report.expected, missing=report.missing, now=now
+        )
+
+    def sync_repo_labels(self, repo: str, *, by: str | None = None) -> dict[str, Any]:
+        """Operator: give a registered repository every label the loop
+        applies, and record what it carries now.
+
+        The repository is read first and only the labels it does not carry
+        are created, so a repository that is already set up costs one
+        listing and changes nothing — the same work ``sbxloop init-repo``
+        does from the host, through the daemon's own forge sandbox.
+        ``KeyError`` names an unknown repository, ``ValueError`` says why
+        the forge could not be asked; a forge that refused the listing
+        raises, and nothing is recorded.
+        """
+        entry = self.config.find_repo(repo)
+        if entry is None:
+            raise KeyError(repo)
+        name = entry.repo
+        if self.github is None:
+            raise ValueError(
+                "this daemon has no forge sandbox to create labels through; "
+                f"`sbxloop init-repo {name}` creates them from the host"
+            )
+        specs = self._label_specs(name)
+        try:
+            report = sync_labels(self.github.ops(), name, specs)
+        except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+            # The forge would not answer. Drop the sandbox so the next ask
+            # re-provisions (the sources' own error handling, #1165), and
+            # let the caller say so: nothing is recorded on a guess.
+            self.github.note_failure(exc)
+            raise
+        now = self.clock()
+        self._record_labels(name, report, now)
+        who = by or "operator"
+        if report.created and not report.missing:
+            text = f"🏷️ labels on {name}: created {', '.join(report.created)} for {who}"
+        elif report.missing:
+            text = (
+                f"🏷️ labels on {name}: could not create {', '.join(report.missing)} "
+                f"for {who} — the forge refused; the repository is not set up"
+            )
+        else:
+            text = f"🏷️ labels on {name}: already complete, nothing created for {who}"
+        self._notice(
+            "daemon.repository_labels_synced",
+            text,
+            level="warning" if report.missing else "info",
+            repo=name,
+            by=who,
+            created=list(report.created),
+            missing=list(report.missing),
+        )
+        return self._labels_json(name, report, now)
+
+    def _labels_json(self, repo: str, report: LabelReport, now: float) -> dict[str, Any]:
+        missing = set(report.missing)
+        return {
+            "repo": repo,
+            "state": "incomplete" if missing else "compliant",
+            "expected": list(report.expected),
+            "present": [name for name in report.expected if name not in missing],
+            "missing": list(report.missing),
+            "created": list(report.created),
+            "checked_at": now,
+        }
+
+    def _maybe_check_labels(self, now: float) -> None:
+        """Read one registered repository's labels back, so a console can
+        say whether it carries the set the loop applies.
+
+        At most one repository per tick and one reading per repository per
+        ``[daemon] label_check_interval_s``, round-robin, enabled
+        repositories only: a daemon with a handful of repositories spends
+        one listing call each per interval. Never raises — a forge that
+        would not answer leaves the last record standing, dated, and holds
+        the reading off for one interval rather than failing every tick.
+        """
+        interval = self.config.daemon.label_check_interval_s
+        if interval <= 0 or self.github is None or now < self._labels_retry_at:
+            return
+        if not getattr(self.github, "provisioned", True):
+            # Nothing has needed the forge yet this process. A reading is
+            # never what boots the sandbox: the poll's boot is, and the
+            # next tick reads through the box it left behind.
+            return
+        entry = self._labels_due(now, interval)
+        if entry is None:
+            return
+        specs = self._label_specs(entry.repo)
+        try:
+            report = audit_labels(self.github.ops(), entry.repo, specs)
+        except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+            self.github.note_failure(exc)
+            self._labels_retry_at = now + interval
+            log.warning("daemon.labels_unread", repo=entry.repo, error=str(exc))
+            return
+        self._record_labels(entry.repo, report, now)
+        log.debug("daemon.labels_read", repo=entry.repo, missing=list(report.missing))
+
+    def _labels_due(self, now: float, interval: float) -> RepoConfig | None:
+        """The next enabled repository whose labels have not been read
+        within ``interval`` — or whose names have changed since the last
+        reading, which makes what was recorded an answer to another
+        question. ``None`` when every one of them is fresh."""
+        entries = [entry for entry in self.config.repo_list() if entry.enabled]
+        if not entries:
+            return None
+        rows = {row.repo.casefold(): row for row in self.dstore.repositories()}
+        start = self._labels_cursor % len(entries)
+        for offset in range(len(entries)):
+            index = (start + offset) % len(entries)
+            entry = entries[index]
+            row = rows.get(entry.repo.casefold())
+            expected = tuple(spec.name for spec in self._label_specs(entry.repo))
+            if (
+                row is not None
+                and row.labels_checked_at is not None
+                and row.labels_expected == expected
+                and now - row.labels_checked_at < interval
+            ):
+                continue
+            self._labels_cursor = index + 1
+            return entry
+        return None
 
     def _fire_schedules(self, now: float) -> int:
         """Queue every schedule tick that has come due since the last one
@@ -3829,12 +4143,14 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("review.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_review_hold(run_id, "merged", by, now)
-            self._file_followups(run_id, item_id, hold.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            # The item is finished and recoverable before any network work
+            # (#1268): a restart during the filing pass leaves nothing gated.
+            self._file_followups(run_id, item_id, hold.repo)
             self._chronicle_landed(fresh, run_id, hold.pr_number, hold.pr_url or None)
             self._notice(
                 "run.done",
@@ -4067,12 +4383,14 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("gate.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_merge_gate(run_id, "merged", by, now)
-            self._file_followups(run_id, item_id, gate.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
             if fresh is not None:
                 self._deliver_report(fresh)
+            # The item is finished and recoverable before any network work
+            # (#1268): a restart during the filing pass leaves nothing gated.
+            self._file_followups(run_id, item_id, gate.repo)
             if item is not None:
                 self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
             self._chronicle_landed(fresh or item, run_id, gate.pr_number, gate.pr_url or None)
@@ -4127,7 +4445,11 @@ class DaemonLoop:
         that one could not (a GitHub failure, a restart) and is idempotent
         against it: the run's ``followup`` rows and the issue markers on the
         repository mean nothing is filed twice. Best-effort: the PR is
-        merged, so a failure here is logged, never raised."""
+        merged, so a failure here is logged, never raised. It runs only once
+        the item is done, its ledger closed and its report delivered
+        (#1268): the pass pages through the repository's issues and creates
+        one per follow-up, and a restart in the middle of that must not
+        leave a merged item parked, which recovery would never settle."""
         assert self.github is not None
         try:
             item = self.dstore.get(item_id)
@@ -4516,26 +4838,33 @@ class DaemonLoop:
         stays keyed on the item's own repository; a repo-less item never
         starts one.
 
-        On a daemon with several repositories a repo-less item refreshes
-        nothing: no repository means no credential, and the checkout would
-        otherwise fall back to the primary repository's, fetched anonymously
-        -- a private forge answered with a username prompt and every chat ask
-        or scheduled workload posted a refresh failure.
+        On a daemon with several repositories, or with every repository
+        disabled, a repo-less item refreshes nothing: no sole enabled
+        repository means no credential, and the checkout would otherwise
+        fall back to the primary repository's, fetched anonymously -- a
+        private forge answered with a username prompt and every chat ask or
+        scheduled workload posted a refresh failure. Only a daemon that
+        declares no repository at all falls through to the legacy
+        daemon-wide workspace.
+
+        Only a live *code* run holds the checkout still: a workload or tool
+        run works from its own data directory, never from the checkout, so
+        a code run admitted beside one still refreshes.
         """
         resolved = repo
         if resolved is None:
             default = self.config.default_repo()
             resolved = default.repo if default is not None else None
-            if resolved is None and self.config.enabled_repos():
+            if resolved is None and self.config.repo_list():
                 log.info(
                     "workspace.refresh_skipped",
-                    reason="the item names no repository and several are configured",
+                    reason="the item names no repository and none is the sole enabled one",
                 )
                 return
-        if resolved is not None and resolved in self._live_repos():
-            # Another run is working from this checkout right now: moving
-            # it under that run's feet is not ours to do. The next run
-            # started with the repository free refreshes it.
+        if resolved is not None and resolved in self._live_repos(code_only=True):
+            # Another code run is cloning from this checkout right now:
+            # moving it under that run's feet is not ours to do. The next
+            # run started with the repository free refreshes it.
             log.info(
                 "workspace.refresh_skipped",
                 repo=resolved,
@@ -4958,6 +5287,7 @@ class DaemonLoop:
         self.generation = new_generation_id()
         self.dstore.set_value(GENERATION_KEY, self.generation)
         self.dstore.set_value(GENERATION_STARTED_KEY, repr(self.clock()))
+        self._activate_repositories()
         with self._holds_lock:
             restored = self.dstore.holds()
             self._holds = {h.name for h in restored}

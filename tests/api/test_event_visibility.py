@@ -294,6 +294,81 @@ def test_the_websocket_carries_only_visible_events(api: Api) -> None:
                 break
 
 
+def _user_id(api: Api, token: dict[str, Any]) -> str:
+    return str(api.client.get("/v1/users/me", headers=bearer(token)).json()["id"])
+
+
+def _remove(api: Api, actor: dict[str, Any], user_id: str) -> None:
+    removed = api.client.delete(f"/v1/workspace/members/{user_id}", headers=bearer(actor))
+    assert removed.status_code == 204, removed.text
+
+
+def test_a_removed_member_receives_nothing_more_on_an_open_stream(
+    api: Api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A person removed from the workspace keeps an access token that still
+    verifies, but an event stream they opened as a member ends at the next
+    re-check with ``access_revoked``: it never falls back to the unfiltered
+    view a plain client gets."""
+    monkeypatch.setattr(events_route, "ACCESS_RECHECK_S", 0.0)
+    owner, guest, _ = _people(api)
+    private = _channel(api, bearer(owner))
+    shared = _channel(api, bearer(owner), "workspace")
+    _touch(api, bearer(owner), shared)
+    wanted = len(_all_events(api, bearer(guest)))
+    auth = resolve_token(api.ctx, guest["access_token"])
+
+    async def go() -> list[str]:
+        gen = sse_frames(api.ctx, auth, after=0, run_id=None, type_prefix=None)
+        delivered = 0
+        async for frame in gen:
+            if frame.startswith("id: evt_"):
+                delivered += 1
+            if delivered >= wanted:
+                break
+        # The member is removed while the stream is open; every event that
+        # lands afterwards, private or shared, must stay unseen.
+        await asyncio.to_thread(_remove, api, owner, _user_id(api, guest))
+        await asyncio.to_thread(_touch, api, bearer(owner), private)
+        await asyncio.to_thread(_touch, api, bearer(owner), shared)
+        api.ctx.hub.notify()
+        after: list[str] = []
+        async for frame in gen:
+            after.append(frame)
+            if frame.startswith("event: stream.closed") or frame.startswith("id: evt_"):
+                break
+        return after
+
+    after = asyncio.run(asyncio.wait_for(go(), timeout=30))
+    assert after == ['event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'], after
+    assert private in _channels_in(_all_events(api, bearer(owner), channel_id=private))
+
+
+def test_a_plain_client_stream_outlives_the_access_re_check(
+    api: Api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream opened by an API client with no local user is not pinned
+    to a member: it keeps delivering across re-checks."""
+    monkeypatch.setattr(events_route, "ACCESS_RECHECK_S", 0.0)
+    auth = resolve_token(api.ctx, api.token()["access_token"])
+    api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 1})
+
+    async def go() -> list[str]:
+        gen = sse_frames(api.ctx, auth, after=0, run_id=None, type_prefix=None)
+        seen = [await gen.__anext__()]
+        api.ctx.chronology.record("daemon.notice", api.clock(), data={"n": 2})
+        api.ctx.hub.notify()
+        async for frame in gen:
+            if frame.startswith("id: evt_") or frame.startswith("event: stream.closed"):
+                seen.append(frame)
+                break
+        return seen
+
+    seen = asyncio.run(asyncio.wait_for(go(), timeout=30))
+    assert all(frame.startswith("id: evt_") for frame in seen), seen
+    assert '"n":2' in seen[-1]
+
+
 def _linked_run(api: Api, headers: dict[str, str], channel_id: str, text: str) -> str:
     """Run a workload asked for in ``channel_id``; returns the run id."""
     accepted = api.client.post(

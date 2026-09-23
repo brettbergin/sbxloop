@@ -2172,12 +2172,24 @@ outcome as `message` until the loop grows structured results of its own; a
 JSON surface exposes the structured fields and never parses the message.
 
 The attribution is derived from the principal, never the reverse: the
-surfaces that exist today are trusted completely, as they always were, and
-`dispatch` builds them a `Principal.trusted(by, via)` holding every
-capability with the legacy string byte-for-byte. A principal with fewer
-capabilities can only come from a surface that authenticated it, and such
-a surface calls the service directly — it never goes through the prose
-dispatcher.
+surfaces the operator owns (`ctl`, a restricted chat channel, the console)
+are trusted completely, as they always were, and `dispatch` builds them a
+`Principal.trusted(by, via)` holding every capability with the legacy
+string byte-for-byte. A principal with fewer capabilities can only come
+from a surface that authenticated it, and such a surface calls the service
+directly — it never goes through the prose dispatcher.
+
+The concierge is the one prose surface that is not the operator's alone: a
+product channel's turn comes from a person with a workspace role. So a turn
+carries a principal (`submit_turn(principal=…)`, on the `TurnContext`), and
+`sbx_control` and `set_config` answer to it: the control service refuses an
+operator's verb the person's role does not grant, and the config write
+takes `daemon:manage`, as the admin routes do. The API hands over the same
+principal a stop or a steer from chat uses (`_chat_principal`); a chat
+bridge, whose control channel the operator restricted, hands over an
+explicit `Principal.trusted`; a turn with no principal (nobody vouched for
+it) keeps the read verbs alone. The attribution the source hears is still
+the concierge's `<author> (via concierge)`.
 
 `controls/eligibility.py` is the pure function a surface can answer
 *before* asking: given a run's kind and state, its item's state, the gate
@@ -2234,6 +2246,30 @@ evidence cannot decide is `reconciling` with the reason, for an operator; it is
 never guessed `succeeded`, and a timeout is never evidence.
 
 ### The remote API listener
+
+External job conversations are a durable read-side projection in
+`api/external_work.py`. Migration `0034` adds job identities, item aliases,
+immutable attempt/channel bindings and a dirty queue. Source-table triggers
+enqueue changed records; a resumable initial scan imports active work and
+the last 30 days of terminal history. The API projector reconciles the queue
+without requiring a connected browser. Presentation associations never
+rewrite admission channels or execution records. Run-scoped access,
+chronology, artifacts and live steering consult the attempt binding; the
+additive `/jobs` route exposes attempts without inventing item or turn IDs.
+
+Imported messages carry historical provenance and read baselines. Per-run
+event cursors, transition identities and transactional message insertion
+make restarts and concurrent projection idempotent. System-created channels
+are workspace-visible, while existing conversation permissions and deleted
+channel tombstones remain authoritative.
+
+Migration `0034` is additive for execution data, but an older package's
+Alembic loader cannot resolve that revision. A package-only rollback cannot
+open the migrated database. The pre-upgrade deployment backup must be
+restored with the daemon stopped before restarting that older package;
+preserve the failed database first because restoration loses later writes.
+The current deployment workflow creates the backup but does not restore it
+automatically. A failed rollback therefore needs operator recovery.
 
 The operator's and integrator's reference is [docs/api.md](api.md); the
 contract of record is the OpenAPI document the listener publishes, kept
@@ -2431,10 +2467,14 @@ stream can reconnect to the next generation, and the operation closes with
 the effect — acceptance is the durable fact, the exit is observed through
 readiness, and the restart reuses the loop's supervisor check and marker
 unchanged. Schedules and a suspended repository's resume go through the
-same service verbs ctl and chat use, each an operation. Not published, by
-design: configuration writes, repository registration, backup and restore,
-garbage collection and sandbox deletion — each needs its own attribution,
-conflict and active-run story before it has a remote adapter.
+same service verbs ctl and chat use, each an operation. So does a
+repository's registration: the daemon's database holds it (the file's
+`[[vcs.repos]]` entries imported once, at first sight, like schedules), the
+API adds, changes and removes registrations live, and what the daemon polls
+follows at the next start. Not published, by design: configuration writes,
+backup and restore, garbage collection and sandbox deletion — each needs its
+own attribution, conflict and active-run story before it has a remote
+adapter.
 
 ### Repositories
 
@@ -2470,7 +2510,11 @@ The split is deliberate and worth stating plainly:
 - **Per repository** — base branch (`deliver_base`), repo creation
   (`create_repo`, `create_public`), every lifecycle label
   (`trigger_label` … `workload_label`; `Config.labels_for(repo)` folds the
-  `[daemon]` defaults in and `sbxloop init-repo` creates them, #630),
+  `[daemon]` defaults in, and `sbxloop init-repo` — or the API's
+  `POST /v1/repositories/{id}/labels/sync`, which does the same work
+  through the daemon's own forge sandbox — creates them, #630; the daemon
+  reads one repository's labels back per tick, so every registered
+  repository says whether it carries the set),
   extra `labels`, the `enabled` switch, the token
   environment variable (`token_env`), and the **workspace** the repo's
   runs clone from (`workspace`).

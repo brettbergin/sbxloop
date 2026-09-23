@@ -859,6 +859,17 @@ def _valid_repo(value: str, kind: VcsKind | None = None) -> bool:
     )
 
 
+def check_repo_name(value: str, kind: str) -> None:
+    """Refuse ``value`` unless it names a repository on ``kind``:
+    ``owner/name``, or on GitLab ``group/subgroup/project``. The sentence
+    is for the person who typed it."""
+    if kind not in VCS_KINDS:
+        raise ValueError(f"forge must be one of {', '.join(VCS_KINDS)}, got {kind!r}")
+    if not _valid_repo(value, kind):
+        shape = "group/subgroup/project" if kind == "gitlab" else "owner/name"
+        raise ValueError(f"a {kind} repository must be {shape}, got {value!r}")
+
+
 # What a PR title / commit message template may interpolate (#621).
 # `{title}` is the model-authored title when the plan gave one, else the
 # outcome; the rest are the run's own facts.
@@ -1882,6 +1893,14 @@ class DaemonConfig(_ConfigModel):
     # a comment on the issue. An issue carrying both this and
     # `trigger_label` is refused, named.
     workload_label: str = "sbxloop:workload"
+    # How often a registered repository's labels are read back, so a
+    # console can say whether the repository carries the set the loop
+    # applies (`sbxloop init-repo`, or the API's label sync, creates them).
+    # One listing call per repository per interval, one repository per
+    # tick, and never for a disabled one; 0 turns the reading off, and a
+    # repository then reports its labels as unread until a sync is asked
+    # for.
+    label_check_interval_s: float = Field(default=3600.0, ge=0)
     max_runs_per_day: int = 12
     # How many runs execute at once. One (the default) is the serial loop:
     # a tick dispatches a run and settles it before the next. Above one, a
@@ -1900,8 +1919,9 @@ class DaemonConfig(_ConfigModel):
     run_cap_timezone: str = "UTC"
     # The workspace's daily token budget: input plus output tokens reported
     # by every run and every chat turn since 00:00 in `run_cap_timezone`.
-    # Once reached, no new run starts (and a chat guardrail may refuse a
-    # turn) until the next day. Unset: tokens never refuse work.
+    # Once reached, no new run starts and no chat turn, whoever asked for
+    # it, is sent to the model until the next day; the person is told so
+    # in reply. Unset: tokens never refuse work.
     daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
@@ -2837,11 +2857,19 @@ class ApiOidcConfig(_ConfigModel):
     #: Create an account on a first sign-in; off, only linked or existing
     #: accounts may sign in.
     auto_provision: bool = True
+    #: Absolute lifetime of an application session; refresh never extends it.
+    session_max_age_s: int = Field(default=28800, ge=300, le=86400)
     #: Link a first sign-in to the local account holding the same email when
-    #: the provider says the address is verified. Off by default: a provider
-    #: that lets people edit their email, or asserts ``email_verified`` for
-    #: any address, would otherwise hand them that account (the owner's
-    #: included). Off, or unverified, the person gets an account of their own.
+    #: the provider says the address is verified and the local side does
+    #: too: the address came from the installation's first registration, an
+    #: invite addressed to it or an earlier verified provider claim, never
+    #: from the person editing their own profile (which would let a member
+    #: capture a colleague's first sign-in). The sign-in that links never
+    #: changes the account's role. Off by default: a provider that lets
+    #: people edit their email, or asserts ``email_verified`` for any
+    #: address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified on either side, the person gets an
+    #: account of their own.
     link_verified_email: bool = False
     request_timeout_s: float = Field(default=10.0, gt=0, le=60)
 
@@ -2917,6 +2945,9 @@ class ApiConfig(_ConfigModel):
     """
 
     enabled: bool = False
+    #: Permit human password login and registration. Machine clients remain
+    #: available; disabling this also refuses existing non-OIDC human tokens.
+    local_auth_enabled: bool = True
     # Loopback by default: a broader bind is an explicit choice, and local
     # binding alone never establishes identity — every request authenticates.
     bind: str = "127.0.0.1"
@@ -2986,8 +3017,9 @@ class AgentTeamConfig(_ConfigModel):
     refused, and how much work one agent may start in a day.
 
     ``max_chain_depth = 0`` stops agent-started work entirely without
-    editing every agent; ``max_agent_runs_per_day`` is the default an
-    ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+    editing every agent; ``max_agent_runs_per_day`` is the ceiling on every
+    agent's daily starts, which an ``[[agents]]`` entry's own
+    ``max_runs_per_day`` may lower but never raise.
 
     ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
     replies, the delivery and any notice; ``"quiet"`` posts only what ends
@@ -2999,7 +3031,8 @@ class AgentTeamConfig(_ConfigModel):
     # Work a person asked for is depth 0; the run an agent starts from it
     # is depth 1. An agent working at this depth may start nothing.
     max_chain_depth: int = Field(default=2, ge=0)
-    # The daily cap for an agent whose spec names none.
+    # The ceiling on every agent's daily starts; a spec's own cap may
+    # lower it, never raise it.
     max_agent_runs_per_day: int = Field(default=4, ge=0)
     # What a run posts in the channel that asked for it.
     chronicle: Literal["normal", "quiet", "off"] = "normal"
@@ -3040,7 +3073,8 @@ class CollaborationConfig(_ConfigModel):
     # A cheap one belongs here: it runs once per ambient participant per
     # message that gets past the interest prefilter.
     ambient_model: str | None = None
-    # How many recent messages the prefilter and the classifier read.
+    # How many recent messages the relevance classifier reads. The
+    # interest prefilter reads only the message that just arrived.
     ambient_window_messages: int = Field(default=5, ge=1, le=50)
     # How often one ambient agent may speak in a channel, per hour.
     ambient_max_per_hour: int = Field(default=6, ge=0)
@@ -3056,6 +3090,9 @@ class Config(_ConfigModel):
     model_source_dir: Path | None = None
     # Environment values (including secrets) never enter the snapshot.
     _model_env: dict[str, str] | None = PrivateAttr(default=None)
+    # The file's own `[[vcs.repos]]` entries, kept from the first time the
+    # daemon's registry replaced the declared list (see `replace_repos`).
+    _declared_repos: tuple[RepoConfig, ...] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
@@ -3216,6 +3253,23 @@ class Config(_ConfigModel):
         """The repository a run acts on, with the forge's daemon-wide
         defaults folded in; see :meth:`GithubConfig.effective_repo`."""
         return self.github.effective_repo(repo)
+
+    def declared_repos(self) -> list[RepoConfig]:
+        """The file's own entries: what ``[[vcs.repos]]`` declared, before
+        the daemon's registry (:mod:`sbxloop.daemon.repositories`) was
+        applied over it — the same as :meth:`repo_list` until then."""
+        if self._declared_repos is None:
+            return self.repo_list()
+        return list(self._declared_repos)
+
+    def replace_repos(self, repos: Sequence[RepoConfig]) -> None:
+        """``repos`` as the declared list from now on, live, for every
+        consumer of this configuration: what the daemon's registry
+        applies. The file's own entries are kept (:meth:`declared_repos`)
+        the first time, so a later application can fold over them again."""
+        if self._declared_repos is None:
+            self._declared_repos = tuple(self.repo_list())
+        self._with_repos(list(repos))
 
     @property
     def primary_repo(self) -> str | None:

@@ -145,6 +145,13 @@ def _known(name: str) -> None:
         raise Problem(404, "connection_not_found", "connection not found")
 
 
+def credential_snapshot(ctx: ApiContext) -> tuple[Config, dict[str, str]]:
+    """The host's configuration and secrets as a check would see them now:
+    what the connection routes and repository discovery read a credential
+    from."""
+    return _snapshot(ctx)
+
+
 def _snapshot(ctx: ApiContext) -> tuple[Config, dict[str, str]]:
     home = ctx.config.paths
     if home.config_toml.is_file():

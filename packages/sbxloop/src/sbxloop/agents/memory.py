@@ -12,8 +12,10 @@ itself remembers, recalls and forgets through the tools in
 :class:`MemoryService` is the one interface. Rows live in the daemon's store
 (``agent_memories``); forgetting is a soft delete, updates are checked
 against the row's ``revision``, and an agent past its configured cap loses
-its oldest unpinned memory. Every change writes an ``agent.memory.*`` event
-naming the memory, never its text.
+its oldest unpinned memory. Listing, updating and forgetting all take the
+caller's ``readable`` channel access, so a memory a person may not read is
+not found for them whichever of the three they ask for. Every change writes
+an ``agent.memory.*`` event naming the memory, never its text.
 """
 
 from __future__ import annotations
@@ -210,12 +212,26 @@ def _live(session: Any, agent: str) -> list[Memory]:
     return [_memory(row) for row in rows]
 
 
-def _row(session: Any, memory_id: str, agent: str | None) -> AgentMemoryRow:
+def _row(
+    session: Any,
+    memory_id: str,
+    agent: str | None,
+    readable: Callable[[str], bool] | None = None,
+) -> AgentMemoryRow:
+    """The live memory ``memory_id`` names, once it is ``agent``'s and its
+    source channel is one ``readable`` admits. Every miss is the same
+    ``memory_not_found``, so a memory the caller may not read answers what
+    an unknown id answers and is never confirmed to exist."""
     row = session.get(AgentMemoryRow, memory_id)
     if (
         not isinstance(row, AgentMemoryRow)
         or row.deleted_at is not None
         or (agent is not None and row.agent_slug != agent)
+        or (
+            readable is not None
+            and row.source_channel_id is not None
+            and not readable(str(row.source_channel_id))
+        )
     ):
         raise AgentMemoryError("memory_not_found", "memory not found")
     return row
@@ -360,12 +376,21 @@ class MemoryService:
                 _row(session, memory.id, agent).last_used_at = now
             return chosen
 
-    def forget(self, agent: str, memory_id: str, *, author: str) -> None:
-        """Soft-delete one of ``agent``'s memories."""
+    def forget(
+        self,
+        agent: str,
+        memory_id: str,
+        *,
+        author: str,
+        readable: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Soft-delete one of ``agent``'s memories. ``readable``, when given,
+        is the caller's channel access: a memory from a channel it cannot
+        read is not found, exactly as an unknown id is not found."""
         _check_author(author)
         now = self.clock()
         with self.store.transaction() as session:
-            row = _row(session, memory_id, agent)
+            row = _row(session, memory_id, agent, readable)
             row.deleted_at = now
             _event(session, "agent.memory.deleted", now, _memory(row), author=author)
 
@@ -378,14 +403,17 @@ class MemoryService:
         expected_revision: int,
         author: str,
         agent: str | None = None,
+        readable: Callable[[str], bool] | None = None,
     ) -> Memory:
         """Change a memory's text or pin at ``expected_revision``; ``agent``,
-        when given, must be the memory's own."""
+        when given, must be the memory's own. ``readable``, when given, is
+        the caller's channel access: a memory from a channel it cannot read
+        is not found, so neither the change nor the text is theirs to take."""
         _check_author(author)
         clean = None if content is None else self._clean(content)
         now = self.clock()
         with self.store.transaction() as session:
-            row = _row(session, memory_id, agent)
+            row = _row(session, memory_id, agent, readable)
             if int(row.revision) != expected_revision:
                 raise MemoryRevisionConflict(memory_id, expected_revision, int(row.revision))
             if clean is not None:

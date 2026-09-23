@@ -571,8 +571,8 @@ def test_removing_a_member_ends_their_access(api: Any) -> None:
     assert response.content == b""
     assert api.ctx.collaboration.member_for_user(member_id) is None
     assert _client_capabilities(api, member["client_id"]) == set()
-    assert api.client.get("/v1/runs", headers=_headers(member)).status_code == 403
-    assert api.client.get("/v1/users", headers=_headers(member)).status_code == 403
+    assert api.client.get("/v1/runs", headers=_headers(member)).status_code == 401
+    assert api.client.get("/v1/users", headers=_headers(member)).status_code == 401
     refreshed = api.client.post(
         "/v1/auth/token",
         json={"grant_type": "refresh_token", "refresh_token": member["refresh_token"]},
@@ -901,6 +901,128 @@ def test_a_failed_membership_change_keeps_refresh_tokens(
         json={"grant_type": "refresh_token", "refresh_token": bea["refresh_token"]},
     )
     assert refreshed.status_code == 200, refreshed.text
+
+
+def _pending_invite_ids(api: Any, headers: dict[str, str]) -> set[str]:
+    listed = api.client.get("/v1/workspace/invites", headers=headers).json()["data"]
+    return {entry["id"] for entry in listed if entry["accepted_at"] is None}
+
+
+def _registration(api: Any, name: str, token: str) -> Any:
+    return _register(
+        api,
+        {
+            "email": f"{name}@example.test",
+            "username": name,
+            "password": f"{name} has a long password",
+            "invite_token": token,
+        },
+    )
+
+
+def test_losing_workspace_standing_revokes_the_invites_one_created(api: Any) -> None:
+    """An invite stands only while its creator does: removing or
+    deactivating an admin withdraws every invite they had not yet spent,
+    in the same step and on the record."""
+    owner = _headers(_owner_token(api))
+    owner_id = _owner_id(api)
+    ada, ada_id = _join(api, "admin", "ada")
+    bob, bob_id = _join(api, "admin", "bob")
+    store = api.ctx.collaboration
+    by_ada = [
+        api.client.post("/v1/workspace/invites", json={"role": role}, headers=_headers(ada)).json()
+        for role in ("admin", "member")
+    ]
+    by_bob = api.client.post(
+        "/v1/workspace/invites", json={"role": "member"}, headers=_headers(bob)
+    ).json()
+    _, spent = store.create_invite("member", None, created_by=ada_id, ttl_s=3600, now=api.clock())
+    assert _registration(api, "cal", spent).status_code == 201
+    mine, by_owner = store.create_invite(
+        "member", None, created_by=owner_id, ttl_s=3600, now=api.clock()
+    )
+
+    assert api.client.delete(f"/v1/workspace/members/{ada_id}", headers=owner).status_code == 204
+    paused = api.client.patch(
+        f"/v1/workspace/members/{bob_id}", json={"is_active": False}, headers=owner
+    )
+    assert paused.status_code == 200, paused.text
+
+    for invite in (*by_ada, by_bob):
+        refused = _registration(api, "dan", invite["token"])
+        assert refused.status_code == 403, refused.text
+        assert _code(refused) == "invite_invalid"
+    assert _pending_invite_ids(api, owner) == {mine.id}
+    revoked = _events(api, "workspace.invite.revoked")
+    assert {json.loads(row.data_json)["invite_id"] for row in revoked} == {
+        invite["id"] for invite in (*by_ada, by_bob)
+    }
+    assert {json.loads(row.actor_json)["id"] for row in revoked} == {owner_id}
+    # The spent invite stays on record, and the owner's own invite still admits.
+    assert [
+        entry["accepted_at"] is not None
+        for entry in api.client.get("/v1/workspace/invites", headers=owner).json()["data"]
+        if entry["created_by"] == ada_id
+    ] == [True]
+    assert _registration(api, "dan", by_owner).status_code == 201
+
+
+def test_an_invite_whose_creator_is_no_longer_a_member_admits_nobody(api: Any) -> None:
+    _owner_token(api)
+    store = api.ctx.collaboration
+    _, ada_id = _join(api, "admin", "ada")
+    store.remove_member(ada_id, now=api.clock())
+    # An invite still naming a creator who is gone (a row from before the
+    # creator left) is refused at acceptance too.
+    _, raw = store.create_invite("member", None, created_by=ada_id, ttl_s=3600, now=api.clock())
+
+    refused = _registration(api, "dan", raw)
+    assert refused.status_code == 403, refused.text
+    assert _code(refused) == "invite_invalid"
+    with pytest.raises(CollaborationError) as again:
+        store.accept_invite(raw, ada_id, now=api.clock())
+    assert again.value.code == "invite_invalid"
+    assert store.member_for_user(ada_id) is None
+
+
+def test_an_invite_grants_at_most_its_creators_current_role(api: Any) -> None:
+    owner = _headers(_owner_token(api))
+    owner_id = _owner_id(api)
+    store = api.ctx.collaboration
+    ada, ada_id = _join(api, "admin", "ada")
+    above = api.client.post(
+        "/v1/workspace/invites", json={"role": "admin"}, headers=_headers(ada)
+    ).json()
+    within = api.client.post(
+        "/v1/workspace/invites", json={"role": "member"}, headers=_headers(ada)
+    ).json()
+
+    # Demoting ada withdraws the invite above the new role and keeps the other.
+    demoted = api.client.patch(
+        f"/v1/workspace/members/{ada_id}", json={"role": "member"}, headers=owner
+    )
+    assert demoted.status_code == 200, demoted.text
+    refused = _registration(api, "cal", above["token"])
+    assert refused.status_code == 403 and _code(refused) == "invite_invalid"
+    assert above["id"] not in _pending_invite_ids(api, owner)
+    assert within["id"] in _pending_invite_ids(api, owner)
+    assert [
+        json.loads(row.data_json)["invite_id"] for row in _events(api, "workspace.invite.revoked")
+    ] == [above["id"]]
+    assert _registration(api, "cal", within["token"]).status_code == 201
+
+    # An owner invite whose creator is an admin by the time it is accepted
+    # admits an admin, with an admin's capabilities.
+    _, raw = store.create_invite("owner", None, created_by=owner_id, ttl_s=3600, now=api.clock())
+    store.set_role(ada_id, "owner")
+    assert store.set_role(owner_id, "admin").role == "admin"
+    joined = _registration(api, "dan", raw)
+    assert joined.status_code == 201, joined.text
+    dan = store.member_for_client(joined.json()["client_id"])
+    assert dan is not None and dan.role == "admin"
+    assert _client_capabilities(api, joined.json()["client_id"]) == set(ROLE_CAPABILITIES["admin"])
+    accepted = _events(api, "workspace.invite.accepted")
+    assert json.loads(accepted[-1].data_json)["role"] == "admin"
 
 
 def test_the_endpoint_catalog_lists_only_real_workspace_methods() -> None:

@@ -205,7 +205,12 @@ def test_providers_offer_only_local_login_when_oidc_is_off(api: Api) -> None:
     response = api.client.get("/v1/auth/providers")
 
     assert response.status_code == 200
-    assert response.json() == {"local": True, "oidc": None}
+    assert response.json() == {
+        "local": True,
+        "oidc": None,
+        "policy_version": 1,
+        "oidc_session_max_age_s": None,
+    }
     features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
     assert "auth.oidc" not in features
 
@@ -218,6 +223,8 @@ def test_providers_describe_the_configured_provider_without_a_token(
     assert response.status_code == 200
     assert response.json() == {
         "local": True,
+        "policy_version": 1,
+        "oidc_session_max_age_s": 28800,
         "oidc": {
             "id": "authentik",
             "label": "Authentik",
@@ -237,7 +244,12 @@ def test_providers_offer_no_oidc_when_discovery_fails(served: Api, idp: FakeIdP)
     response = served.client.get("/v1/auth/providers")
 
     assert response.status_code == 200
-    assert response.json() == {"local": True, "oidc": None}
+    assert response.json() == {
+        "local": True,
+        "oidc": None,
+        "policy_version": 1,
+        "oidc_session_max_age_s": 28800,
+    }
 
 
 def test_a_failed_discovery_is_not_retried_on_every_request(served: Api, idp: FakeIdP) -> None:
@@ -723,9 +735,141 @@ def test_an_email_already_linked_to_another_identity_gets_a_new_account(
     assert _member(linking, other).role == "member"
 
 
+def _invite(api: Api, role: str, email: str | None) -> str:
+    """The raw token of an invite the owner issued, addressed to ``email`` or open."""
+    store = api.ctx.collaboration
+    owner = next(m.user.id for m in store.list_members() if m.role == "owner")
+    _, raw = store.create_invite(role, email, created_by=owner, ttl_s=3600, now=api.clock())
+    return raw
+
+
+def _register_invited(api: Api, name: str, email: str, invite_token: str) -> dict[str, Any]:
+    body = {
+        "email": email,
+        "username": name,
+        "password": f"{name} has a long password",
+        "invite_token": invite_token,
+    }
+    registered = api.client.post("/v1/auth/local/register", json=body)
+    assert registered.status_code == 201, registered.text
+    return dict(registered.json())
+
+
+def _change_email(api: Api, tokens: dict[str, Any], email: str) -> None:
+    response = api.client.patch(
+        "/v1/users/me",
+        json={"email": email},
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_a_member_who_took_a_colleagues_email_is_not_linked_or_promoted(
+    tmp_path: Path, idp: FakeIdP
+) -> None:
+    for api in _serve(tmp_path, idp, link_verified_email=True, admin_groups=["admins"]):
+        _register_local(api)  # the owner
+        mallory = _register_invited(
+            api, "mallory", "mallory@example.test", _invite(api, "member", "mallory@example.test")
+        )
+        _change_email(api, mallory, "newadmin@example.test")
+
+        # The new admin's first sign-in: the provider has verified the address.
+        tokens = _sign_in(api, idp, "newadmin", groups=["admins"])
+        again = _sign_in(api, idp, "newadmin", groups=["admins"])
+
+        assert tokens["client_id"] != mallory["client_id"]
+        assert again["client_id"] == tokens["client_id"]
+        assert _users(api)[mallory["client_id"]].oidc_subject is None
+        assert _member(api, mallory).role == "member"
+        assert _member(api, tokens).role == "admin"
+
+
+def test_an_address_chosen_at_an_open_invite_is_not_linkable(linking: Api, idp: FakeIdP) -> None:
+    _register_local(linking)
+    bob = _register_invited(linking, "bob", "bob@example.test", _invite(linking, "member", None))
+
+    tokens = _sign_in(linking, idp, "bob")
+
+    assert tokens["client_id"] != bob["client_id"]
+    assert _users(linking)[bob["client_id"]].oidc_subject is None
+
+
+def test_an_address_an_invite_was_sent_to_is_linkable(linking: Api, idp: FakeIdP) -> None:
+    _register_local(linking)
+    bob = _register_invited(
+        linking, "bob", "Bob@Example.test", _invite(linking, "member", "bob@example.test")
+    )
+
+    tokens = _sign_in(linking, idp, "bob")
+
+    assert tokens["client_id"] == bob["client_id"]
+    assert _users(linking)[bob["client_id"]].oidc_subject == "bob"
+
+
+def test_an_email_changed_by_its_holder_is_not_linkable(linking: Api, idp: FakeIdP) -> None:
+    registered = _register_local(linking)
+    _change_email(linking, registered, "alice@elsewhere.test")
+
+    # The changed address is not trusted for a link...
+    stranger = _sign_in(linking, idp, "stranger", email="alice@elsewhere.test")
+    assert stranger["client_id"] != registered["client_id"]
+    # ...and the address the account was registered with is held by nobody
+    # now, so a sign-in with it gets an account of its own too.
+    other = _sign_in(linking, idp, "other", email=LOCAL["email"])
+    assert other["client_id"] != registered["client_id"]
+
+
+def test_the_linking_sign_in_never_changes_the_role(tmp_path: Path, idp: FakeIdP) -> None:
+    for api in _serve(tmp_path, idp, link_verified_email=True, admin_groups=["admins"]):
+        _register_local(api)  # the owner
+        bob = _register_invited(
+            api, "bob", "bob@example.test", _invite(api, "member", "bob@example.test")
+        )
+
+        tokens = _sign_in(api, idp, "bob", groups=["admins"])
+
+        assert tokens["client_id"] == bob["client_id"]
+        assert _member(api, bob).role == "member"
+        # The next sign-in follows the groups like any other.
+        _sign_in(api, idp, "bob", groups=["admins"])
+        assert _member(api, bob).role == "admin"
+
+
 def test_an_unverified_new_email_still_provisions(served: Api, idp: FakeIdP) -> None:
     tokens = _sign_in(served, idp, "alice", email_verified=False)
+    me = _me(served, tokens)
+    assert me.status_code == 200, me.text
+    # The claim is not trusted: the account gets an address that can never
+    # receive mail, not the one the provider did not check.
+    assert me.json()["email"].endswith("@users.invalid")
+
+
+def test_an_unverified_email_never_replaces_the_stored_one(served: Api, idp: FakeIdP) -> None:
+    tokens = _sign_in(served, idp, "alice")
     assert _me(served, tokens).json()["email"] == "alice@example.test"
+
+    _sign_in(served, idp, "alice", email="alice@elsewhere.test", email_verified=False)
+    assert _me(served, tokens).json()["email"] == "alice@example.test"
+
+    # A verified change is still followed.
+    _sign_in(served, idp, "alice", email="alice@elsewhere.test")
+    assert _me(served, tokens).json()["email"] == "alice@elsewhere.test"
+
+
+def test_an_unverified_claim_does_not_take_an_address_from_its_owner(
+    served: Api, idp: FakeIdP
+) -> None:
+    _register_local(served)
+    mallory = _sign_in(served, idp, "mallory", email="victim@example.test", email_verified=False)
+
+    # The real person can still register with the address they were invited by.
+    victim = _register_invited(
+        served, "victim", "victim@example.test", _invite(served, "member", "victim@example.test")
+    )
+
+    assert _me(served, victim).json()["email"] == "victim@example.test"
+    assert _users(served)[mallory["client_id"]].email.endswith("@users.invalid")
 
 
 def test_a_person_without_an_email_still_provisions(served: Api, idp: FakeIdP) -> None:

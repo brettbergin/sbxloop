@@ -18,9 +18,9 @@ message, but never parses it.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 from sbxloop.agents.registry import AgentRegistry, default_registry
 from sbxloop.config import ScheduleConfig
@@ -53,6 +53,8 @@ from sbxloop.daemon.controls.results import (
     QueueOutcome,
     ReleaseOutcome,
     RepoResumeOutcome,
+    RepositoryLabelsOutcome,
+    RepositoryOutcome,
     RestartOutcome,
     ResumeOutcome,
     ReviewResumeOutcome,
@@ -64,6 +66,7 @@ from sbxloop.daemon.controls.results import (
 )
 from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
+from sbxloop.errors import GithubOpsError, ProvisionError, SbxError, WorkerError
 from sbxloop.ghids import normalize_item_id
 
 
@@ -783,6 +786,126 @@ class ControlService:
             return RepoResumeOutcome(repo=str(health.get("repo", repo)), health=dict(health))
 
         spec = self._spec("repo.resume", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def add_repository(
+        self,
+        principal: Principal,
+        *,
+        repo: str,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        source: str,
+        idempotency: tuple[str, str] | None = None,
+    ) -> RepositoryOutcome:
+        """Register a repository, live, as one recorded operation."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.add_repository(
+                    repo,
+                    kind=kind,
+                    enabled=enabled,
+                    deliver_base=deliver_base,
+                    by=principal.attribution(),
+                    source=source,
+                )
+            except ValueError as exc:
+                raise ControlError("invalid_argument", str(exc)) from exc
+            return RepositoryOutcome(verb="add", repo=name, message=message)
+
+        spec = self._spec(
+            "repo.add",
+            principal,
+            "repo",
+            repo,
+            idempotency=idempotency,
+            source=source,
+            kind=kind,
+            enabled=enabled,
+            deliver_base=deliver_base,
+        )
+        return self._record(spec, apply)
+
+    def update_repository(
+        self,
+        principal: Principal,
+        repo: str,
+        changes: Mapping[str, Any],
+        *,
+        idempotency: tuple[str, str] | None = None,
+    ) -> RepositoryOutcome:
+        """Change a registration's ``enabled`` / ``deliver_base``, live."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.update_repository(
+                    repo, changes, by=principal.attribution()
+                )
+            except KeyError as exc:
+                raise ControlError("unknown_target", _message(exc)) from exc
+            except ValueError as exc:
+                raise ControlError("invalid_argument", str(exc)) from exc
+            return RepositoryOutcome(verb="update", repo=name, message=message)
+
+        spec = self._spec(
+            "repo.update", principal, "repo", repo, idempotency=idempotency, **changes
+        )
+        return self._record(spec, apply)
+
+    def remove_repository(
+        self, principal: Principal, repo: str, *, idempotency: tuple[str, str] | None = None
+    ) -> RepositoryOutcome:
+        """Forget a registration; work already queued or running is untouched."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryOutcome:
+            try:
+                name, message = self.loop.remove_repository(repo, by=principal.attribution())
+            except KeyError as exc:
+                raise ControlError("unknown_target", _message(exc)) from exc
+            return RepositoryOutcome(verb="remove", repo=name, message=message)
+
+        spec = self._spec("repo.remove", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def sync_repo_labels(
+        self, principal: Principal, repo: str, *, idempotency: tuple[str, str] | None = None
+    ) -> RepositoryLabelsOutcome:
+        """Give a registered repository every label the loop applies, and
+        say what it carries now. A repository that is already set up is
+        read and left alone."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryLabelsOutcome:
+            try:
+                labels = self.loop.sync_repo_labels(repo, by=principal.attribution())
+            except KeyError as exc:
+                raise ControlError("unknown_target", f"{repo} is not registered here") from exc
+            except ValueError as exc:
+                raise ControlError("not_eligible", str(exc)) from exc
+            except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+                # Fail closed: the forge would not say what the repository
+                # carries — it refused, or its sandbox could not be had —
+                # so nothing is claimed about it, here or in the record.
+                raise ControlError(
+                    "source_unavailable",
+                    f"the forge would not answer for {repo}'s labels: {_message(exc)}",
+                ) from exc
+            return RepositoryLabelsOutcome(
+                repo=str(labels["repo"]),
+                state=cast(Literal["compliant", "incomplete"], labels["state"]),
+                expected=list(labels["expected"]),
+                present=list(labels["present"]),
+                created=list(labels["created"]),
+                missing=list(labels["missing"]),
+                checked_at=float(labels["checked_at"]),
+            )
+
+        spec = self._spec("repo.labels_sync", principal, "repo", repo, idempotency=idempotency)
         return self._record(spec, apply)
 
     def reset_breaker(

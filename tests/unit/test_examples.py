@@ -117,6 +117,19 @@ def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
 
 
+def test_the_label_reading_cadence_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[daemon] label_check_interval_s`."""
+    assert Config.model_validate({}).daemon.label_check_interval_s == 3600.0
+    (line,) = [
+        line
+        for line in DEFAULT_CONFIG_TOML.splitlines()
+        if line.startswith("# label_check_interval_s = ")
+    ]
+    assert tomllib.loads(line.removeprefix("# ")) == {"label_check_interval_s": 3600.0}
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    assert "| `[daemon] label_check_interval_s` | `3600.0`" in guide
+
+
 def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
     """The three places every knob lands, for `[api.oidc]`, plus the secrets
     template that carries the client secret."""
@@ -140,6 +153,13 @@ def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
     assert documented == fields
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
     assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
+
+
+def test_local_auth_policy_is_documented_with_its_compatible_default() -> None:
+    assert Config.model_validate({}).api.local_auth_enabled is True
+    assert "# local_auth_enabled = true" in DEFAULT_CONFIG_TOML
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
+    assert "`[api] local_auth_enabled`" in guide
 
 
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:

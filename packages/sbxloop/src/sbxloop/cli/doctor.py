@@ -1148,6 +1148,75 @@ def stored_schedules(config: Config) -> list[Any]:
         return []
 
 
+def stored_repositories(config: Config) -> list[Any]:
+    """The repositories registered with the daemon, from its state db —
+    read only when that file exists, so doctor never creates one; an
+    unreadable db reads as none."""
+    from sbxloop.daemon.store import DaemonStore
+
+    db = config.paths.state_db
+    if not db.is_file():
+        return []
+    try:
+        store = DaemonStore(db, readonly=True)
+        try:
+            return list(store.repositories())
+        finally:
+            store.close()
+    except Exception:  # doctor reports, never raises: an unreadable db is "none"
+        return []
+
+
+def apply_registry(config: Config, stored: Sequence[Any]) -> list[Check]:
+    """Fold the daemon's registrations over the file's entries, so every
+    repository check below sees what the daemon runs by — and name the
+    entries whose ``enabled`` / ``deliver_base`` the file still spells
+    differently, since the registration wins after the import."""
+    from sbxloop.daemon.repositories import merge
+
+    if not stored:
+        return []
+    declared = {entry.repo.casefold(): entry for entry in config.declared_repos()}
+    drift: list[str] = []
+    for row in stored:
+        entry = declared.get(row.repo.casefold())
+        if entry is None:
+            continue
+        if entry.enabled != row.enabled:
+            drift.append(
+                f"{row.repo}: enabled = {entry.enabled} in the file, {row.enabled} registered"
+            )
+        if (entry.deliver_base or None) != (row.deliver_base or None):
+            drift.append(
+                f"{row.repo}: deliver_base = {entry.deliver_base!r} in the file, "
+                f"{row.deliver_base!r} registered"
+            )
+    config.replace_repos(merge(config.declared_repos(), stored))
+    listed = "; ".join(
+        f"{row.repo} ({row.source}{', disabled' if not row.enabled else ''})" for row in stored
+    )
+    checks = [
+        Check(
+            "registered repositories",
+            True,
+            f"{listed} — in the daemon's database; `POST`/`PATCH`/`DELETE /v1/repositories` "
+            "change the registration",
+            hard=False,
+        )
+    ]
+    if drift:
+        checks.append(
+            Check(
+                "registered repositories vs sbxloop.toml",
+                False,
+                "; ".join(drift) + " — the registration wins: change it through the API, or "
+                "match the file to it",
+                hard=False,
+            )
+        )
+    return checks
+
+
 def schedule_checks(config: Config, stored: Sequence[Any]) -> list[Check]:
     """The schedules row (#761, #818): each stored schedule with its
     cadence, zone and profile — and a warning when sbxloop.toml still
@@ -1462,6 +1531,7 @@ def collect_checks(
     checks.extend(workload_profile_checks(config))
     stored = stored_schedules(config)
     checks.extend(schedule_checks(config, stored))
+    checks.extend(apply_registry(config, stored_repositories(config)))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;

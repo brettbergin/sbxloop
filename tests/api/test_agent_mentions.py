@@ -216,9 +216,36 @@ def test_a_chain_runs_to_the_default_depth_of_four_and_no_further(tmp_path: Any)
     api.ctx.close()
 
 
+class SpendingConcierge(ScriptedConcierge):
+    """Answers as scripted and, as the real concierge does, charges what
+    the turn spent to the workspace pool: here, more than the day's budget
+    in one turn."""
+
+    def __init__(self, api: Any, replies: dict[str, str], tokens: int) -> None:
+        super().__init__(replies)
+        self.api = api
+        self.tokens = tokens
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        self.api.loop.dstore.record_usage(
+            ts=self.api.clock(),
+            source="turn",
+            ref_id=kwargs.get("message_id") or "turn",
+            agent_slug=kwargs.get("agent_slug"),
+            channel_id=kwargs.get("channel_id"),
+            input_tokens=self.tokens,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        return super().submit_turn(text, **kwargs)
+
+
 def test_a_spent_token_budget_refuses_the_follow_up(tmp_path: Any) -> None:
     """The workspace budget is the last guardrail: once today's tokens are
-    spent, an agent naming another agent starts nothing."""
+    spent, an agent naming another agent starts nothing. The person's own
+    turn is what spends them here; a budget spent before the person asks
+    refuses that turn itself (``test_turn_budget``)."""
     api = build(
         tmp_path,
         config={
@@ -227,20 +254,9 @@ def test_a_spent_token_budget_refuses_the_follow_up(tmp_path: Any) -> None:
         },
     )
     with api.client:
-        api.ctx.concierge = ScriptedConcierge({"planner": "over to @critic"})
+        api.ctx.concierge = SpendingConcierge(api, {"planner": "over to @critic"}, tokens=1000)
         headers = bearer(register(api))
         channel = _channel(api, headers)
-        api.loop.dstore.record_usage(
-            ts=api.clock(),
-            source="run",
-            ref_id="spent",
-            agent_slug=None,
-            channel_id=None,
-            input_tokens=500,
-            output_tokens=500,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-        )
         _ask(api, headers, channel, "@planner plan the bake")
 
         assert len(_turns(api, headers, channel)) == 1
@@ -535,3 +551,65 @@ def test_the_new_controls_are_advertised(tmp_path: Any) -> None:
         ):
             assert feature in features
     api.ctx.close()
+
+
+def test_a_refused_mention_does_not_add_the_agent_to_the_roster(tmp_path: Any) -> None:
+    """The roster says who is in the conversation. An agent whose follow-up
+    the guardrails refused never got in, so a reply naming it in a silenced
+    channel leaves the roster as it was."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ScriptedConcierge({"planner": "over to @critic"})
+        headers = bearer(register(api))
+        channel = _channel(api, headers)
+        silenced = api.client.put(
+            f"/v1/channels/{channel}/silence",
+            json={"until": api.clock() + 300},
+            headers=headers,
+        )
+        assert silenced.status_code == 200, silenced.text
+
+        _ask(api, headers, channel, "@planner plan the bake")
+
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["silenced"]
+        listed = api.client.get(f"/v1/channels/{channel}/participants", headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert "critic" not in [p["agent_slug"] for p in listed.json()["data"]]
+    api.ctx.close()
+
+
+def test_a_roster_failure_drops_only_that_mention() -> None:
+    """Joining one named agent fails; the others named in the same reply
+    are still queued, and the one that failed is neither joined nor queued."""
+    from sbxloop.api.mentions import MentionRouter
+    from sbxloop.daemon.usagepool import Admission
+
+    joined: list[str] = []
+    queued: list[str] = []
+
+    def join(channel_id: str, slug: str) -> None:
+        if slug == "critic":
+            raise RuntimeError("roster unavailable")
+        joined.append(slug)
+
+    router = MentionRouter(
+        resolve=lambda slug: slug,
+        participants=lambda channel_id: [],
+        join=join,
+        admit=lambda channel_id, **kwargs: Admission(ok=True),
+        queue=lambda **kwargs: queued.append(str(kwargs["target_slug"])),
+    )
+
+    routed = router.route(
+        "@critic and @planner, thoughts?",
+        channel_id="ch_1",
+        source_message_id="msg_1",
+        author_slug="helper",
+        reply_to_author=None,
+        depth=1,
+    )
+
+    assert routed == ("planner",)
+    assert queued == ["planner"]
+    assert joined == ["planner"]
