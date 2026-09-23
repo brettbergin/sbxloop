@@ -8,7 +8,9 @@ import time
 from concurrent.futures import Future
 from typing import Any
 
-from sbxloop.api.channel_file_tools import read_channel_input
+import pytest
+
+from sbxloop.api.channel_file_tools import read_channel_input, search_channel_input
 from sbxloop.backup import create_backup
 from sbxloop.daemon.concierge import ConciergeReply
 
@@ -186,6 +188,7 @@ def test_turn_attaches_files_and_agent_reads_only_its_snapshot(api: Any) -> None
     assert {tool.spec.name for tool in call["channel_tools"]} >= {
         "list_channel_inputs",
         "read_channel_input",
+        "search_channel_input",
     }
     file, chunk = api.ctx.channel_files.read_for_turn(turn_id, first, offset=0, limit=100)
     assert file.id == first and chunk == content
@@ -242,3 +245,117 @@ def test_turn_attaches_files_and_agent_reads_only_its_snapshot(api: Any) -> None
         assert getattr(exc, "code", None) == "channel_not_found"
     else:
         raise AssertionError("a deleted channel kept agent file access")
+
+
+def test_search_channel_input_is_bounded_and_snapshot_scoped(api: Any) -> None:
+    class CapturingConcierge:
+        def submit_turn(self, prompt: str, **kwargs: Any) -> Future[ConciergeReply]:
+            result: Future[ConciergeReply] = Future()
+            result.set_result(ConciergeReply("I can inspect the file."))
+            return result
+
+    api.ctx.concierge = CapturingConcierge()
+    headers, channel = _owner(api)
+    boundary = 1_000_000
+    content = b"x" * (boundary - 3) + b"need" + b"le\n" + b"z" * 100
+    first = _reserve(api, headers, channel, "large.txt", len(content))
+    assert (
+        api.client.put(
+            f"/v1/channels/{channel}/files/{first}/content", headers=headers, content=content
+        ).status_code
+        == 200
+    )
+    sent = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Find the needle", "file_ids": [first], "client_turn_id": "search-1"},
+    )
+    assert sent.status_code == 202, sent.text
+    turn_id = sent.json()["turn"]["id"]
+
+    first_page = json.loads(
+        search_channel_input(
+            api.ctx, turn_id, {"file_id": first, "query": "needle", "max_bytes": boundary - 3}
+        )
+    )
+    assert first_page["matches"] == []
+    assert first_page["next_offset"] == boundary - 3
+    assert first_page["truncated"] is True
+    second_page = json.loads(
+        search_channel_input(
+            api.ctx, turn_id, {"file_id": first, "query": "needle", "offset": boundary - 3}
+        )
+    )
+    assert [match["offset"] for match in second_page["matches"]] == [boundary - 3]
+    assert "needle" in second_page["matches"][0]["excerpt"]
+    assert second_page["truncated"] is False
+
+    later = api.client.post(
+        f"/v1/channels/{channel}/files",
+        headers=headers,
+        json={"client_upload_id": "upload-later", "name": "later.txt", "size": 4},
+    ).json()["id"]
+    assert (
+        api.client.put(
+            f"/v1/channels/{channel}/files/{later}/content", headers=headers, content=b"test"
+        ).status_code
+        == 200
+    )
+    assert (
+        api.client.post(
+            f"/v1/channels/{channel}/turns",
+            headers=headers,
+            json={"content": "Another file", "file_ids": [later], "client_turn_id": "search-2"},
+        ).status_code
+        == 202
+    )
+    from sbxloop.errors import ToolRejectedError
+
+    with pytest.raises(ToolRejectedError, match="unavailable"):
+        search_channel_input(api.ctx, turn_id, {"file_id": later, "query": "test"})
+    with pytest.raises(ToolRejectedError, match="nonempty"):
+        search_channel_input(api.ctx, turn_id, {"file_id": first, "query": ""})
+    with pytest.raises(ToolRejectedError, match="too long"):
+        search_channel_input(api.ctx, turn_id, {"file_id": first, "query": "x" * 257})
+    with pytest.raises(ToolRejectedError, match="valid Unicode"):
+        search_channel_input(api.ctx, turn_id, {"file_id": first, "query": "\ud800"})
+    assert api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
+    with pytest.raises(ToolRejectedError, match="unavailable"):
+        search_channel_input(api.ctx, turn_id, {"file_id": first, "query": "needle"})
+
+
+def test_search_channel_input_limits_results_and_escapes_binary(api: Any) -> None:
+    class CapturingConcierge:
+        def submit_turn(self, prompt: str, **kwargs: Any) -> Future[ConciergeReply]:
+            result: Future[ConciergeReply] = Future()
+            result.set_result(ConciergeReply("I can inspect the file."))
+            return result
+
+    api.ctx.concierge = CapturingConcierge()
+    headers, channel = _owner(api)
+    content = b"\x00" + b"hit" * 25
+    first = _reserve(api, headers, channel, "binary.bin", len(content))
+    assert (
+        api.client.put(
+            f"/v1/channels/{channel}/files/{first}/content", headers=headers, content=content
+        ).status_code
+        == 200
+    )
+    sent = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Find hits", "file_ids": [first], "client_turn_id": "search-binary"},
+    )
+    assert sent.status_code == 202, sent.text
+    turn_id = sent.json()["turn"]["id"]
+    result = json.loads(search_channel_input(api.ctx, turn_id, {"file_id": first, "query": "hit"}))
+    assert len(result["matches"]) == 20
+    assert result["matches"][0]["offset"] == 1
+    assert result["matches"][0]["representation"] == "hex"
+    assert result["truncated"] is True
+    continuation = json.loads(
+        search_channel_input(
+            api.ctx, turn_id, {"file_id": first, "query": "hit", "offset": result["next_offset"]}
+        )
+    )
+    assert [match["offset"] for match in continuation["matches"]] == [61, 64, 67, 70, 73]
