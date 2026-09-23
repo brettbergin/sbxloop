@@ -9,12 +9,22 @@ on:
       - .github/workflows/channel-analysis-isolation.yml
       - scripts/probe_channel_analysis_isolation.py
       - docs/channel-analysis-isolation.md
+      - scripts/probe_channel_pdf_analysis.py
+      - packages/sbxloop/src/sbxloop/api/pdf_analysis.py
+      - packages/sbxloop/src/sbxloop/api/pdf_worker.py
+      - packages/sbxloop/pyproject.toml
+      - uv.lock
   push:
     branches: [main]
     paths:
       - .github/workflows/channel-analysis-isolation.yml
       - scripts/probe_channel_analysis_isolation.py
       - docs/channel-analysis-isolation.md
+      - scripts/probe_channel_pdf_analysis.py
+      - packages/sbxloop/src/sbxloop/api/pdf_analysis.py
+      - packages/sbxloop/src/sbxloop/api/pdf_worker.py
+      - packages/sbxloop/pyproject.toml
+      - uv.lock
   workflow_dispatch:
 
 permissions:
@@ -22,6 +32,8 @@ permissions:
 
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  # Match the sbx series pinned by sbxloop init and doctor.
+  SBX_ANALYSIS_TEST_VERSION: 0.43.0
   SBXLOOP_APP_NAME: sbxloop-analysis
   SBX_PROBE_NAME: analysis-isolation-${{ github.run_id }}
   XDG_STATE_HOME: /tmp/sbx-analysis-state
@@ -48,7 +60,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          url=$(gh api repos/docker/sbx-releases/releases/latest \
+          url=$(gh api "repos/docker/sbx-releases/releases/tags/v${SBX_ANALYSIS_TEST_VERSION}" \
             | python3 -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and ('amd64' in a['name'] or 'x86_64' in a['name']) and a['name'].endswith('.tar.gz')]; print(assets[0])")
           curl -fsSL -o /tmp/sbx-analysis.tar.gz "$url"
           mkdir -p /tmp/sbx-analysis-install
@@ -72,7 +84,9 @@ jobs:
           test -n "$DOCKERHUB_TOKEN"
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
           printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name "$SBXLOOP_APP_NAME" login --username "$DOCKERHUB_USERNAME" --password-stdin
-          sbx --app-name "$SBXLOOP_APP_NAME" policy init balanced
+          # This app exists only for analyzers, so deny globally as well.
+          sbx --app-name "$SBXLOOP_APP_NAME" policy init deny-all
+          sbx --app-name "$SBXLOOP_APP_NAME" policy deny network '**'
           sbx --app-name "$SBXLOOP_APP_NAME" version
 
       - name: Prove isolated parser profile
@@ -85,9 +99,10 @@ jobs:
           printf 'host-only neighbor\n' > "$root/private/neighbor.bin"
           cp scripts/probe_channel_analysis_isolation.py "$root/input/probe.py"
 
-          # Fail closed if this runner cannot demonstrate that the host has
-          # network access; a blocked sandbox probe alone would be ambiguous.
-          python3 -c 'import socket; s=socket.create_connection(("example.com", 443), timeout=5); s.close()'
+          # Fail closed if the host cannot fetch the exact content checked by
+          # the sandbox probe. A TCP handshake alone is insufficient because
+          # the transparent proxy can accept it before applying policy.
+          python3 -c 'import http.client,ssl; c=http.client.HTTPSConnection("example.com",timeout=10,context=ssl._create_unverified_context()); c.request("GET","/"); assert b"Example Domain" in c.getresponse().read(65536)'
           # Explicitly clear service credentials at creation and execution.
           # Keep the host-only sentinel set to detect unintended inheritance.
           clear_credentials=(
@@ -107,8 +122,14 @@ jobs:
           test ! -e "$root/private/host-output.bin"
           test "$(cat "$root/private/neighbor.bin")" = 'host-only neighbor'
 
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Extract PDF with production runner in a real sandbox
+        run: uv run --package sbxloop python scripts/probe_channel_pdf_analysis.py
+
       - name: Remove disposable sandbox
         if: always()
         run: |
+          sbx --app-name "$SBXLOOP_APP_NAME" policy log "$SBX_PROBE_NAME" --limit 10 || true
           sbx --app-name "$SBXLOOP_APP_NAME" rm --force "$SBX_PROBE_NAME" || true
           sbx --app-name "$SBXLOOP_APP_NAME" logout --yes || true

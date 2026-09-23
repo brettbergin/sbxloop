@@ -13,11 +13,13 @@ import pytest
 
 from sbxloop.api.channel_file_tools import (
     read_channel_input,
+    read_pdf_channel_input,
     search_channel_input,
     strings_channel_input,
 )
 from sbxloop.backup import create_backup
 from sbxloop.daemon.concierge import ConciergeReply
+from sbxloop.errors import ToolRejectedError
 
 
 def _owner(api: Any) -> tuple[dict[str, str], str]:
@@ -76,6 +78,68 @@ def test_arbitrary_bytes_round_trip_and_backup(api: Any) -> None:
 
     snapshot = create_backup(api.ctx.config.paths, label="file-input")
     assert (snapshot.path / "channel-files" / file_id).read_bytes() == original
+
+
+def test_pdf_analysis_is_saved_and_page_text_is_turn_scoped(api: Any) -> None:
+    class Concierge:
+        def submit_turn(self, prompt: str, **kwargs: Any) -> Future[ConciergeReply]:
+            result: Future[ConciergeReply] = Future()
+            result.set_result(ConciergeReply("I can read the PDF."))
+            return result
+
+    class FakeIsolatedRunner:
+        def run(self, file: Any) -> str:
+            assert file.sha256 == hashlib.sha256(b"%PDF-1.7\nfixture").hexdigest()
+            return json.dumps(
+                {
+                    "total_pages": 2,
+                    "pages": [
+                        {"page": 1, "text": "Introduction", "truncated": False, "reason": None},
+                        {
+                            "page": 2,
+                            "text": "The answer is 42.",
+                            "truncated": False,
+                            "reason": None,
+                        },
+                    ],
+                    "complete": True,
+                    "reason": None,
+                }
+            )
+
+    api.ctx.concierge = Concierge()
+    api.ctx.pdf_analysis.runner = FakeIsolatedRunner()
+    headers, channel = _owner(api)
+    original = b"%PDF-1.7\nfixture"
+    file_id = _reserve(api, headers, channel, "facts.pdf", len(original))
+    response = api.client.put(
+        f"/v1/channels/{channel}/files/{file_id}/content", headers=headers, content=original
+    )
+    assert response.status_code == 200, response.text
+    sent = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "What is on page 2?", "file_ids": [file_id], "client_turn_id": "pdf-turn"},
+    )
+    assert sent.status_code == 202, sent.text
+    deadline = time.monotonic() + 3
+    while True:
+        result = json.loads(
+            read_pdf_channel_input(
+                api.ctx, sent.json()["turn"]["id"], {"file_id": file_id, "page": 2}
+            )
+        )
+        if result["status"] == "ready" or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    assert result["status"] == "ready"
+    assert result["page"] == 2
+    assert result["text"] == "The answer is 42."
+    assert api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
+    with pytest.raises(ToolRejectedError, match="unavailable"):
+        read_pdf_channel_input(
+            api.ctx, sent.json()["turn"]["id"], {"file_id": file_id, "page": 2, "wait_seconds": 0}
+        )
 
 
 def test_upload_replay_conflict_size_and_channel_scope(api: Any) -> None:

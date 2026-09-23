@@ -431,6 +431,10 @@ class ChannelInputFileRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     uploaded_at: Mapped[float | None] = mapped_column(REAL)
     deleted_at: Mapped[float | None] = mapped_column(REAL)
+    # Only PDF text has an analyzer today. Null means generic opaque bytes.
+    analysis_status: Mapped[str | None] = mapped_column(Text)
+    analysis_json: Mapped[str | None] = mapped_column(Text)
+    analysis_version: Mapped[int | None] = mapped_column(Integer)
 
 
 class ChannelSummaryRow(Base):

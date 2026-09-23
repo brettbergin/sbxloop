@@ -297,7 +297,8 @@ class TestWiring:
         # The step's command, not the whole mapping: the static gates share one
         # job and each carries an `if:` so a failing one does not hide the rest.
         assert any(
-            step.get("run") == "uv run python scripts/check_self_references.py" for step in steps
+            step.get("run") == "uv run --no-sync python scripts/check_self_references.py"
+            for step in steps
         )
 
     def test_ci_push_filter_is_main_alone(self) -> None:
