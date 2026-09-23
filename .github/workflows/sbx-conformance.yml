@@ -9,7 +9,9 @@ name: sbx conformance (new releases)
 # that drifted from the verdicts this codebase depends on, errored, or is
 # unprobed. The version-keyed verdict cache is carried between runs with
 # actions/cache so cross-version flips ("changed from X under sbx N-1") are
-# reported too, and both the doctor output and the cache are uploaded.
+# reported too, and both the doctor output and the cache are uploaded. A
+# flip fails the first run that sees it under a new release; that run's
+# saved cache makes the new verdict the baseline for later runs.
 #
 # Requires DOCKERHUB_USERNAME / DOCKERHUB_TOKEN (for `sbx login`).
 
