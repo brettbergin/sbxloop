@@ -14,6 +14,23 @@ a run left `decomposing` by a settle step that died stayed "active" in
 now skips only the runs actually executing and closes the rest. (#1271,
 #1270)
 
+**A private channel's events reach its members only, workspace owners and
+admins included, and nobody sees another person's older events.** The event
+filter behind `/v1/events`, a run's events, the SSE stream and the
+WebSocket let a workspace owner or admin see every channel's events, so an
+admin who could not open a private channel (it answers them 404) still
+followed its turns, participants, members and runs; it now applies the same
+channel rule to everyone, and only work no channel asked for stays visible
+to owners and admins alone. A plain member also saw every event about an
+item that no channel asked for (a daemon notice or an operation on it),
+while that item's run events were hidden from them; such item events are
+now shown to owners and admins only, like the runs. And revision 0026 never
+gave the team, preference, workflow and profile events recorded before it
+their audience, so those reached every member: revision 0039 fills the
+audience from the person their data names, or the owner of the team,
+preference or workflow, and an event whose person can no longer be told
+reaches no member (a plain API client still sees everything).
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped

@@ -98,10 +98,12 @@ def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
     """SQL conditions on :class:`ApiEventRow` for what ``viewer`` may see.
 
     No member (a plain client, the daemon): everything. Anyone else sees
-    events for everyone or for them alone. A workspace owner or admin sees
-    every channel's and every run's events; a member sees the events of the
-    channels they can open, and a run's events only when a channel they can
-    open asked for the run (``channel_id`` is set when it is recorded).
+    events for everyone or for them alone, and the events of the channels
+    they can open, whatever their workspace role: a private channel's events
+    reach its members only. A run's or an item's events belong to the
+    channel that asked for the work (``channel_id`` is set when they are
+    recorded); work no channel asked for is shown to workspace owners and
+    admins only.
     """
     if viewer is None:
         return []
@@ -111,10 +113,17 @@ def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
             ApiEventRow.audience_user_id == viewer.user.id,
         )
     ]
-    if viewer.role in MANAGING_ROLES:
-        return conditions
     visible = ChannelAccess.visible_condition(viewer)
     assert visible is not None  # nosec B101 - a member always narrows
+    unscoped: ColumnElement[bool]
+    if viewer.role in MANAGING_ROLES:
+        unscoped = ApiEventRow.channel_id.is_(None)
+    else:
+        unscoped = and_(
+            ApiEventRow.channel_id.is_(None),
+            ApiEventRow.run_id.is_(None),
+            ApiEventRow.item_id.is_(None),
+        )
     conditions.append(
         or_(
             ApiEventRow.channel_id.in_(
@@ -126,7 +135,7 @@ def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
                 ApiEventRow.type == "collaboration.channel.deleted",
                 ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
             ),
-            and_(ApiEventRow.channel_id.is_(None), ApiEventRow.run_id.is_(None)),
+            unscoped,
         )
     )
     return conditions
