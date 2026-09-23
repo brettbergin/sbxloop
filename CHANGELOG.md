@@ -57,6 +57,15 @@ audience from the person their data names, or the owner of the team,
 preference or workflow, and an event whose person can no longer be told
 reaches no member (a plain API client still sees everything).
 
+**An agent in a channel reads only the files a member of that channel can
+download.** The in-turn `read_channel_artifact` tool accepted any catalogued
+file from a run the channel had started, including a code run's checkout
+(the target's source and configuration), which the channel's download
+route already refuses with 404. The tool now falls back to a run the
+channel owns only for runs that deliver files into the conversation
+(workload and tool runs); a code run's checkout is refused, and delivered
+files read as before. (#1265)
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped
