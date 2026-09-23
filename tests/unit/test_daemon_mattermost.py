@@ -1299,7 +1299,9 @@ class TestControlChannelThreads:
             )
             assert wait_for(lambda: bool(concierge.turns))
             assert concierge.turns[0][0] == "what happened there?"
-            # answered where the person is looking: in that thread
+            # answered where the person is looking: in that thread. The turn
+            # is recorded before its answer is posted, so wait for the post.
+            assert wait_for(lambda: any("hello" in p["message"] for p in client.posts))
             answer = next(p for p in client.posts if "hello" in p["message"])
             assert answer.get("root_id") == notice_id
             # and acknowledged like any other ask
