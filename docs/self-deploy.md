@@ -6,7 +6,7 @@ workflow — is [docs/deploy.md](deploy.md). This page records where sbxloop's o
 departs from that pattern and the facts about the host that operating it needs.
 
 ```
-merge to main → quiet batch → Release (test + tag + PyPI) → Deploy the daemon
+merge to main → coalesced request → Release (verify + tag + PyPI) → Deploy the daemon
                                                  ├─ check version, cooldown, and blocked releases
                                                  ├─ check the existing host with doctor
                                                  ├─ take a named pause hold (deploy-<run id>)
@@ -23,6 +23,12 @@ wait ([RELEASING.md](../RELEASING.md)). `.github/workflows/deploy.yml` carries c
 releases onto the daemon host. A task may already be in flight when a release arrives,
 which is why draining has no cap apart from the job timeout (#534): restarting anyway
 killed tasks and spent their resume budgets.
+
+Release reuses successful CI for its frozen commit, or runs the same CI workflow
+when that evidence is unavailable. Its automatic intake coalesces pending requests;
+manual release requests retain their place in the publication queue. The final
+wheels pass a clean installation and CLI smoke test before publication. Deployment
+still starts from the completed `Release` workflow and its publication receipt.
 
 Automatic deployments have a thirty-minute cooldown after a deployment finishes,
 including a verified rollback. No hold is taken during that cooldown. A reconciliation

@@ -1,16 +1,16 @@
 name: Release
+run-name: ${{ inputs.automatic && 'Automatic release' || 'Manual release' }}
 
-# Pushes wake one serialized batch: three quiet minutes, at most thirty minutes
-# from the first observation, then one frozen SHA. Redundant wakeups no-op.
+# release-wakeup.yml coalesces pushes and reconciliation into automatic requests.
+# Each batch waits three quiet minutes, at most thirty, then freezes one SHA.
 # Keep this workflow/environment identity: both PyPI Trusted Publishers use it.
 on:
-  push:
-    branches: [main]
-  # Catch up after a missed push or after finishing an older partial release.
-  # Already-published main exits without checks, tagging, or uploading.
-  schedule:
-    - cron: '13,43 * * * *'
-  workflow_dispatch: {}  # Release now: bypass the quiet window.
+  workflow_dispatch:
+    inputs:
+      automatic:
+        description: Automatic intake request (keep the quiet window)
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -20,6 +20,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   batch:
@@ -38,36 +39,69 @@ jobs:
         id: batch
         env:
           GH_TOKEN: ${{ github.token }}
-          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          MANUAL: ${{ !inputs.automatic }}
         run: python3 scripts/release_pipeline.py batch
       - name: Keep the helper with the frozen plan
-        run: cp scripts/release_pipeline.py pipeline/
+        run: cp scripts/release_pipeline.py scripts/smoke_wheels.py pipeline/
       - uses: actions/upload-artifact@v4
         with:
           name: release-plan
           path: pipeline/
           if-no-files-found: error
 
-  check:
+  evidence:
     needs: batch
     if: needs.batch.outputs.proceed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      reused: ${{ steps.evidence.outputs.reused }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ needs.batch.outputs.sha }}
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-packages
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
-      - run: uv run mypy
-      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
-      - run: uv run pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
+          name: release-plan
+          path: pipeline
+      - name: Verify CI evidence for the frozen commit
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.batch.outputs.sha }}
+        run: python3 pipeline/release_pipeline.py verification
+
+  verify:
+    needs: [batch, evidence]
+    if: needs.evidence.outputs.reused == 'false'
+    uses: ./.github/workflows/ci.yml
+    with:
+      sha: ${{ needs.batch.outputs.sha }}
+
+  check:
+    needs: [evidence, verify]
+    if: ${{ always() && needs.evidence.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require reused evidence or a successful full verification
+        env:
+          EVIDENCE_RESULT: ${{ needs.evidence.result }}
+          REUSED: ${{ needs.evidence.outputs.reused }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          test "$EVIDENCE_RESULT" = success
+          if [ "$REUSED" = true ]; then
+            test "$VERIFY_RESULT" = skipped
+          else
+            test "$REUSED" = false
+            test "$VERIFY_RESULT" = success
+          fi
 
   release:
     needs: [batch, check]
-    if: needs.batch.outputs.proceed == 'true'
+    # Reuse deliberately skips verify. Override implicit success() while
+    # still requiring the explicit verdict and honoring cancellation.
+    if: >-
+      ${{ !cancelled() && needs.batch.result == 'success' &&
+          needs.batch.outputs.proceed == 'true' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -105,7 +139,8 @@ jobs:
         id: staged
         run: python3 "${RUNNER_TEMP}/release-plan/release_pipeline.py" restore
       - uses: astral-sh/setup-uv@v5
-        if: steps.staged.outputs.reused != 'true'
+        with:
+          enable-cache: true
       - name: Build both distributions once
         if: steps.staged.outputs.reused != 'true'
         run: |
@@ -115,6 +150,8 @@ jobs:
         run: |
           unzip -l "dist/sbxloop-${VERSION}-py3-none-any.whl" \
             | grep -F "sbxloop/_vendor/sbxloop_worker-${VERSION}-py3-none-any.whl"
+      - name: Smoke the final wheels in a clean environment
+        run: python3 "${RUNNER_TEMP}/release-plan/smoke_wheels.py" dist "${VERSION}"
       - name: Stage original files before any PyPI upload
         run: python3 "${RUNNER_TEMP}/release-plan/release_pipeline.py" stage
       - name: Publish both distributions to PyPI

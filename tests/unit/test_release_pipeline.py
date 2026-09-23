@@ -64,6 +64,178 @@ def test_isolated_merge_waits_three_minutes(api):
     assert plan == {"action": "new", "version": "1.0.2", "sha": "b" * 40}
 
 
+def ci_run(run_id=1, **changes):
+    return {
+        "id": run_id,
+        "workflow_id": 42,
+        "path": ".github/workflows/ci.yml",
+        "head_sha": "b" * 40,
+        "head_branch": "main",
+        "event": "push",
+        "head_repository": {"full_name": "o/r"},
+        "status": "completed",
+        "conclusion": "success",
+        "run_attempt": 1,
+        **changes,
+    }
+
+
+def green_ci(fake):
+    fake.release_ci_runs = [ci_run()]
+    fake.release_ci_jobs[1] = [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in ("lint", "typecheck", "build", "test (3.13)", "test (3.14)", "verified")
+    ]
+
+
+def test_release_reuses_successful_ci_only_for_the_frozen_sha(api):
+    client, fake = api
+    green_ci(fake)
+    assert pipeline.verification(client, "b" * 40) == 1
+    assert pipeline.verification(client, "c" * 40) is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"event": "pull_request"},
+        {"head_branch": "feature"},
+        {"head_repository": {"full_name": "fork/r"}},
+        {"workflow_id": 99},
+        {"path": ".github/workflows/impostor.yml"},
+    ],
+)
+def test_release_rejects_ci_from_another_trust_context(api, changes):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_runs = [ci_run(**changes)]
+    assert pipeline.verification(client, "b" * 40) is None
+
+
+@pytest.mark.parametrize("result", ["failure", "timed_out", "action_required", "skipped"])
+def test_release_never_substitutes_older_green_ci_for_newer_failed_run(api, result):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_runs.append(ci_run(2, conclusion=result))
+    with pytest.raises(ValueError, match="CI"):
+        pipeline.verification(client, "b" * 40)
+
+
+def test_cancelled_and_legacy_ci_require_full_verification(api):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_runs[0]["conclusion"] = "cancelled"
+    assert pipeline.verification(client, "b" * 40) is None
+    fake.release_ci_runs[0]["conclusion"] = "success"
+    fake.release_ci_jobs[1].pop()  # Pre-verdict CI cannot supply proof.
+    assert pipeline.verification(client, "b" * 40) is None
+
+
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
+def test_successful_workflow_does_not_hide_an_unsuccessful_required_job(api, result):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_jobs[1][0]["conclusion"] = result
+    with pytest.raises(ValueError, match="lint"):
+        pipeline.verification(client, "b" * 40)
+
+
+def test_ci_evidence_is_paginated(api):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_jobs[1] = [
+        {"name": f"other-{i}", "status": "completed", "conclusion": "success"} for i in range(100)
+    ] + fake.release_ci_jobs[1]
+    assert pipeline.verification(client, "b" * 40) == 1
+
+
+def test_release_waits_for_running_ci_but_never_assumes_a_timeout_is_success(api):
+    client, fake = api
+    green_ci(fake)
+    fake.release_ci_runs[0].update(status="in_progress", conclusion=None)
+    clock = Clock()
+    with pytest.raises(TimeoutError, match="CI"):
+        pipeline.verification(client, "b" * 40, clock=clock.time, sleep=clock.sleep, timeout=30)
+    assert clock.now == 30
+
+    def finish(seconds):
+        clock.sleep(seconds)
+        fake.release_ci_runs[0].update(status="completed", conclusion="success")
+
+    assert pipeline.verification(client, "b" * 40, clock=clock.time, sleep=finish) == 1
+
+
+def test_ci_api_failure_stops_release(api):
+    client, fake = api
+    fake.release_api_error = OSError("unavailable")
+    with pytest.raises(OSError):
+        pipeline.verification(client, "b" * 40)
+
+
+@pytest.mark.parametrize("status", ["queued", "pending", "waiting", "requested"])
+def test_automatic_wakeup_coalesces_a_pending_automatic_release(api, monkeypatch, status):
+    client, fake = api
+    monkeypatch.setattr(pipeline, "command", fake.release_command)
+    fake.release_workflow_runs = [
+        ci_run(
+            path=".github/workflows/release.yml",
+            event="workflow_dispatch",
+            display_title="Automatic release",
+            status=status,
+            conclusion=None,
+        )
+    ]
+    assert not pipeline.wake_release(client)
+    assert not fake.release_commands
+
+
+@pytest.mark.parametrize(
+    "title,status",
+    [
+        ("Manual release", "pending"),
+        ("Automatic release", "in_progress"),
+        ("Automatic release", "completed"),
+    ],
+)
+def test_automatic_wakeup_preserves_manual_requests_and_can_queue_after_active_run(
+    api, monkeypatch, title, status
+):
+    client, fake = api
+    monkeypatch.setattr(pipeline, "command", fake.release_command)
+    fake.release_workflow_runs = [
+        ci_run(
+            path=".github/workflows/release.yml",
+            event="workflow_dispatch",
+            display_title=title,
+            status=status,
+        )
+    ]
+    assert pipeline.wake_release(client)
+    assert fake.release_commands == [
+        (
+            "gh",
+            "workflow",
+            "run",
+            "release.yml",
+            "--repo",
+            "o/r",
+            "--ref",
+            "main",
+            "-f",
+            "automatic=true",
+        )
+    ]
+
+
+def test_automatic_wakeup_does_not_dispatch_when_github_is_unavailable(api, monkeypatch):
+    client, fake = api
+    monkeypatch.setattr(pipeline, "command", fake.release_command)
+    fake.release_api_error = OSError("unavailable")
+    with pytest.raises(OSError):
+        pipeline.wake_release(client)
+    assert not fake.release_commands
+
+
 def test_new_merges_reset_quiet_time_and_use_latest_sha(api):
     client, fake = api
     fake.release_heads = ["b" * 40] * 5 + ["c" * 40]
@@ -273,8 +445,9 @@ def test_release_workflow_has_quiet_batch_and_noop_receipt():
     assert "release_pipeline.py batch" in text
     assert "release-result" in text
     assert "queue: max" in text
-    assert "schedule:" in text  # finish later main changes after an older reservation
-    assert "branches: [main]" in text  # isolated PRs do not wait for that schedule
+    intake = (ROOT / ".github/workflows/release-wakeup.yml").read_text()
+    assert "schedule:" in intake  # finish changes after an older reservation
+    assert "branches: [main]" in intake  # isolated pushes do not wait for the schedule
 
 
 def test_deploy_refreshes_after_drain_before_fetch_and_mutation():

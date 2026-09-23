@@ -1,7 +1,8 @@
 # Releasing
 
 Releases are **fully automated and batched**. A merge/push to `main` wakes
-`Release`, which waits for **three minutes without another observed merge**,
+the automatic intake, which dispatches `Release` unless an automatic request
+is already pending. Release waits for **three minutes without another observed merge**,
 or **thirty minutes from its first observation**, whichever comes first.
 One isolated PR waits for the short quiet window; a burst shares one patch
 version. Runner queueing and release checks add to that time.
@@ -11,8 +12,8 @@ changes left behind when a run first finishes an older partial publication.
 Already-published `main` is a no-op. Normal pushes still start their own
 short quiet window without waiting for that schedule.
 
-CI still checks every PR and push to `main`. Each release batch tests its
-own frozen commit before tagging or publishing. Both `sbxloop` and
+CI still checks every PR and push to `main`. Each release batch requires
+successful verification of its frozen commit before tagging or publishing. Both `sbxloop` and
 `sbxloop-worker` keep the same version; nothing is committed back to `main`.
 
 ## How it works
@@ -22,9 +23,15 @@ own frozen commit before tagging or publishing. Both `sbxloop` and
    A changed tip resets the quiet window, never the thirty-minute limit.
    At the deadline it freezes one SHA. Subsequent merges belong to the next
    batch. An already published tip exits before waiting or running checks.
-2. The full release suite checks that SHA: formatting, lint, typing,
-   security, and tests with coverage. The release job checks out the same
-   SHA, never a moving branch.
+2. Release looks up the latest trusted `main` push run of `ci.yml` for that
+   exact SHA. It reuses a successful run only when the required jobs and
+   the complete `verified` verdict succeeded. It waits up to fifteen minutes
+   for a running attempt; API errors, timeouts, and known failures stop the
+   release. Missing, cancelled, or older runs without the verdict invoke
+   `ci.yml` as a reusable workflow at the frozen SHA. This shares formatting,
+   lint, Markdown and self-reference checks, typing, security, both Python
+   test matrices with coverage, SDK/browser contracts, and packaging checks.
+   The release job checks out the same SHA, never a moving branch.
 3. A new batch reserves the next patch tag. An existing reservation whose
    publication is incomplete is finished first, at its original version
    and commit, even if `main` has advanced. A latest tag outside `main`'s
@@ -32,7 +39,10 @@ own frozen commit before tagging or publishing. Both `sbxloop` and
 4. `hatch-vcs` derives both versions from the tag. The host build hook
    ([`packages/sbxloop/hatch_build.py`](packages/sbxloop/hatch_build.py))
    vendors the matching worker wheel and injects the exact worker pin.
-   The workflow verifies the vendored wheel before publishing.
+   The workflow installs the final wheels into a clean temporary environment,
+   runs the CLI, checks both versions and the exact worker dependency pin,
+   and compares the vendored worker bytes with the worker distribution.
+   Publication retries smoke the original restored files too.
 5. The two wheels and two source distributions are staged on a draft
    GitHub Release. `release-manifest.json`, uploaded last, records their
    SHA-256 hashes, version, and tested commit. PyPI publication cannot
@@ -46,10 +56,24 @@ own frozen commit before tagging or publishing. Both `sbxloop` and
    event's SHA. An explicit no-op causes no upgrade.
 
 A concurrency group with `cancel-in-progress: false` serializes the whole
-release, including batching and validation. `queue: max` keeps a push from
-replacing a pending manual request. Redundant wakeups exit without another
-version when their changes have already shipped. GitHub caps the queue at
-100 pending runs.
+release, including batching and validation. `queue: max` preserves manual
+requests. The separate `release-wakeup.yml` intake serializes its observation
+and dispatch, coalescing an observed pending automatic request. It allows a
+successor to an active release because that release may have frozen an older
+commit. Automatic intake never cancels a release or replaces a manual request.
+Its own pending wakeups use `queue: single`; the eventual release reads the
+current tip when it starts. Scheduled reconciliation repairs missed events.
+GitHub caps the publication queue at 100 pending runs.
+
+Required CI check names remain `lint`, `typecheck`, `build`, `test (3.13)`
+and `test (3.14)`. The test summaries run after failed dependencies and reject
+unsuccessful shards/contracts or missing coverage files before enforcing 85%
+coverage. The additional `verified` verdict lets Release reuse that complete
+result. Five mixed shards per Python version distribute the entire collection,
+using the existing deterministic node-id partition and xdist work stealing.
+Local `make test-fast` still excludes process-bound tests. Shards retain JUnit timings and failures for fourteen days, and print
+their slowest 25 tests, so runner allocation can be benchmarked against actual
+execution times. The native Windows portability job remains advisory.
 
 ## Everyday use
 
@@ -110,8 +134,11 @@ A completed release at the selected tip is a no-op, not another publication.
 The existing PyPI Trusted Publishers for both projects use repository
 `brettbergin/sbxloop`, workflow `release.yml`, and environment `pypi`.
 Those identities are preserved; no new publication tokens are needed.
-The workflow's `GITHUB_TOKEN` needs `contents: write` to reserve tags and
-stage releases, and `id-token: write` for PyPI Trusted Publishing.
+The publication job's `GITHUB_TOKEN` needs `contents: write` to reserve tags
+and stage releases, and `id-token: write` for PyPI Trusted Publishing.
+Verification uses `actions: read` to inspect CI evidence. Only the automatic
+intake needs `actions: write` to dispatch `release.yml`; its inputs preserve
+the quiet window. A normal manual dispatch still bypasses that window.
 
 The three-minute quiet window, thirty-minute batching limit, and
 thirty-minute deployment cooldown are repository workflow policy in

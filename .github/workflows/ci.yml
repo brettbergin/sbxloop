@@ -6,10 +6,20 @@ on:
     # push filter that also matched them would run every job twice per PR.
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      sha:
+        description: Frozen release commit to verify
+        required: true
+        type: string
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Reusable release verification must never cancel ordinary main CI.
+  group: ci-${{ github.workflow }}-${{ inputs.sha || github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   # Every static gate in one runner. These were four jobs (format, mdformat,
@@ -33,20 +43,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages
-      - run: uv run ruff format --check .
+      - run: uv sync --locked --all-packages
+      - run: uv run --no-sync ruff format --check .
         if: ${{ !cancelled() }}
-      - run: uv run ruff check .
+      - run: uv run --no-sync ruff check .
         if: ${{ !cancelled() }}
-      - run: uv run mdformat --check .
+      - run: uv run --no-sync mdformat --check .
         if: ${{ !cancelled() }}
-      - run: uv run python scripts/check_self_references.py
+      - run: uv run --no-sync python scripts/check_self_references.py
         if: ${{ !cancelled() }}
-      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
+      - run: uv run --no-sync bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
         if: ${{ !cancelled() }}
 
   typecheck:
@@ -54,12 +65,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages
-      - run: uv run mypy
+      - run: uv sync --locked --all-packages
+      - run: uv run --no-sync mypy
 
   # Exercise the published optional SDK against a fake stdio process. No
   # inference credentials, model calls or real Codex runtime are involved.
@@ -73,11 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages --extra codex --python ${{ matrix.python-version }}
+      - run: uv sync --locked --all-packages --extra codex --python ${{ matrix.python-version }}
       - run: uv run --no-sync pytest -n0 tests/unit/test_codex_sdk_contract.py
 
   # Exercise the published openai client against a local server speaking
@@ -93,11 +106,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages --extra openai --python ${{ matrix.python-version }}
+      - run: uv sync --locked --all-packages --extra openai --python ${{ matrix.python-version }}
       - run: uv run --no-sync pytest -n0 tests/unit/test_openai_sdk_contract.py
 
   # Use the shipped preset to install and drive Chromium, without an agent
@@ -108,6 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
@@ -115,40 +130,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: uv sync --all-packages
-      - run: uv run pytest -n0 tests/unit/test_playwright_preset_runtime.py
+      - run: uv sync --locked --all-packages
+      - run: uv run --no-sync pytest -n0 tests/unit/test_playwright_preset_runtime.py
         env:
           SBXLOOP_TEST_PLAYWRIGHT: "1"
 
-  # The suite in five slices per interpreter: the ~5700 in-process tests over
-  # two runners, and the ~950 process-bound `slow` tests (fake sbx, real
-  # workers, real git) over three, all cut by the deterministic `--shard` from
-  # the root conftest. Each slice writes its own coverage data; `test` below
-  # combines them and holds the 85% line, so the required contexts stay
-  # `test (3.13)` / `test (3.14)` however many slices there are.
-  #
-  # Five, not three, because the shards set the run's length and neither half
-  # fits in one runner any more: measured on main, `fast` ran 220s and the two
-  # `slow` halves 185s and 251s, against a 292s run. The suite has roughly
-  # half again as many tests as when the two-way split was written (#750), and
-  # a slice cannot go below the largest single unit you refuse to cut — so
-  # cutting `fast` in two and `slow` in three lands both near 150s.
-  #
-  # `--shard` runs before pytest's own `-m` filter (root conftest, tryfirst),
-  # so it slices the whole collection and each `-m` selection then falls out
-  # of the slice. Verified to partition exactly: the fast shards sum to 5717
-  # at every width tried.
-  #
-  # Ten pytest jobs put the workflow's peak at 18 concurrent (`test` needs
-  # `pytest`, so its two run after everything else has finished), against a
-  # per-account cap of 20 on the Free plan. If jobs start queuing rather than
-  # all starting at once, that is the cap, not the runners — drop `fast` back
-  # to one slice before touching anything else.
-  #
-  # A slice takes about three minutes. The timeout is for a wedged test: the
-  # suite's own per-test limit (`timeout` in pyproject.toml) should fail it
-  # first, with a stack; this catches whatever that cannot, well short of
-  # GitHub's six-hour default.
+  # Five mixed shards per interpreter share the entire test workload. The
+  # former two-fast/three-slow split left fast runners on the critical path
+  # after the process-bound jobs finished. Keep ten test runners in total;
+  # CRC32(nodeid) partitions every test once and xdist worksteal balances each
+  # runner. JUnit artifacts and --durations retain evidence for comparisons.
+  # Required contexts remain test (3.13) / test (3.14), independent of layout.
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -156,35 +148,32 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
-        slice: [fast-1, fast-2, slow-1, slow-2, slow-3]
-        include:
-          - slice: fast-1
-            select: -m "not slow" --shard 1/2
-          - slice: fast-2
-            select: -m "not slow" --shard 2/2
-          - slice: slow-1
-            select: -m slow --shard 1/3
-          - slice: slow-2
-            select: -m slow --shard 2/3
-          - slice: slow-3
-            select: -m slow --shard 3/3
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages --python ${{ matrix.python-version }}
-      - run: uv run --python ${{ matrix.python-version }} pytest ${{ matrix.select }} --cov=sbxloop --cov=sbxloop_worker --cov-report=
+      - run: uv sync --locked --all-packages --python ${{ matrix.python-version }}
+      - run: uv run --no-sync --python ${{ matrix.python-version }} pytest --shard ${{ matrix.shard }}/5 --cov=sbxloop --cov=sbxloop_worker --cov-report= --durations=25 --junitxml=reports/junit-${{ matrix.python-version }}-${{ matrix.shard }}.xml
         env:
-          COVERAGE_FILE: .coverage.${{ matrix.slice }}
+          COVERAGE_FILE: .coverage.${{ matrix.shard }}
       - uses: actions/upload-artifact@v4
         with:
-          name: coverage-${{ matrix.python-version }}-${{ matrix.slice }}
-          path: .coverage.${{ matrix.slice }}
+          name: coverage-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: .coverage.${{ matrix.shard }}
           include-hidden-files: true
           if-no-files-found: error
+      - name: Keep test timings and failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: reports/
+          retention-days: 14
 
   # The host-portability rows a Linux runner cannot settle: where a real venv
   # puts its entry points, what `chmod` does to a file on Windows, and which
@@ -210,38 +199,78 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages --python 3.13
-      - run: uv run --python 3.13 pytest -m windows_host
+      - run: uv sync --locked --all-packages --python 3.13
+      - run: uv run --no-sync --python 3.13 pytest -m windows_host
 
   test:
-    needs: pytest
+    needs: [pytest, codex-sdk, openai-sdk, playwright-preset]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Check out verdict helpers from the trusted workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-tools
+          sparse-checkout: scripts/ci_checks.py
+          sparse-checkout-cone-mode: false
+      - name: Require successful test and contract jobs
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .ci-tools/scripts/ci_checks.py dependencies pytest codex-sdk openai-sdk playwright-preset
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-packages --python ${{ matrix.python-version }}
+      - run: uv sync --locked --all-packages --python ${{ matrix.python-version }}
       - uses: actions/download-artifact@v4
         with:
           pattern: coverage-${{ matrix.python-version }}-*
           merge-multiple: true
-      - run: uv run --python ${{ matrix.python-version }} coverage combine .coverage.*
-      - run: uv run --python ${{ matrix.python-version }} coverage report --show-missing --fail-under=85
+      - name: Require every coverage slice
+        run: python3 .ci-tools/scripts/ci_checks.py coverage 1 2 3 4 5
+      - run: uv run --no-sync --python ${{ matrix.python-version }} coverage combine .coverage.*
+      - run: uv run --no-sync --python ${{ matrix.python-version }} coverage report --show-missing --fail-under=85
+
+  # Release only reuses a run carrying this complete, fail-closed verdict.
+  verified:
+    needs: [lint, typecheck, test, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Check out verdict helpers from the trusted workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-tools
+          sparse-checkout: scripts/ci_checks.py
+          sparse-checkout-cone-mode: false
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .ci-tools/scripts/ci_checks.py dependencies lint typecheck test build
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
         with:

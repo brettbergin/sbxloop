@@ -62,10 +62,12 @@ class Github:
     def get(self, path: str) -> Any:
         return self.request(f"repos/{self.repo}/{path}")
 
-    def pages(self, path: str) -> list[dict]:
+    def pages(self, path: str, field: str = "") -> list[dict]:
         result = []
         for page in range(1, 1001):
-            items = self.get(f"{path}?per_page=100&page={page}")
+            separator = "&" if "?" in path else "?"
+            payload = self.get(f"{path}{separator}per_page=100&page={page}")
+            items = payload[field] if field else payload
             if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
                 raise ValueError(f"invalid {path} response")
             result.extend(items)
@@ -194,6 +196,103 @@ def batch(api: Github, *, manual: bool, clock=time.monotonic, sleep=time.sleep) 
     plan = release_plan(api, sha)
     print(f"Frozen release batch: {plan['action']} {plan['version']} at {plan['sha']}", flush=True)
     return plan
+
+
+def wake_release(api: Github) -> bool:
+    """Keep one observed pending automatic request; manual requests are untouched.
+
+    The intake workflow serializes this read/dispatch pair. A running release
+    may have frozen an older commit, so it is allowed one pending successor.
+    """
+    for status in ("queued", "pending", "waiting", "requested"):
+        runs = api.pages(
+            f"actions/workflows/release.yml/runs?event=workflow_dispatch&branch=main&status={status}",
+            "workflow_runs",
+        )
+        if any(
+            run.get("path") == ".github/workflows/release.yml"
+            and run.get("event") == "workflow_dispatch"
+            and run.get("head_branch") == "main"
+            and run.get("head_repository", {}).get("full_name") == api.repo
+            and run.get("display_title") == "Automatic release"
+            and run.get("status") == status
+            for run in runs
+        ):
+            print("An automatic release is already pending; it will select current main.")
+            return False
+    command(
+        "gh",
+        "workflow",
+        "run",
+        "release.yml",
+        "--repo",
+        api.repo,
+        "--ref",
+        "main",
+        "-f",
+        "automatic=true",
+    )
+    print("Queued an automatic release.")
+    return True
+
+
+def verification(
+    api: Github, sha: str, *, clock=time.monotonic, sleep=time.sleep, timeout: int = 900
+) -> int | None:
+    """Reuse the latest trusted main CI attempt, or request the shared CI fallback.
+
+    A known failure stops publication. Missing, cancelled, or pre-verdict CI
+    requires the full fallback. Running CI gets a bounded chance to finish;
+    an API error or timeout never becomes permission to publish.
+    """
+    commit_sha(sha)
+    workflow = api.get("actions/workflows/ci.yml")
+    if workflow["path"] != ".github/workflows/ci.yml":
+        raise ValueError("unexpected CI workflow identity")
+    start = clock()
+    while True:
+        runs = api.pages(
+            f"actions/workflows/ci.yml/runs?event=push&branch=main&head_sha={sha}",
+            "workflow_runs",
+        )
+        trusted = [
+            run
+            for run in runs
+            if run.get("workflow_id") == workflow["id"]
+            and run.get("path") == workflow["path"]
+            and run.get("head_sha") == sha
+            and run.get("head_branch") == "main"
+            and run.get("event") == "push"
+            and run.get("head_repository", {}).get("full_name") == api.repo
+        ]
+        if not trusted:
+            return None
+        run = dict(max(trusted, key=lambda item: item["id"]))
+        if run["status"] == "completed":
+            if run["conclusion"] == "cancelled":
+                return None
+            if run["conclusion"] != "success":
+                raise ValueError(f"CI run {run['id']} concluded {run['conclusion']}")
+            jobs = api.pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+            # Older reservations may predate the fail-closed aggregate.
+            if not any(job.get("name") == "verified" for job in jobs):
+                return None
+            for name in ("lint", "typecheck", "build", "test (3.13)", "test (3.14)", "verified"):
+                matches = [job for job in jobs if job.get("name") == name]
+                if len(matches) != 1 or any(
+                    job.get("status") != "completed" or job.get("conclusion") != "success"
+                    for job in matches
+                ):
+                    raise ValueError(f"CI run {run['id']} has no successful unambiguous {name}")
+            current = api.get(f"actions/runs/{run['id']}")
+            if all(current[key] == run[key] for key in ("run_attempt", "status", "conclusion")):
+                return int(run["id"])
+        elif run["status"] not in {"queued", "in_progress", "pending", "waiting", "requested"}:
+            raise ValueError(f"Unknown CI state: {run['status']}")
+        if clock() - start >= timeout:
+            raise TimeoutError(f"CI for {sha} did not finish within {timeout}s")
+        print(f"Waiting for CI run {run['id']} at {sha}", flush=True)
+        sleep(min(15, timeout - (clock() - start)))
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -384,6 +483,19 @@ def main() -> None:
         return
     api = Github(os.environ["GITHUB_REPOSITORY"])
     manual = os.environ.get("MANUAL") == "true"
+    if mode == "wake-release":
+        wake_release(api)
+        return
+    if mode == "verification":
+        sha = commit_sha(os.environ["RELEASE_SHA"])
+        run_id = verification(api, sha)
+        output(reused=run_id is not None, run_id=run_id or "")
+        message = f"Reuse CI run {run_id} for {sha}" if run_id else f"Run shared CI for {sha}"
+        print(message)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
+                stream.write(message + "\n")
+        return
     if mode == "batch":
         plan = batch(api, manual=manual)
         write_json(Path("pipeline/plan.json"), plan)
