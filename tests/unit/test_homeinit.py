@@ -569,6 +569,18 @@ class TestTemplates:
         daemon_unit = render_unit("sbxloop-daemon.service", home)
         assert "SuccessExitStatus=143" in daemon_unit and "Restart=always" in daemon_unit
 
+    def test_sandboxd_is_supervised_through_its_pid_file(self, tmp_path: Path) -> None:
+        """#2305: sbx 0.45.1's `daemon start` detaches even without -d, so a
+        Type=simple unit saw its main process exit at once, restarted, and
+        left the real daemon orphaned holding containerd's lock. The unit
+        detaches on purpose and follows the pid file sandboxd writes."""
+        unit = render_unit("sbx-sandboxd.service", SbxloopHome(tmp_path / "h"))
+        assert values_of(unit, "Type") == ["forking"]
+        assert parse_words(values_of(unit, "ExecStart")[0])[1:] == ["daemon", "start", "-d"]
+        # sbx keeps its state under $XDG_STATE_HOME (%S in a user unit), app "sandboxes"
+        assert values_of(unit, "PIDFile") == ["%S/sandboxes/sandboxes/sandboxd/sandboxd.pid"]
+        assert values_of(unit, "Restart") == ["always"]
+
     def test_launchers_bind_to_their_own_home(self) -> None:
         for name in ("sbxloop.launcher.sh", "sbx.launcher.sh"):
             text = template(name)
@@ -729,6 +741,7 @@ class TestUnitPaths:
             f"{root}/bin/sbx",
             "daemon",
             "start",
+            "-d",
         ]
         assert parse_words(values_of(sandboxd, "ExecStop")[0]) == [
             f"{root}/bin/sbx",

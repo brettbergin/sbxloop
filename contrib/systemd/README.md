@@ -120,7 +120,10 @@ rewrites the rendered copies.
 `sbx` wrapper. Without it `sbx daemon start` is a bare process: if it dies
 nothing restarts it, and every run fails with no systemd trace. The daemon
 unit `Requires=` it, so a manual `systemctl --user start sbxloop-daemon`
-brings the backend up first.
+brings the backend up first. The unit starts sandboxd detached (`-d`,
+`Type=forking`) and follows the pid file it writes under sbx's state directory
+(`$XDG_STATE_HOME/sandboxes/sandboxes/sandboxd/sandboxd.pid`, `~/.local/state`
+by default), since newer sbx releases detach whether asked to or not.
 
 `github-runner.service` is **only needed for the automated upgrade above**.
 It runs a GitHub Actions runner as the *same user*, which is what lets a
