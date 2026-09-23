@@ -88,6 +88,18 @@ class TestWorkflowCredentials:
             assert env["GH_TOKEN"] == "${{ github.token }}", name
 
 
+def test_pdf_analyzer_identity_is_provisioned_before_deploy_hold(deploy: str) -> None:
+    step = _step(deploy, "Prepare isolated PDF analyzer")
+    assert 'ANALYSIS_SBX="${SBXLOOP_HOME}/bin/sbx"' in step
+    assert "--app-name sbxloop-analysis login" in step
+    assert "--password-stdin" in step
+    assert "--app-name sbxloop-analysis policy init deny-all" in step
+    assert "--app-name sbxloop-analysis policy deny network '**'" in step
+    assert deploy.index("name: Prepare isolated PDF analyzer") < deploy.index(
+        "name: Take the deploy hold"
+    )
+
+
 @pytest.mark.parametrize("fixture", ["deploy", "example"])
 class TestAuthenticationOutage:
     def test_preflight_precedes_any_hold_or_upgrade(

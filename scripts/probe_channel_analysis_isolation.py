@@ -6,8 +6,9 @@ must remain invisible. This deliberately uses only Python's standard library.
 
 from __future__ import annotations
 
+import http.client
 import os
-import socket
+import ssl
 import sys
 from hashlib import sha256
 from pathlib import Path
@@ -55,10 +56,16 @@ def main() -> None:
     else:
         _fail("analyzer wrote into the read-only input mount")
 
+    # A transparent proxy may accept the TCP handshake before evaluating a
+    # policy rule. Require real upstream response content to prove egress.
     try:
-        with socket.create_connection(("example.com", 443), timeout=5):
-            _fail("analyzer reached an external TCP endpoint")
-    except OSError:
+        connection = http.client.HTTPSConnection(
+            "example.com", timeout=10, context=ssl._create_unverified_context()
+        )
+        connection.request("GET", "/")
+        if b"Example Domain" in connection.getresponse().read(65_536):
+            _fail("analyzer received content from an external HTTPS endpoint")
+    except (OSError, http.client.HTTPException):
         pass
 
     # A parser may write only to its disposable VM filesystem; this path is

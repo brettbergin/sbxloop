@@ -80,6 +80,11 @@ health; reports and history use that final version.
   `#sbxloop-deploys`; the trusted workflow helper selects that channel through the installed
   notifier's original API, so routing also works before an upgrade or after a rollback. The
   daemon's normal control traffic remains in `#sbxloop`.
+- **PDF analyzer identity.** Before a changed release takes the deploy hold, the job
+  signs in to Docker under the separate `sbxloop-analysis` app with repository
+  Docker Hub secrets and initializes a deny-all policy once. The PDF worker runs with no
+  agent skills, credentials or network access. A missing Docker Hub secret fails
+  the deployment before the installed daemon is changed.
 
 ## The host
 
