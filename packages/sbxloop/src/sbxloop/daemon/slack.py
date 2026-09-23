@@ -225,14 +225,15 @@ class SlackBridge(ChatBridge):
         return self._user_id
 
     def _handle_event(self, event: dict[str, Any]) -> None:
-        """Every Events API event lands here (client thread); only a human's
-        ``message`` in the control channel goes on to routing, after the
-        author's handle is known."""
+        """Every Events API event lands here (client thread); only a
+        ``message`` in the control channel or a linked one (a thread reply
+        by the channel it lives in) goes on to routing, after the author's
+        handle is known."""
         if event.get("type") != "message":
             return
         if str(event.get("subtype") or "") not in _ROUTABLE_SUBTYPES:
             return
-        if str(event.get("channel") or "") != (self.slack.channel_id or ""):
+        if not self._hears_channel(str(event.get("channel") or "")):
             return
         self._schedule(self._route_event(event))
 
