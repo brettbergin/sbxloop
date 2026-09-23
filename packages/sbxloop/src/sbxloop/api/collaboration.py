@@ -40,6 +40,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
     AgentMemoryRow,
+    ChannelInputFileRow,
     ChannelLinkRow,
     ChannelMemberRow,
     ChannelParticipantRow,
@@ -211,6 +212,16 @@ class ArtifactRef:
 
 
 @dataclass(frozen=True, slots=True)
+class InputFileRef:
+    """An immutable original a person committed to a channel message."""
+
+    id: str
+    name: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelSummary:
     """What a channel said up to ``through_sequence``, in a few sentences."""
 
@@ -268,6 +279,7 @@ class Message:
     reactions: tuple[str, ...] = ()
     author: Author = SYSTEM_AUTHOR
     artifacts: tuple[ArtifactRef, ...] = ()
+    input_files: tuple[InputFileRef, ...] = ()
     origin: dict[str, Any] | None = None
     #: What an ``agent_update`` a run posted is; None for every other message.
     post_kind: PostKind | None = None
@@ -839,6 +851,7 @@ def _history_line(
     row: Any,
     files: tuple[ArtifactRef, ...],
     directory: _Directory = _NO_DIRECTORY,
+    input_files: tuple[InputFileRef, ...] = (),
 ) -> str:
     """One message as a turn's history carries it.
 
@@ -870,6 +883,11 @@ def _history_line(
             {"id": ref.id, "name": ref.relpath, "media_type": ref.media_type, "size": ref.size}
             for ref in files
         ]
+    if input_files:
+        line["input_files"] = [
+            {"id": ref.id, "name": ref.name, "size": ref.size, "sha256": ref.sha256}
+            for ref in input_files
+        ]
     return json.dumps(line, ensure_ascii=False)
 
 
@@ -889,11 +907,33 @@ def _attachments(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[Ar
     return {key: tuple(value) for key, value in found.items()}
 
 
+def _input_files(session: Any, message_ids: Sequence[str]) -> dict[str, tuple[InputFileRef, ...]]:
+    found: dict[str, list[InputFileRef]] = {}
+    if not message_ids:
+        return {}
+    rows = session.scalars(
+        select(ChannelInputFileRow)
+        .where(
+            ChannelInputFileRow.message_id.in_(list(message_ids)),
+            ChannelInputFileRow.status == "attached",
+        )
+        .order_by(ChannelInputFileRow.position.asc())
+    )
+    for row in rows:
+        if row.size is None or row.sha256 is None:
+            continue
+        found.setdefault(str(row.message_id), []).append(
+            InputFileRef(str(row.id), str(row.display_name), int(row.size), str(row.sha256))
+        )
+    return {key: tuple(value) for key, value in found.items()}
+
+
 def _message(
     session: Any,
     row: MessageRow,
     attachments: Mapping[str, tuple[ArtifactRef, ...]] | None = None,
     directory: _Directory = _NO_DIRECTORY,
+    input_files: Mapping[str, tuple[InputFileRef, ...]] | None = None,
 ) -> Message:
     agent_slug = None if row.agent_slug is None else str(row.agent_slug)
     work = json.loads(row.work_json) if row.work_json else None
@@ -935,6 +975,11 @@ def _message(
             _attachments(session, [str(row.id)]).get(str(row.id), ())
             if attachments is None
             else attachments.get(str(row.id), ())
+        ),
+        input_files=(
+            _input_files(session, [str(row.id)]).get(str(row.id), ())
+            if input_files is None
+            else input_files.get(str(row.id), ())
         ),
         origin=origin,
         # A kind this build does not know (a later build's) reads as none:
@@ -3206,8 +3251,9 @@ class CollaborationStore:
                 )
             )
             attachments = _attachments(session, [str(row.id) for row in rows])
+            input_files = _input_files(session, [str(row.id) for row in rows])
             known = _directory(session, rows)
-            return [_message(session, row, attachments, known) for row in rows]
+            return [_message(session, row, attachments, known, input_files) for row in rows]
 
     def accept_turn(
         self,
@@ -3223,6 +3269,7 @@ class CollaborationStore:
         intent: str = "conversation",
         participants: tuple[str, ...] = (),
         assignees: dict[str, str] | None = None,
+        file_ids: tuple[str, ...] = (),
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
@@ -3233,6 +3280,10 @@ class CollaborationStore:
         the run roles those mentions declare on a turn that may start managed
         work; they ride the first participant slot, where admission reads them.
         """
+        if not content.strip() and not file_ids:
+            raise CollaborationError("empty_turn", "a turn needs text or at least one file")
+        if len(file_ids) > 16 or len(set(file_ids)) != len(file_ids):
+            raise CollaborationError("invalid_file_ids", "a turn accepts up to 16 distinct files")
         with self.dstore.immediate_transaction() as session:
             channel, _ = _access(session, channel_id, user_id, "post", now=now)
             if client_turn_id:
@@ -3250,6 +3301,13 @@ class CollaborationStore:
                         or tuple(json.loads(existing.targets_json)) != targets
                         or existing.intent != intent
                         or message.client_message_id != client_message_id
+                        or tuple(
+                            ref.id
+                            for ref in _input_files(session, [str(message.id)]).get(
+                                str(message.id), ()
+                            )
+                        )
+                        != file_ids
                     ):
                         raise CollaborationError(
                             "idempotency_conflict",
@@ -3306,6 +3364,21 @@ class CollaborationStore:
                     chain_depth=0,
                 )
             )
+            for position, file_id in enumerate(file_ids):
+                file = session.get(ChannelInputFileRow, file_id)
+                if (
+                    file is None
+                    or file.channel_id != channel_id
+                    or file.uploader_id != user_id
+                    or file.status != "uploaded"
+                    or file.message_id is not None
+                    or file.size is None
+                    or file.sha256 is None
+                ):
+                    raise CollaborationError("input_file_not_found", "uploaded file not found")
+                file.message_id = message_id
+                file.position = position
+                file.status = "attached"
             for slug in dict.fromkeys(participants):
                 if session.get(ChannelParticipantRow, (channel_id, slug)) is None:
                     session.add(
@@ -3772,11 +3845,18 @@ class CollaborationStore:
                 )
             )
             carried = _attachments(session, [str(message.id) for message in newest])
+            input_files = _input_files(session, [str(message.id) for message in newest])
             known = _directory(session, newest)
             kept: list[int] = []
             held = 0
             for message in newest:
-                line = _history_line(session, message, carried.get(str(message.id), ()), known)
+                line = _history_line(
+                    session,
+                    message,
+                    carried.get(str(message.id), ()),
+                    known,
+                    input_files.get(str(message.id), ()),
+                )
                 held += len(line) + 1
                 if kept and held > max_chars:
                     break
@@ -4256,11 +4336,18 @@ class CollaborationStore:
             dropped = len(rows) > HISTORY_MESSAGES
             rows = rows[:HISTORY_MESSAGES]
             attachments = _attachments(session, [str(row.id) for row in rows])
+            input_files = _input_files(session, [str(row.id) for row in rows])
             known = _directory(session, rows)
             chunks: list[str] = []
             remaining = max_chars
             for row in rows:
-                chunk = _history_line(session, row, attachments.get(str(row.id), ()), known)
+                chunk = _history_line(
+                    session,
+                    row,
+                    attachments.get(str(row.id), ()),
+                    known,
+                    input_files.get(str(row.id), ()),
+                )
                 if len(chunk) > remaining:
                     dropped = True
                     break
