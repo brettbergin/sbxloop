@@ -9,13 +9,19 @@ StartLimitIntervalSec=600
 StartLimitBurst=5
 
 [Service]
-Type=simple
-# `sbx daemon start` stays in the foreground (-d/--detach is what backgrounds
-# it), so Type=simple is right. Through the home's wrapper, which puts
-# /usr/sbin on PATH: sandboxd's "block" volume driver shells out to mkfs.ext4,
-# and without it the only symptom is "unknown volume driver: block".
+Type=forking
+# `sbx daemon start` detaches (sbx 0.45 does so even without -d), so the unit
+# asks for it and follows the pid file sandboxd writes under sbx's state
+# directory ($XDG_STATE_HOME, %S here; app "sandboxes"). Under Type=simple the
+# early exit read as a crash and each restart orphaned another daemon holding
+# containerd's lock. Whatever `sbx daemon stop` leaves behind, systemd still
+# signals the unit's cgroup and removes a stale pid file. Through the home's
+# wrapper, which puts /usr/sbin on PATH: sandboxd's "block" volume driver
+# shells out to mkfs.ext4, and without it the only symptom is "unknown volume
+# driver: block".
 Environment=SBXLOOP_HOME=@HOME@
-ExecStart=@HOME@/bin/sbx daemon start
+ExecStart=@HOME@/bin/sbx daemon start -d
+PIDFile=%S/sandboxes/sandboxes/sandboxd/sandboxd.pid
 ExecStop=@HOME@/bin/sbx daemon stop
 Restart=always
 RestartSec=10

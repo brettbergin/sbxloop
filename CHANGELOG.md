@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+**The sandbox backend stays up under systemd on sbx 0.45.** From sbx 0.45.1
+(field-verified) `sbx daemon start` detaches even without `-d`, so the
+`Type=simple` unit `sbxloop init --systemd` rendered saw its main process exit
+at once, read it as a crash and restarted, while the detached daemon lived on
+holding containerd's database lock: every later start failed, and
+`StartLimitBurst` left `sbx-sandboxd` (and `sbxloop-daemon`, which requires
+it) failed within a minute. The unit now starts sandboxd with `-d` as
+`Type=forking` and supervises it through the pid file sandboxd writes under
+sbx's state directory; systemd also clears whatever `sbx daemon stop` leaves
+running and removes a stale pid file. Re-run `sbxloop init --systemd` to pick
+it up, and drop any local override written as a stopgap.
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped
