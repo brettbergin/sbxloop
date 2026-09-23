@@ -81,6 +81,13 @@ class Github:
     def releases(self) -> dict[str, dict]:
         return {item["tag_name"]: item for item in self.pages("releases")}
 
+    def with_assets(self, item: dict) -> dict:
+        """Read assets from their own endpoint; release summaries can omit them."""
+        release_id = item.get("id")
+        if type(release_id) is not int:
+            return item
+        return {**item, "assets": self.pages(f"releases/{release_id}/assets")}
+
     def latest(self, pinned: str = "") -> dict:
         releases = self.releases()
         if pinned:
@@ -98,6 +105,7 @@ class Github:
             if not candidates:
                 raise ValueError("no published stable release")
             selected = max(candidates, key=lambda item: version_key(item["tag_name"][1:]))
+        selected = self.with_assets(selected)
         validate_release(selected)
         tag = selected["tag_name"]
         matching = [entry for entry in self.pages("tags") if entry.get("name") == tag]
@@ -161,7 +169,7 @@ def release_plan(api: Github, sha: str) -> dict:
     released = api.releases().get(latest["name"])
     if released is None or released.get("draft") is True:
         return {"action": "resume", "version": version, "sha": reserved_sha}
-    validate_release(released)
+    validate_release(api.with_assets(released))
     if sha == reserved_sha:
         return {"action": "noop", "version": version, "sha": sha}
     major, minor, patch = version_key(version)
@@ -334,6 +342,7 @@ def restore_staged(api: Github, plan: dict, dist: Path) -> bool:
     item = api.releases().get(f"v{plan['version']}")
     if item is None:
         return False
+    item = api.with_assets(item)
     if item.get("draft") is not True:
         raise ValueError("reserved release was already published; start a new batch check")
     if not any(asset["name"] == MANIFEST for asset in item.get("assets", [])):
@@ -348,6 +357,8 @@ def restore_staged(api: Github, plan: dict, dist: Path) -> bool:
 def stage(api: Github, plan: dict, dist: Path) -> None:
     version = plan["version"]
     item = api.releases().get(f"v{version}")
+    if item is not None:
+        item = api.with_assets(item)
     if item and item.get("draft") is not True:
         raise ValueError("refusing to replace published release assets")
     if item and any(asset["name"] == MANIFEST for asset in item.get("assets", [])):
