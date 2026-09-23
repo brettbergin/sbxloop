@@ -934,6 +934,13 @@ came in over a bridge is mirrored under `**name (via slack)**`, and a
 guest's under `**name (guest, via slack)**`: a guest's name is their own
 claim, not a member's.
 
+A link works both ways on every service. Slack and Mattermost deliver
+everything said in each channel the bot has been added to, and the bridge
+hears only two kinds of channel: the control channel, and a channel with an
+active link (a thread reply counts as the channel it lives in). Anywhere
+else stays silent. A link made or retired takes effect with the next
+message; the bot still has to be a member of the linked channel to hear it.
+
 A message that arrived over a bridge carries `origin`:
 
 ```json

@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -84,6 +85,10 @@ HISTORY_MESSAGES = 200
 HISTORY_CHARS = 60_000
 #: How long a bridge identity link code is worth typing.
 LINK_CODE_TTL_S = 600.0
+#: How long a bridge may go on answering "which surfaces are linked" from
+#: memory. A link made or retired through this store refreshes the answer at
+#: once; this bounds how stale it can be after a write that bypassed it.
+LINKED_SURFACES_TTL_S = 30.0
 
 
 #: Starts the ledger key of a run post whose own key another run or channel
@@ -1122,6 +1127,13 @@ class CollaborationStore:
         #: Outstanding bridge identity link codes: code -> (user, expiry).
         self._link_codes: dict[str, tuple[str, float]] = {}
         self._link_code_lock = threading.Lock()
+        #: backend -> (surface ids with an active link, monotonic read time).
+        #: A bridge asks on every inbound frame, so this is what keeps that
+        #: question off the database; a link write drops it.
+        self._linked_surfaces: dict[str, tuple[frozenset[str], float]] = {}
+        self._linked_surfaces_lock = threading.Lock()
+        #: Bumped by every link write, so a read that raced one is not cached.
+        self._links_generation = 0
 
     # -- local profile -------------------------------------------------------------
 
@@ -2830,7 +2842,9 @@ class CollaborationStore:
             )
             row = session.get(ChannelLinkRow, link_id)
             assert row is not None  # nosec B101 - just inserted
-            return _channel_link(row)
+            link = _channel_link(row)
+        self._forget_linked_surfaces()
+        return link
 
     def delete_channel_link(
         self, viewer: Viewer, channel_id: str, link_id: str, now: float
@@ -2849,6 +2863,7 @@ class CollaborationStore:
                 now,
                 data={"channel_id": channel_id, "link_id": link_id, "backend": str(row.backend)},
             )
+        self._forget_linked_surfaces()
 
     def link_for_surface(
         self, backend: str, surface_id: str, thread_id: str | None = None
@@ -2857,6 +2872,41 @@ class CollaborationStore:
         with self.dstore.read() as session:
             row = _active_link(session, backend, surface_id, thread_id)
             return None if row is None else _channel_link(row)
+
+    def linked_surfaces(self, backend: str) -> frozenset[str]:
+        """The surfaces (service channel ids) with an active link on
+        ``backend``, a thread link counted under the channel it lives in.
+
+        A bridge asks this for every inbound message to decide whether a
+        channel other than its control one is worth hearing at all, so it
+        is answered from memory: refreshed when a link is made or retired
+        here, and at most ``LINKED_SURFACES_TTL_S`` old otherwise. It only
+        admits; ``link_for_surface`` still decides where a message goes.
+        """
+        clock = time.monotonic()
+        with self._linked_surfaces_lock:
+            cached = self._linked_surfaces.get(backend)
+            if cached is not None and clock - cached[1] < LINKED_SURFACES_TTL_S:
+                return cached[0]
+            generation = self._links_generation
+        with self.dstore.read() as session:
+            surfaces = frozenset(
+                str(surface)
+                for surface in session.scalars(
+                    select(ChannelLinkRow.surface_id)
+                    .where(ChannelLinkRow.backend == backend, ChannelLinkRow.active == 1)
+                    .distinct()
+                )
+            )
+        with self._linked_surfaces_lock:
+            if generation == self._links_generation:
+                self._linked_surfaces[backend] = (surfaces, clock)
+        return surfaces
+
+    def _forget_linked_surfaces(self) -> None:
+        with self._linked_surfaces_lock:
+            self._links_generation += 1
+            self._linked_surfaces.clear()
 
     def create_link_code(self, user_id: str, now: float) -> tuple[str, float]:
         """A short code the person types on a bridge to prove who they are.

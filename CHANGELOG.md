@@ -78,6 +78,19 @@ suppresses the post: it is stored under a key scoped to its run and channel,
 and a replay of it finds that post. No caller does either today; this is
 defence in depth. (#1262)
 
+**A Slack or Mattermost channel linked to a collaboration channel is heard,
+not only posted to.** Both bridges dropped every inbound message that did
+not arrive in the control channel, so a link on any other channel was
+outbound-only: sbxloop posted there and replies went nowhere, with nothing
+logged. A message on a linked channel, or in a thread under one, is now a
+turn in the channel it is linked to, as on Discord. It is authorized by the
+link and never by the control channel: operator commands there are still
+refused and nothing said there reaches the concierge as the operator. A
+channel that is neither the control channel nor linked stays silent. The
+bridges ask the collaboration store which surfaces are linked, which answers
+from memory, refreshed on every link write and at least every 30 seconds.
+(#2290)
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped

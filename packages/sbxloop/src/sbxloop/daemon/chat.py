@@ -865,6 +865,33 @@ class ChatBridge(ABC):
         ctx = self._api_ctx()
         return None if ctx is None else ctx.collaboration
 
+    def _hears_channel(self, channel_id: str) -> bool:
+        """Is a message in this service channel one to route at all?
+
+        For a transport that is subscribed to more than it serves (Slack,
+        Mattermost: the bot hears every channel it sits in), this is the
+        gate in front of routing. The control channel is heard, as is any
+        channel linked to a collaboration channel: the link is what
+        authorizes that surface, and ``_handle_message`` sends what arrives
+        there down the linked path, never to the concierge as the operator.
+        ``channel_id`` is the channel the message physically lives in, so a
+        thread reply is judged by its parent. Anything else stays silent.
+        """
+        if not channel_id:
+            return False
+        control = self.chat.channel_ref or None
+        if control is not None and channel_id == str(control):
+            return True
+        store = self._collaboration()
+        if store is None:
+            return False
+        try:
+            return channel_id in store.linked_surfaces(self.backend)
+        except Exception:
+            # Fail closed: a surface nobody can vouch for stays silent.
+            self.log.warning("chat.linked_surfaces_failed", surface=channel_id, exc_info=True)
+            return False
+
     def _channel_link(self, msg: Inbound) -> Any:
         """The active link for the surface this message arrived on, or None.
 
