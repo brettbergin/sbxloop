@@ -12,6 +12,51 @@ sbx's state directory; systemd also clears whatever `sbx daemon stop` leaves
 running and removes a stale pid file. Re-run `sbxloop init --systemd` to pick
 it up, and drop any local override written as a stopgap.
 
+**Starting work and changing schedules from chat answer to the person who
+asked.** A concierge turn already carries the asking person's principal
+and `sbx_control` and `set_config` answer to it, but `start_workload`,
+`start_entrygraph`, `create_schedule` and `delete_schedule` still acted with
+the daemon's own authority, so a workspace member could have the agent
+create a recurring schedule or delete the operator's. Each is now authorized
+as the equivalent API route authorizes the person: `start_workload` and
+`start_entrygraph` need `items:create`, as `POST /v1/items` does (so a member
+may still ask for work, and a workload for a channel also needs what a write
+to that channel does), and `create_schedule` and `delete_schedule` need
+`daemon:manage`, as `POST` and `DELETE /v1/schedules` do. A refusal names the
+missing capability and writes nothing; a turn nobody vouched for gets none of
+the four. The control channel's explicitly trusted principal is unchanged.
+
+**A deploy's SIGTERM can no longer hang the daemon, and a stale run is
+closed even while other runs are busy.** The shutdown handler asks every
+run to cancel from the main thread, which is also the loop thread; the
+lock guarding the runs in flight was not reentrant, so a signal landing
+while the loop held it (about once a second whenever a run was live) left
+the daemon blocked on its own lock until the service manager killed it,
+with no run asked to cancel and no sandbox cleaned up. The lock is now
+reentrant. Separately, the `[daemon] run_stale_after_s` sweep skipped
+itself entirely whenever any run was live, so under steady concurrent load
+a run left `decomposing` by a settle step that died stayed "active" in
+`list_runs`, the API and the TUI for as long as the daemon stayed busy. It
+now skips only the runs actually executing and closes the rest. (#1271,
+#1270)
+
+**A private channel's events reach its members only, workspace owners and
+admins included, and nobody sees another person's older events.** The event
+filter behind `/v1/events`, a run's events, the SSE stream and the
+WebSocket let a workspace owner or admin see every channel's events, so an
+admin who could not open a private channel (it answers them 404) still
+followed its turns, participants, members and runs; it now applies the same
+channel rule to everyone, and only work no channel asked for stays visible
+to owners and admins alone. A plain member also saw every event about an
+item that no channel asked for (a daemon notice or an operation on it),
+while that item's run events were hidden from them; such item events are
+now shown to owners and admins only, like the runs. And revision 0026 never
+gave the team, preference, workflow and profile events recorded before it
+their audience, so those reached every member: revision 0039 fills the
+audience from the person their data names, or the owner of the team,
+preference or workflow, and an event whose person can no longer be told
+reaches no member (a plain API client still sees everything).
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped

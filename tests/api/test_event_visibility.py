@@ -4,15 +4,18 @@ A workspace member sees the events of the channels they can open and
 nothing of anyone else's private channel, whether they page through
 ``/v1/events``, read a run's events, follow the SSE stream or subscribe on
 the WebSocket. Events meant for one person reach only that person. A run's
-events follow the channel that asked for the run; a run no channel asked
-for is shown to workspace owners and admins only. A plain API client and a
-workspace owner or admin see everything, as before.
+or an item's events follow the channel that asked for the work; work no
+channel asked for is shown to workspace owners and admins only. A private
+channel stays private: a workspace owner or admin who is not one of its
+members does not see its events either. A plain API client sees everything,
+as before.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -28,6 +31,7 @@ from tests.api.conftest import Api
 from tests.api.test_channel_access import _channel, _invite
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
+from tests.unit.test_channel_membership_migration import _head, _stamp
 from tests.unit.test_daemon_loop import gh_item
 
 
@@ -82,8 +86,11 @@ def test_a_member_lists_only_the_events_of_channels_they_can_open(api: Api) -> N
     assert private not in seen
     assert shared in seen
 
-    for everyone in (bearer(owner), bearer(admin), api.bearer()):
+    for everyone in (bearer(owner), api.bearer()):
         assert {private, shared} <= _channels_in(_all_events(api, everyone))
+    seen = _channels_in(_all_events(api, bearer(admin)))
+    assert private not in seen
+    assert shared in seen
 
     # Once the guest is added, the private channel's history is theirs too.
     added = api.client.post(
@@ -178,7 +185,8 @@ def test_memory_events_follow_the_channel_the_memory_came_from(api: Api) -> None
         }
 
     assert memories_seen(bearer(guest)) == {made[shared], made[None]}
-    for everyone in (bearer(owner), bearer(admin), api.bearer()):
+    assert memories_seen(bearer(admin)) == {made[shared], made[None]}
+    for everyone in (bearer(owner), api.bearer()):
         assert memories_seen(everyone) == set(made.values())
 
 
@@ -407,9 +415,10 @@ def test_run_events_follow_the_channel_that_asked_for_the_run(api: Api) -> None:
         assert page.status_code == 200, page.text
         return [e["type"] for e in page.json()["data"]]
 
-    for everyone in (bearer(owner), bearer(admin), api.bearer()):
+    for everyone in (bearer(owner), api.bearer()):
         assert "phase.start" in run_types(everyone, hidden_run)
     assert run_types(bearer(guest), hidden_run) == []
+    assert run_types(bearer(admin), hidden_run) == []
     shared_types = run_types(bearer(guest), shared_run)
     assert "run.started" in shared_types
     assert "phase.start" in shared_types
@@ -433,6 +442,132 @@ def test_a_run_no_channel_asked_for_is_shown_to_owners_and_admins(api: Api) -> N
     assert run_id not in runs_seen(bearer(guest))
     for everyone in (bearer(owner), bearer(admin), api.bearer()):
         assert run_id in runs_seen(everyone)
+
+
+def _join(api: Api, actor: dict[str, Any], channel_id: str, member: dict[str, Any]) -> None:
+    added = api.client.post(
+        f"/v1/channels/{channel_id}/members",
+        headers=bearer(actor),
+        json={"user_id": _user_id(api, member)},
+    )
+    assert added.status_code == 201, added.text
+
+
+def test_an_admin_outside_a_private_channel_does_not_see_its_events(api: Api) -> None:
+    """A private channel is seen by its members only, whatever their
+    workspace role: an admin who cannot open it does not follow it through
+    the chronology either, until they are made a member."""
+    owner, _guest, admin = _people(api)
+    private = _channel(api, bearer(owner))
+    _touch(api, bearer(owner), private)
+
+    opened = api.client.get(f"/v1/channels/{private}", headers=bearer(admin))
+    assert opened.status_code == 404, opened.text
+    assert private not in _channels_in(_all_events(api, bearer(admin)))
+    assert _all_events(api, bearer(admin), channel_id=private) == []
+    frames = _collect_sse(api, admin, until=len(_all_events(api, bearer(admin))))
+    assert private not in _channels_in(frames)
+
+    _join(api, owner, private, admin)
+    assert private in _channels_in(_all_events(api, bearer(admin)))
+
+
+def _asked_item(api: Api, headers: dict[str, str], channel_id: str, text: str) -> str:
+    """Admit a workload asked for in ``channel_id``; returns its item id."""
+    accepted = api.client.post(
+        f"/v1/channels/{channel_id}/turns", headers=headers, json={"content": text}
+    )
+    assert accepted.status_code == 202, accepted.text
+    settled(api.client, headers, channel_id, accepted.json()["turn"]["id"])
+    key = accepted.json()["turn"]["input_message_id"]
+    item = WorkItem(
+        item_id=chat_item_id(key), source_key=key, title=text, body=text, kind="workload"
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    return item.item_id
+
+
+def test_an_items_events_follow_the_channel_that_asked_for_the_item(api: Api) -> None:
+    """An event about an item and no run (a daemon notice, an operation on
+    the item) is shown to whoever may see the item: the members of the
+    channel that asked for it, or, when no channel did, workspace owners and
+    admins only, the same as that item's runs."""
+    api.ctx.concierge = FakeConcierge()
+    owner, guest, admin = _people(api)
+    private = _channel(api, bearer(owner))
+    shared = _channel(api, bearer(owner), "workspace")
+    api.harness.dstore.upsert_new(gh_item("7"), api.clock())
+    items = {
+        "private": _asked_item(api, bearer(owner), private, "Private report"),
+        "shared": _asked_item(api, bearer(owner), shared, "Shared report"),
+        "no channel": gh_item("7").item_id,
+    }
+    for text, item_id in items.items():
+        api.ctx.chronology.record(
+            "daemon.notice", api.clock(), item_id=item_id, data={"kind": "info", "text": text}
+        )
+
+    def notices_seen(headers: dict[str, str]) -> set[str]:
+        return {
+            str(e["data"]["text"]) for e in _all_events(api, headers, type_prefix="daemon.notice")
+        }
+
+    assert notices_seen(bearer(guest)) == {"shared"}
+    assert notices_seen(bearer(admin)) == {"shared", "no channel"}
+    for everyone in (bearer(owner), api.bearer()):
+        assert notices_seen(everyone) == set(items)
+
+
+#: The revision before the one that gives recorded per-person events their
+#: audience.
+BEFORE_AUDIENCE = "0038"
+
+
+def test_a_per_person_event_recorded_before_audiences_reaches_only_that_person(
+    api: Api,
+) -> None:
+    """Events a release before revision 0026 recorded for one person carry
+    no audience. After the upgrade they reach that person only, and one
+    whose person can no longer be told reaches no workspace member."""
+    owner, guest, admin = _people(api)
+    saved = api.client.put("/v1/prompts/style", headers=bearer(owner), json={"content": "brief"})
+    assert saved.status_code == 200, saved.text
+    (made,) = _all_events(api, bearer(owner), type_prefix="collaboration.preference.")
+    legacy = [
+        ("collaboration.preference.updated", {"preference_id": made["data"]["preference_id"]}),
+        ("collaboration.user.updated", {"user_id": _user_id(api, owner)}),
+        ("collaboration.team.deleted", {"team_id": "team_gone"}),
+    ]
+    path = api.harness.dstore.path
+    conn = sqlite3.connect(path)
+    try:
+        for type_, data in legacy:
+            conn.execute(
+                "INSERT INTO api_events (recorded_at, occurred_at, type, data_json)"
+                " VALUES (?, ?, ?, ?)",
+                (api.clock(), api.clock(), type_, json.dumps(data)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(path, BEFORE_AUDIENCE)
+    _head(path)
+
+    def legacy_seen(headers: dict[str, str]) -> set[str]:
+        types = {type_ for type_, _ in legacy}
+        return {
+            str(e["type"])
+            for e in _all_events(api, headers)
+            if e["type"] in types and e["id"] != made["id"]
+        }
+
+    assert legacy_seen(bearer(guest)) == set()
+    assert legacy_seen(bearer(admin)) == set()
+    assert legacy_seen(bearer(owner)) == {
+        "collaboration.preference.updated",
+        "collaboration.user.updated",
+    }
+    assert legacy_seen(api.bearer()) == {type_ for type_, _ in legacy}
 
 
 def test_capabilities_advertise_scoped_events(api: Api) -> None:

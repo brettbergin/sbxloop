@@ -611,7 +611,8 @@ class Concierge:
         return self._turn.model
 
     def _turn_principal(self, by: str) -> Principal:
-        """Who an operator command or config write on this turn runs as.
+        """Who an operator command, a config write, new work or a schedule
+        change on this turn runs as.
 
         The turn's principal keeps its identity, capabilities and workspace,
         so the control service refuses what the person's role does not
@@ -630,6 +631,31 @@ class Concierge:
                 capabilities=_UNVOUCHED_CAPABILITIES,
             )
         return replace(principal, display=by, via="concierge")
+
+    def _turn_refusal(
+        self, by: str, tool: str, what: str, capabilities: Sequence[Capability], nothing: str
+    ) -> str | None:
+        """Why the turn's person may not do ``what``, or ``None`` when they may.
+
+        Starting work and changing schedules answer to the person who asked
+        exactly as the equivalent API route answers to them (#2291): the
+        first capability of ``capabilities`` their principal lacks is named,
+        in the order the route checks them, and ``nothing`` says that no
+        write happened. A turn with no principal holds the read verbs alone,
+        so it fails closed here too.
+        """
+        principal = self._turn_principal(by)
+        missing = next((cap for cap in capabilities if not principal.can(cap)), None)
+        if missing is None:
+            return None
+        log.info(
+            "concierge.tool_refused",
+            tool=tool,
+            capability=missing,
+            by=by,
+            principal=principal.audit(),
+        )
+        return f"{what}: {principal.id} (via {principal.via}) lacks {missing}. {nothing}"
 
     @property
     def _via(self) -> str:
@@ -2395,6 +2421,16 @@ class Concierge:
         return lines
 
     def _tool_start_workload(self, args: dict[str, Any], by: str) -> str:
+        # As `POST /v1/items` admits a workload: `items:create`, and a run
+        # delivered to a channel takes what a write to that channel does.
+        needed: tuple[Capability, ...] = ("items:create",)
+        if self._turn.channel_id is not None:
+            needed = (*needed, "collaboration:read", "collaboration:write")
+        refused = self._turn_refusal(
+            by, "start_workload", "the workload is not queued", needed, "Nothing was queued."
+        )
+        if refused is not None:
+            return refused
         ask = str(args.get("ask", "")).strip()
         if not ask:
             return "an ask is required"
@@ -2516,6 +2552,16 @@ class Concierge:
         ]
 
     def _tool_start_entrygraph(self, args: dict[str, Any], by: str) -> str:
+        # A recipe run is admitted as `POST /v1/items` admits a tool intake.
+        refused = self._turn_refusal(
+            by,
+            "start_entrygraph",
+            "entrygraph is not queued",
+            ("items:create",),
+            "Nothing was queued.",
+        )
+        if refused is not None:
+            return refused
         for name in ("repo", "url"):
             if args.get(name) is not None and not isinstance(args[name], str):
                 return f"{name} must be a string"
@@ -2589,6 +2635,17 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_create_schedule(self, args: dict[str, Any], by: str) -> str:
+        # A schedule is recurring, unattended work: `daemon:manage`, as
+        # `POST /v1/schedules` requires.
+        refused = self._turn_refusal(
+            by,
+            "create_schedule",
+            "the schedule is not created",
+            ("daemon:manage",),
+            "Nothing was written.",
+        )
+        if refused is not None:
+            return refused
         name = str(args.get("name") or "").strip()
         ask = str(args.get("ask") or "").strip()
         if not name or not ask:
@@ -2792,6 +2849,17 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_delete_schedule(self, args: dict[str, Any], by: str) -> str:
+        # `DELETE /v1/schedules/{name}` takes `daemon:manage` and nothing
+        # else: whoever created a schedule, removing it needs that standing.
+        refused = self._turn_refusal(
+            by,
+            "delete_schedule",
+            "the schedule is not deleted",
+            ("daemon:manage",),
+            "Nothing was written.",
+        )
+        if refused is not None:
+            return refused
         name = str(args.get("name") or "").strip()
         if not name:
             return "a schedule name is required"

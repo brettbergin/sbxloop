@@ -453,9 +453,11 @@ class DaemonLoop:
         # The runs in flight, oldest first (insertion order), keyed by run
         # id; at most `[daemon] max_concurrent_runs` of them. Changed only
         # on the loop thread (launch and reap) and under `_current_lock`;
-        # controls on other threads read it under the lock.
+        # controls on other threads read it under the lock. Reentrant: the
+        # SIGTERM handler's `quiesce` runs on the main thread, which is also
+        # the loop thread, and can land while that thread holds the lock.
         self._runs: dict[str, RunHandle] = {}
-        self._current_lock = threading.Lock()
+        self._current_lock = threading.RLock()
         # Every mutating control leaves a durable record here before it
         # acts; `recover()` stamps the generation that claims them.
         self.operations = OperationStore(dstore)
@@ -5478,16 +5480,18 @@ class DaemonLoop:
         return True
 
     def _reconcile_stale_runs(self, now: float) -> None:
-        """Liveness safety net (#374): with no run executing in this process,
-        close non-terminal runs that have shown no activity for
-        ``[daemon] run_stale_after_s``. Disabled when the threshold is 0."""
+        """Liveness safety net (#374): close non-terminal runs that no
+        thread in this process is executing and that have shown no activity
+        for ``[daemon] run_stale_after_s``. A live run is never swept; the
+        others are, however many runs are in flight. Disabled when the
+        threshold is 0."""
         threshold = self.config.daemon.run_stale_after_s
         if threshold <= 0:
             return
-        with self._current_lock:
-            if self._runs:
-                return  # a run is genuinely in flight; nothing here is stale
+        live = {handle.run_id for handle in self.runs}
         for record in self.store.non_terminal_runs():
+            if record.run_id in live:
+                continue  # genuinely in flight; not stale however quiet
             last_activity = max(record.updated_at, self.store.last_event_ts(record.run_id) or 0.0)
             idle = now - last_activity
             if idle <= threshold:
