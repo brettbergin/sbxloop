@@ -31,6 +31,8 @@ from sbxloop.log import get_logger
 from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from sbxloop.agents.definition import AgentDefinition
     from sbxloop.agents.memory import MemoryService
 
@@ -406,6 +408,8 @@ class StartRequest:
     channel_id: str | None
     dedupe_key: str
     on_behalf_of: str | None
+    #: The ledger row :meth:`WorkHost.reserve` set aside for this start.
+    reservation: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +424,8 @@ class IssueRequest:
     channel_id: str | None
     dedupe_key: str
     on_behalf_of: str | None
+    #: The ledger row :meth:`WorkHost.reserve` set aside for this filing.
+    reservation: str = ""
 
 
 class WorkHost(Protocol):
@@ -441,8 +447,21 @@ class WorkHost(Protocol):
     def budget_refusal(self) -> str | None:
         """Why the workspace pool will not admit another run now, or None."""
 
-    def duplicate(self, dedupe_key: str) -> str | None:
-        """What this exact ask already produced, or None."""
+    def duplicate(self, agent_slug: str, dedupe_key: str) -> str | None:
+        """What this exact ask already produced and still stands, or None:
+        work still in flight, or started today and not ended in failure."""
+
+    def admitting(self) -> AbstractContextManager[object]:
+        """Held across the checks and :meth:`reserve`, and shared by every
+        turn, so two turns cannot both pass the cap or the same ask."""
+
+    def reserve(self, agent_slug: str, dedupe_key: str) -> str:
+        """Set a ledger row aside for this start before its side effect,
+        so the cap counts it and :meth:`duplicate` finds it from then on;
+        the row's handle."""
+
+    def release(self, reservation: str) -> None:
+        """Give back a row whose start was refused, so nothing was started."""
 
     def start(self, request: StartRequest) -> str: ...
 
@@ -497,7 +516,14 @@ def work_tools(
        cannot spend the whole workspace;
     5. the workspace pool must admit another run;
     6. the ask must not be one this agent already started under this
-       parent.
+       parent and is still in flight, or started today and did not see
+       fail -- a failed ask, or one from an earlier day, may be asked again.
+
+    4 and 6 are checked, and the start written to the host's ledger, under
+    the host's admission lock and *before* anything is admitted or filed:
+    two turns of one agent at once cannot both pass them, and a start the
+    process dies in the middle of still counts. A start the host refuses
+    gives its row back.
 
     Filing an issue nobody queued runs nothing, so it is excused 1 and 5 --
     there is no kind to declare and no run for the pool to admit -- and
@@ -558,13 +584,34 @@ def work_tools(
 
     def deduped(ask: str) -> str:
         key = work_dedupe_key(slug, parent_item_id, ask)
-        existing = host.duplicate(key)
+        existing = host.duplicate(slug, key)
         if existing is not None:
             raise ToolRejectedError(
                 f"you already asked for this: {existing}. Say what it produced rather "
                 "than asking again"
             )
         return key
+
+    def admitted(
+        kind: str | None, repo: str | None, ask: str, *, needs_repo: bool, budget: bool = True
+    ) -> tuple[str, str, str]:
+        """Every guardrail and the dedupe, then the ledger row reserved --
+        all under the host's admission lock, so nothing another turn does
+        lands between a check and the record it relies on."""
+        with host.admitting():
+            resolved = guard(kind, repo, needs_repo=needs_repo, budget=budget)
+            key = deduped(ask)
+            return resolved, key, host.reserve(slug, key)
+
+    def started(reservation: str, fn: Callable[[], str]) -> str:
+        # A refusal means nothing was started, so its row goes back; any
+        # other failure may have left work behind, so the row stays -- it
+        # counts today and blocks the same ask until the host expires it.
+        try:
+            return fn()
+        except ToolRejectedError:
+            host.release(reservation)
+            raise
 
     def origin() -> WorkOrigin:
         return WorkOrigin(
@@ -582,20 +629,19 @@ def work_tools(
             raise ToolRejectedError("an ask is required: say what the run should produce")
         repo = _text(args, "repo").strip() or None
         profile = _text(args, "profile").strip() or None
-        resolved = guard(kind, repo, needs_repo=kind == "code")
-        key = deduped(ask)
-        return host.start(
-            StartRequest(
-                kind=cast("AgentStartKind", kind),
-                ask=ask,
-                repo=resolved or None,
-                profile=profile,
-                origin=origin(),
-                channel_id=channel_id,
-                dedupe_key=key,
-                on_behalf_of=on_behalf_of,
-            )
+        resolved, key, reservation = admitted(kind, repo, ask, needs_repo=kind == "code")
+        request = StartRequest(
+            kind=cast("AgentStartKind", kind),
+            ask=ask,
+            repo=resolved or None,
+            profile=profile,
+            origin=origin(),
+            channel_id=channel_id,
+            dedupe_key=key,
+            on_behalf_of=on_behalf_of,
+            reservation=reservation,
         )
+        return started(reservation, lambda: host.start(request))
 
     def file_issue(args: Mapping[str, Any]) -> str:
         title = " ".join(_text(args, "title").split())[:_TITLE_MAX]
@@ -613,24 +659,23 @@ def work_tools(
         # `can_start` and to the workspace pool. Everything else holds
         # either way: filing on a repository is work the agent started, so
         # it counts against the chain and against its own day.
-        resolved = (
-            guard("code", repo, needs_repo=True)
+        resolved, key, reservation = (
+            admitted("code", repo, f"issue:{title}", needs_repo=True)
             if queue
-            else guard(None, repo, needs_repo=True, budget=False)
+            else admitted(None, repo, f"issue:{title}", needs_repo=True, budget=False)
         )
-        key = deduped(f"issue:{title}")
-        return host.file_issue(
-            IssueRequest(
-                repo=resolved,
-                title=title,
-                body=body,
-                queue=queue,
-                origin=origin(),
-                channel_id=channel_id,
-                dedupe_key=key,
-                on_behalf_of=on_behalf_of,
-            )
+        request = IssueRequest(
+            repo=resolved,
+            title=title,
+            body=body,
+            queue=queue,
+            origin=origin(),
+            channel_id=channel_id,
+            dedupe_key=key,
+            on_behalf_of=on_behalf_of,
+            reservation=reservation,
         )
+        return started(reservation, lambda: host.file_issue(request))
 
     return [
         AgentTool(

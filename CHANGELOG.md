@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+**An agent's daily cap and its "already asked" check hold when two turns
+start work at once, and a failed or day-old ask can be asked again.** An
+agent that may start work (`can_start`) was refused the same wording
+forever, by anyone in any channel, because every start it ever made was
+kept and matched whatever became of it, even when that run failed; and the
+cap read and parsed that whole history on every call. The check now
+matches only work still in flight, or work started today that did not end
+in failure, and earlier days are dropped from the record. Separately, the
+cap and the check ran with nothing held and the start was noted only after
+the issue was filed, so two turns at once could both pass either one, and
+a daemon that died right after filing left an issue that was neither
+counted nor recognised. The start is now reserved under one lock before
+anything is admitted or filed and filled in afterwards; a refused start
+gives its reservation back, and one a crash cut short stops blocking the
+same ask after ten minutes (it still counts for the day). (#1242, #1243)
+
 **The sandbox backend stays up under systemd on sbx 0.45.** From sbx 0.45.1
 (field-verified) `sbx daemon start` detaches even without `-d`, so the
 `Type=simple` unit `sbxloop init --systemd` rendered saw its main process exit
