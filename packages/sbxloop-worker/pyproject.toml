@@ -17,7 +17,7 @@ classifiers = [
 dependencies = ["pydantic>=2.7", "gitpython>=3.1.62"]
 
 [project.optional-dependencies]
-copilot = ["github-copilot-sdk>=1.0.8"]
+copilot = ["github-copilot-sdk>=1.0.13"]
 # The Claude Agent SDK spawns the Claude Code CLI, which is NOT bundled:
 # provisioning installs Node + @anthropic-ai/claude-code into the sandbox
 # when [agent] backend = "claude" is configured.

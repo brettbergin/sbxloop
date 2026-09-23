@@ -645,7 +645,7 @@ wheels = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "1.0.8"
+version = "1.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -653,7 +653,7 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/d2/517ae4be0dbbb02d5546f48e4be59f0ac2d83752cd608da739c5c580942f/github_copilot_sdk-1.0.8-py3-none-any.whl", hash = "sha256:7c3d868b73daa3a154ae6c1c5a2bd9301c47349c6b080f1ed77ba9027da3e0fa", size = 429721, upload-time = "2026-07-22T23:14:47.571Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/6d/4f2e3dddc576ff49739317adba6f9b8c35e93b835ece923e46f1b7fa6028/github_copilot_sdk-1.0.13-py3-none-any.whl", hash = "sha256:941dd5b55cf32ba55c73c651052a4a52b259b470c68bf6a6ac3d240c235402c9", size = 588198, upload-time = "2026-09-04T21:31:02.063Z" },
 ]
 
 [[package]]
@@ -1894,7 +1894,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
-    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.13" },
     { name = "gitpython", specifier = ">=3.1.62" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.147.0" },
@@ -1943,7 +1943,7 @@ openai = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.152" },
-    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.13" },
     { name = "gitpython", specifier = ">=3.1.62" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.99" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.147.0" },
