@@ -202,7 +202,10 @@ An sbxloop deployment or rollback leaves sbx unchanged. Upgrade that runtime sep
 with an explicit version, using `sbxloop init --sbx-version X.Y.Z` after checking
 compatibility on a CI runner. Take a named hold and drain the current run first, then stop
 `sbxloop-daemon` followed by `sbx-sandboxd` before installing. Restart the sandbox backend
-before the sbxloop daemon, check health, and release the hold you took.
+before the sbxloop daemon, check health, and release the hold you took. On a systemd host,
+add `--systemd` to that init so the `sbx-sandboxd` unit is rendered afresh: an older unit
+runs sandboxd as `Type=simple`, and sbx 0.45's `daemon start`, which detaches on its own,
+crash-loops under it.
 
 Before the first start of the new runtime, keep a matching backup of the old binaries and
 the stopped sandbox state, configuration and credentials. `sbxloop backup` does not include
