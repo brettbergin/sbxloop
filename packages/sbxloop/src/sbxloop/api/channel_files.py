@@ -28,6 +28,7 @@ MAX_FILE_BYTES = 100_000_000
 MAX_WORKSPACE_BYTES = 10_000_000_000
 MAX_STAGED_PER_USER = 32
 MAX_CHANNEL_FILES = 1_000
+MAX_PDF_ANALYSIS_BYTES = 20_000_000
 STAGED_TTL_S = 7 * 24 * 60 * 60
 PART_TTL_S = 24 * 60 * 60
 _ID = re.compile(r"^fin_[0-9abcdefghjkmnpqrstvwxyz]{24}$")
@@ -47,6 +48,7 @@ class ChannelInputFile:
     message_id: str | None
     created_at: float
     uploaded_at: float | None
+    analysis_status: str | None = None
 
 
 def _file(row: ChannelInputFileRow) -> ChannelInputFile:
@@ -63,6 +65,7 @@ def _file(row: ChannelInputFileRow) -> ChannelInputFile:
         message_id=None if row.message_id is None else str(row.message_id),
         created_at=float(row.created_at),
         uploaded_at=None if row.uploaded_at is None else float(row.uploaded_at),
+        analysis_status=None if row.analysis_status is None else str(row.analysis_status),
     )
 
 
@@ -356,6 +359,78 @@ class ChannelFileStore:
             handle.seek(offset)
             return file, handle.read(limit)
 
+    def pdf_for_turn(self, turn_id: str, file_id: str) -> tuple[ChannelInputFile, str | None]:
+        """Read derived text only through the original turn's current access check."""
+        if _ID.fullmatch(file_id) is None:
+            raise _not_found()
+        with self.dstore.immediate_transaction() as session:
+            channel_id, sequence = self._turn_scope(session, turn_id)
+            row = session.scalar(
+                select(ChannelInputFileRow)
+                .join(MessageRow, MessageRow.id == ChannelInputFileRow.message_id)
+                .where(
+                    ChannelInputFileRow.id == file_id,
+                    ChannelInputFileRow.channel_id == channel_id,
+                    ChannelInputFileRow.status == "attached",
+                    MessageRow.sequence <= sequence,
+                )
+            )
+            if row is None:
+                raise _not_found()
+            # Files uploaded before this analyzer was released are admitted
+            # lazily, after the same turn-snapshot authorization check.
+            if row.analysis_status is None and row.size is not None:
+                with self.open_original(file_id, int(row.size)) as original:
+                    if original.read(5) == b"%PDF-":
+                        row.analysis_status = (
+                            "queued" if row.size <= MAX_PDF_ANALYSIS_BYTES else "oversize"
+                        )
+                        row.analysis_version = 1
+                        session.flush()
+            return _file(row), row.analysis_json
+
+    def pending_pdf_ids(self) -> list[str]:
+        """Recover queued and interrupted jobs after a daemon restart."""
+        with self.dstore.immediate_transaction() as session:
+            rows = list(
+                session.scalars(
+                    select(ChannelInputFileRow).where(
+                        ChannelInputFileRow.analysis_status.in_(("queued", "running")),
+                        ChannelInputFileRow.status.in_(("uploaded", "attached")),
+                    )
+                )
+            )
+            for row in rows:
+                row.analysis_status = "queued"
+            return [str(row.id) for row in rows]
+
+    def claim_pdf(self, file_id: str) -> ChannelInputFile | None:
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(ChannelInputFileRow, file_id)
+            if (
+                row is None
+                or row.analysis_status != "queued"
+                or row.status not in ("uploaded", "attached")
+                or row.sha256 is None
+                or row.size is None
+            ):
+                return None
+            row.analysis_status = "running"
+            return _file(row)
+
+    def finish_pdf(self, file_id: str, sha256: str, result_json: str | None) -> None:
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(ChannelInputFileRow, file_id)
+            if (
+                row is None
+                or row.sha256 != sha256
+                or row.status not in ("uploaded", "attached")
+                or row.analysis_status != "running"
+            ):
+                return
+            row.analysis_status = "ready" if result_json is not None else "failed"
+            row.analysis_json = result_json
+
     def complete(
         self,
         member: Member,
@@ -371,6 +446,8 @@ class ChannelFileStore:
             raise CollaborationError(
                 "file_too_large", f"files are limited to {MAX_FILE_BYTES} bytes"
             )
+        with temporary.open("rb") as source:
+            is_pdf = source.read(5) == b"%PDF-"
         final = self.path(file_id)
         with self.dstore.immediate_transaction() as session:
             _access(session, channel_id, member, "post", now=now)
@@ -416,6 +493,9 @@ class ChannelFileStore:
             row.sha256 = sha256
             row.status = "uploaded"
             row.uploaded_at = now
+            if is_pdf:
+                row.analysis_status = "queued" if size <= MAX_PDF_ANALYSIS_BYTES else "oversize"
+                row.analysis_version = 1
             session.flush()
             return _file(row)
 

@@ -6,7 +6,7 @@ workflow — is [docs/deploy.md](deploy.md). This page records where sbxloop's o
 departs from that pattern and the facts about the host that operating it needs.
 
 ```
-merge to main → quiet batch → Release (test + tag + PyPI) → Deploy the daemon
+merge to main → coalesced request → Release (verify + tag + PyPI) → Deploy the daemon
                                                  ├─ check version, cooldown, and blocked releases
                                                  ├─ check the existing host with doctor
                                                  ├─ take a named pause hold (deploy-<run id>)
@@ -23,6 +23,12 @@ wait ([RELEASING.md](../RELEASING.md)). `.github/workflows/deploy.yml` carries c
 releases onto the daemon host. A task may already be in flight when a release arrives,
 which is why draining has no cap apart from the job timeout (#534): restarting anyway
 killed tasks and spent their resume budgets.
+
+Release reuses successful CI for its frozen commit, or runs the same CI workflow
+when that evidence is unavailable. Its automatic intake coalesces pending requests;
+manual release requests retain their place in the publication queue. The final
+wheels pass a clean installation and CLI smoke test before publication. Deployment
+still starts from the completed `Release` workflow and its publication receipt.
 
 Automatic deployments have a thirty-minute cooldown after a deployment finishes,
 including a verified rollback. No hold is taken during that cooldown. A reconciliation
@@ -80,6 +86,11 @@ health; reports and history use that final version.
   `#sbxloop-deploys`; the trusted workflow helper selects that channel through the installed
   notifier's original API, so routing also works before an upgrade or after a rollback. The
   daemon's normal control traffic remains in `#sbxloop`.
+- **PDF analyzer identity.** Before a changed release takes the deploy hold, the job
+  signs in to Docker under the separate `sbxloop-analysis` app with repository
+  Docker Hub secrets and initializes a deny-all policy once. The PDF worker runs with no
+  agent skills, credentials or network access. A missing Docker Hub secret fails
+  the deployment before the installed daemon is changed.
 
 ## The host
 

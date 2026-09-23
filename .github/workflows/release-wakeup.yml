@@ -1,0 +1,31 @@
+name: Request an automatic release
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '13,43 * * * *'
+
+# Only automatic wakeups are replaceable. Release itself keeps its durable
+# queue and original workflow/environment identity for Trusted Publishing.
+concurrency:
+  group: release-wakeup
+  cancel-in-progress: false
+  queue: single
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+      - name: Coalesce automatic release requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_pipeline.py wake-release
