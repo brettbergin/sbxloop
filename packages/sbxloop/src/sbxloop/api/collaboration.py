@@ -89,7 +89,9 @@ LINK_CODE_TTL_S = 600.0
 #: Starts the ledger key of a run post whose own key another run or channel
 #: already holds. No caller's key may start with it, so a scoped key never
 #: meets one a caller named.
-SCOPED_POST_KEY_PREFIX = ""
+#: Written as an escape, never a raw byte: an invisible character is easy to
+#: strip by accident, and an empty prefix would reserve every key.
+SCOPED_POST_KEY_PREFIX = "\x1f"
 
 
 def scoped_run_post_key(run_id: str, channel_id: str, dedupe_key: str) -> str:
