@@ -88,10 +88,18 @@ jobs:
           # Fail closed if this runner cannot demonstrate that the host has
           # network access; a blocked sandbox probe alone would be ambiguous.
           python3 -c 'import socket; s=socket.create_connection(("example.com", 443), timeout=5); s.close()'
+          # Explicitly clear service credentials at creation and execution.
+          # Keep the host-only sentinel set to detect unintended inheritance.
+          clear_credentials=(
+            -e GH_TOKEN= -e GITHUB_TOKEN= -e DOCKERHUB_TOKEN=
+            -e OPENAI_API_KEY= -e ANTHROPIC_API_KEY= -e COPILOT_GITHUB_TOKEN=
+          )
           timeout 600s sbx --app-name "$SBXLOOP_APP_NAME" create \
             --name="$SBX_PROBE_NAME" --cpus 1 --memory 512m \
-            --deny-network '**' --skills off shell "$root/work" "$root/input:ro"
-          timeout 30s sbx --app-name "$SBXLOOP_APP_NAME" exec "$SBX_PROBE_NAME" \
+            --deny-network '**' --skills off "${clear_credentials[@]}" \
+            shell "$root/work" "$root/input:ro"
+          timeout 30s sbx --app-name "$SBXLOOP_APP_NAME" exec \
+            "${clear_credentials[@]}" "$SBX_PROBE_NAME" \
             python3 "$root/input/probe.py" "$root/input/original.bin" "$expected_sha256" \
             "$root/private/neighbor.bin" "$root/private/host-output.bin"
           cmp tests/fixtures/channel_analysis/inert_keylogger_indicators.elf "$root/input/original.bin"
