@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**Starting work and changing schedules from chat answer to the person who
+asked.** A concierge turn already carries the asking person's principal
+and `sbx_control` and `set_config` answer to it, but `start_workload`,
+`start_entrygraph`, `create_schedule` and `delete_schedule` still acted with
+the daemon's own authority, so a workspace member could have the agent
+create a recurring schedule or delete the operator's. Each is now authorized
+as the equivalent API route authorizes the person: `start_workload` and
+`start_entrygraph` need `items:create`, as `POST /v1/items` does (so a member
+may still ask for work, and a workload for a channel also needs what a write
+to that channel does), and `create_schedule` and `delete_schedule` need
+`daemon:manage`, as `POST` and `DELETE /v1/schedules` do. A refusal names the
+missing capability and writes nothing; a turn nobody vouched for gets none of
+the four. The control channel's explicitly trusted principal is unchanged.
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped
