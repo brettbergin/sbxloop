@@ -63,7 +63,7 @@ from sbxloop_worker.backends.copilot import (
 if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
 
-TESTED_SBX_SERIES = "0.38"
+TESTED_SBX_SERIES = "0.43"
 
 
 @dataclass

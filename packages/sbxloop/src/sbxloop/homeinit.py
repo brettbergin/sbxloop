@@ -59,7 +59,7 @@ log = get_logger(__name__)
 #: The sbx series sbxloop is tested against (doctor's TESTED_SBX_SERIES is
 #: the major.minor of this). Upgrading sbx is an explicit operator step —
 #: `sbxloop init --sbx-version X` — never something a deploy does.
-SBX_VERSION = "0.38.0"
+SBX_VERSION = "0.43.0"
 SBX_RELEASES_API = "https://api.github.com/repos/docker/sbx-releases/releases/tags/{tag}"
 UV_INSTALLER_URL = "https://astral.sh/uv/install.sh"
 PYTHON_SERIES = "3.13"
