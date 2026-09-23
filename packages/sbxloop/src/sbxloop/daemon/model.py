@@ -335,6 +335,7 @@ NoticeKind = Literal[
     "daemon.repository_added",
     "daemon.repository_updated",
     "daemon.repository_removed",
+    "daemon.repository_labels_synced",
     "daemon.restart_requested",
     "daemon.restarted",
     "daemon.restart_marker_stale",

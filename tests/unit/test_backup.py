@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -122,6 +123,51 @@ class TestListRestorePrune:
         info = create_backup(home)
         with pytest.raises(BackupError, match="daemon is running"):
             restore_backup(home, info.name, daemon_live=True)
+
+    def test_restore_only_uses_verified_manifest_entries(self, tmp_path: Path) -> None:
+        home = seeded_home(tmp_path / "h")
+        info = create_backup(home)
+        extra = info.path / "channel-files" / "unlisted"
+        extra.parent.mkdir()
+        extra.write_bytes(b"not in the manifest")
+        restore_backup(home, info.name)
+        assert not (home.channel_files / "unlisted").exists()
+
+        (info.path / "config" / "sbxloop.toml").write_text("tampered")
+        with pytest.raises(BackupError, match="integrity verification"):
+            restore_backup(home, info.name)
+
+    def test_restores_channel_originals_with_database_snapshot(self, tmp_path: Path) -> None:
+        home = seeded_home(tmp_path / "h")
+        file_id = "fin_" + "a" * 24
+        content = b"MZ\x00private original"
+        home.channel_files.mkdir(exist_ok=True)
+        original = home.channel_files / file_id
+        original.write_bytes(content)
+        with sqlite3.connect(home.state_db) as db:
+            db.execute(
+                "INSERT INTO collaboration_input_files "
+                "(id, workspace_id, channel_id, uploader_id, client_upload_id, "
+                "display_name, size, sha256, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    file_id,
+                    "workspace",
+                    "channel",
+                    "user",
+                    "upload",
+                    "sample.exe",
+                    len(content),
+                    hashlib.sha256(content).hexdigest(),
+                    "attached",
+                    1.0,
+                ),
+            )
+        info = create_backup(home)
+        original.unlink()
+        restored = restore_backup(home, info.name)
+        assert f"channel-files/{file_id}" in restored
+        assert original.read_bytes() == content
 
     def test_prune_keeps_the_newest(self, tmp_path: Path) -> None:
         home = seeded_home(tmp_path / "h")

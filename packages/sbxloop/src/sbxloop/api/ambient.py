@@ -7,8 +7,10 @@ one that calls a model to decide on every message is expensive noise. So a
 message reaches an ambient agent through three gates, cheapest first:
 
 1. **Interests.** The agent's ``interests`` are matched, case-insensitively,
-   against the last few messages. No match and no mention means the agent is
-   not considered further and nothing is called.
+   against the message that just arrived, and only that one: an interest
+   mentioned a few messages ago is not a reason to classify everything said
+   since. No match and no mention means the agent is not considered further
+   and nothing is called.
 2. **Guardrails.** The same bounds an agent-to-agent mention passes — chain
    depth, the rate caps, the pair cooldown, the channel's silence and the
    workspace token budget — plus ``ambient_max_per_hour`` for this agent in
@@ -20,8 +22,11 @@ message reaches an ambient agent through three gates, cheapest first:
    ``queued`` only once the turn exists.
 
 An agent never answers its own message, and one already answering the turn
-the message belongs to does not also volunteer. ``ambient = false``, the
-shipped default, skips all of it.
+the message belongs to does not also volunteer. The turn a listener takes
+is recorded against whoever wrote the message it answers; a message from
+someone with no account (a guest on a linked surface) makes it the
+listener's own turn. ``ambient = false``, the shipped default, skips all of
+it.
 """
 
 from __future__ import annotations
@@ -144,8 +149,11 @@ class AmbientSelector:
         if not limits.ambient:
             return ()
         now = self.clock()
+        # The window is what the classifier reads; the prefilter reads only
+        # the new message, so one mention of an interest does not make every
+        # message that follows it cost a model call.
         window = list(self.recent(channel_id, limits.ambient_window_messages))
-        texts = [str(getattr(entry, "content", "")) for entry in window]
+        texts = [str(message.content)]
         named = set(addressed_slugs(message.content))
         skip = {slug for slug in answering if slug}
         if author.kind == "agent" and author.id:
@@ -185,10 +193,16 @@ class AmbientSelector:
             if not self._relevant(channel_id, slug, agent, window):
                 record(Admission(ok=False, reason=AMBIENT_DECLINED))
                 continue
+            # A message from someone with no account (a guest on a linked
+            # surface) cannot be the turn's author: recording the listener's
+            # slug as a person's id would say a person started it. The turn
+            # is the listener's own.
+            author_slug = author.id or slug
+            author_kind = author.kind if author.id else "agent"
             try:
                 accepted = self.queue(
-                    author_slug=author.id or slug,
-                    author_kind=author.kind,
+                    author_slug=author_slug,
+                    author_kind=author_kind,
                     channel_id=channel_id,
                     source_message_id=message.id,
                     target_slug=slug,
@@ -204,6 +218,10 @@ class AmbientSelector:
                 )
                 continue
             if not accepted:
+                # Refused at the door after the classifier answered: the
+                # channel was stopped or silenced, or the turn this one
+                # would hang off was cancelled, while the call was in flight.
+                log.info("collaboration.ambient_turn_refused", channel=channel_id, agent=slug)
                 continue
             record(Admission(ok=True))
             spoke.append(slug)

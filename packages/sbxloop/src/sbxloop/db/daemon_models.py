@@ -124,7 +124,10 @@ class DaemonRunRow(Base):
     """The ledger: one row per run the daemon started, and how it ended."""
 
     __tablename__ = "daemon_runs"
-    __table_args__ = (Index("idx_daemon_runs_started", "started_at"),)
+    __table_args__ = (
+        Index("idx_daemon_runs_started", "started_at"),
+        Index("idx_daemon_runs_item_started", "item_id", "started_at", "run_id"),
+    )
 
     run_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
     item_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -476,6 +479,12 @@ class RepositoryRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
     removed_at: Mapped[float | None] = mapped_column(REAL)
+    # What the repository's sbxloop labels looked like when they were last
+    # read (#630): when, the names read for, and the ones it did not carry,
+    # both as JSON arrays. NULL means never read — not "carries them all".
+    labels_checked_at: Mapped[float | None] = mapped_column(REAL)
+    labels_expected: Mapped[str | None] = mapped_column(Text)
+    labels_missing: Mapped[str | None] = mapped_column(Text)
 
 
 class WorkspaceUsageRow(Base):

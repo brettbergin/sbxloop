@@ -1,5 +1,311 @@
 ## [Unreleased]
 
+**A member cannot give their own agent the power to start work, nor a
+daily cap above the operator's.** `POST /v1/agents` and
+`PATCH /v1/agents/{slug}` accepted `can_start` and `max_runs_per_day` from
+anyone holding `collaboration:write`, and an agent's own `max_runs_per_day`
+replaced `[agent_team] max_agent_runs_per_day` outright, so a member could
+save an agent that queues runs and files issues on its own under a cap of
+their choosing. Granting `can_start` (setting it on a new agent, or adding a
+kind to a saved one) now needs a workspace owner or admin (a plain API
+client: `daemon:manage`) and answers 403 `agent_forbidden` for anyone else;
+the agent's owner may still narrow or clear it, and `[[agents]]` in
+`sbxloop.toml` are unaffected. The team knob is now a ceiling: an agent's
+effective daily cap is the lower of its own `max_runs_per_day` and
+`max_agent_runs_per_day`, and the refusal names whichever bit.
+
+**Merging two collaboration accounts takes nothing from a deactivated
+account, never re-admits somebody who was removed, and records who ran
+it.** `sbxloop users merge` kept the stronger of the two workspace roles
+even when the `--from` account was deactivated, so folding a shut-off
+owner into a person's account made that person an owner; it created a
+membership when the `--into` account had none, putting a person somebody
+had removed from the workspace back in without saying so; and the
+`collaboration.user.merged` event held the two user ids and nothing else,
+unlike the member-management events beside it. A deactivated `--from`
+account now lends none of its role, an `--into` account that is not a
+member is refused (`merge_target_not_member`) unless the new `--readmit`
+flag asks for the re-admission on purpose, and the event names the
+operator who ran the command, the role before and after, and whether the
+account was re-admitted.
+
+**A username can no longer spell another person's user id, and a selector
+that names two accounts is refused.** User ids read `usr_<token>` and are
+public in `GET /v1/users`, while a username only had to be 1 to 80
+characters; `users merge` resolved a selector as a user id first and as a
+username second, so somebody who registered the username `usr_<victim>`
+could be merged in the victim's place by an operator taking them at their
+word. Registration now refuses a username beginning with `usr_` (`422`),
+a provider-suggested username gives up that prefix, and a selector that
+is at once one account's id and another's username is refused
+(`ambiguous_selector`) instead of resolved by lookup order.
+
+**Agent-started work counts its chain depth through chat handoffs, and a
+handoff no longer gets round the agent's own guardrails.** Every work
+tool a chat turn offered an agent with `can_start` was built at depth 0,
+so `[agent_team] max_chain_depth` never refused anything a chain of
+handoffs started, and a peer such an agent handed off to (another
+`can_start` agent, or Angie) kept the concierge's own `create_issue`,
+`label_issue_for_run` and `start_workload`, which check no `can_start`,
+daily cap or chain depth: an agent at its cap could hand off to Angie and
+have the run queued anyway. A handoff peer now starts work one hop deeper
+than the agent that handed off, so `max_chain_depth` counts handoffs as
+the hops they are, and a peer handed off to (directly or through other
+peers) by an agent with `can_start` is offered none of the unguarded
+start tools, whatever it declares itself; it keeps every other tool it
+had and is not made read-only.
+
+**A memory a person cannot read is now one they cannot edit, delete or read
+back.** `GET /v1/agents/{slug}/memories` has always left out the memories
+sourced from private channels the caller cannot read, but `PATCH` and
+`DELETE` on one memory checked only that it belonged to the agent in the
+path: a member who came by an id from a channel they had left, or were
+never in, could pin or rewrite that memory, soft-delete it, and read its
+full text back out of the `PATCH` response. Both routes now apply the same
+channel-readability filter the listing does, and a memory the caller may
+not read answers the `404 memory_not_found` an unknown id answers, so the
+refusal never confirms that the memory exists. Owners, admins and plain API
+clients still see and change every memory, and a channel's own members are
+unaffected.
+
+**A run the daemon lands is finished before its follow-ups are filed, so a
+restart during the filing pass leaves nothing parked.** Approving a merge
+gate or a review wait filed the run's follow-up issues between resolving
+the gate and marking the item done. That pass is network work (paging the
+repository's issues, one create per follow-up, a PR comment), and a
+restart, a crash or a stop whose grace ran out in the middle of it left a
+merged pull request with an item still `gated` or `awaiting_review`:
+recovery only settles open gates and holds and running items, the merged
+report was never delivered, the tracker issue kept its awaiting-merge
+label, and approving again was refused as already merged. The item is now
+marked done, its ledger closed and its report delivered before any
+follow-up is filed; the filing itself is unchanged and stays best-effort
+and idempotent.
+
+**A channel summary the daemon gives up on no longer holds the concierge
+pool.** The compaction job abandons a summary after its timeout, or when
+the daemon is stopping, but left the model call queued: at the default
+pool width of one it still ran later and held the concierge's only thread
+for up to `[concierge] timeout_s`, so with a slow provider abandoned
+summaries piled up and chat in every channel waited behind them. The job
+also reset the channel's summary session before each call, outside the
+session lane, so an abandoned call finishing later could write its session
+back and the next summary would resume it, growing across compactions.
+An abandoned summary is now cancelled, which frees its place in the pool
+when it has not started, and each summary is a stateless call that
+neither resumes nor stores a session.
+
+**A run's posts in a channel now reach the surfaces linked to it.** A
+channel linked to Slack, Mattermost or Discord promises that every message
+it shows is posted to each linked surface, and it kept that promise for
+what people and agents typed but not for what a run posted: the `plan`,
+`progress`, `review`, `notice` and `delivery` posts a run made appeared in
+the web channel and nowhere else, because the store never told its
+observers (the channel mirror among them) about them. A run's post is now
+observed like any other message once it is stored; a replay under a dedupe
+key already posted still stores nothing and is not mirrored again.
+
+**A `/stop` typed in chat now does what `POST /v1/channels/{id}/stop`
+does.** It cancelled the channel's live runs and nothing else, so with one
+run live and a second item queued the reply said "Stopping `r1`" and the
+queued item then started, and with nothing live it said nothing was running
+even though queued work was waiting. A bare `/stop` or `/cancel` now goes
+through the same channel stop the route uses: the channel's other turns
+are cancelled, the runs it asked for are cancelled, the work it queued is
+abandoned, and the channel is silenced for the same hour; the turn carrying
+the stop is left to answer, and its reply names each run, item and turn it
+stopped and says the channel is quiet. Who may stop is unchanged (anyone
+who may post in the channel), and exactly `@agent stop` still cancels that
+agent's runs alone. The route's response is unchanged; it also now cancels
+a live run whose channel the daemon knows only through the run's
+conversation, which the chat stop already reached.
+
+**Retiring the concierge sandbox no longer stalls every other turn.** When
+a failed turn condemned the concierge box, the last lease to come back
+removed it (two `sbx rm` calls, each up to the settle timeout and longer on
+a host where the backend is wedged) while holding the lease pool's lock, so
+until the removal returned every other turn waiting for a session could not
+even time out, and reads of a lease's generation blocked with it. The lock
+now only moves the pool to the next generation and takes the box's handles;
+the removal runs after it is released. Leases, their timeouts and generation
+reads stay responsive throughout, and the next provision still waits for the
+removal to finish, so the same name is never re-created into a teardown
+still in flight.
+
+**A code run always starts from a fresh checkout unless another code run
+on the same repository is live, and a daemon with every repository
+disabled never refreshes a checkout for a repo-less item.** With
+`max_concurrent_runs` above one, a code run admitted while a workload on
+the same repository was in flight skipped its pre-launch refresh: the
+skip counted every live run that named the repository, though a workload
+or tool run works from its own data directory and never from the
+checkout. The code run cloned a stale HEAD, redid work already merged and
+opened pull requests that conflicted with the current base. Only a live
+code run holds the checkout still now. Separately, an operator who paused
+issue polling by disabling every repository while keeping chat asks and
+scheduled workloads running found each such item fetching the first
+repository's checkout anonymously: the guard that keeps a repo-less item
+off the primary checkout fired only with an enabled repository, so a
+private forge answered every ask with a username prompt posted as a
+refresh warning. The guard now fires whenever a repository is declared at
+all; only a daemon with none falls through to the legacy daemon-wide
+workspace.
+
+**A message typed on a linked chat surface addresses the agents it
+mentions, is authorized by the link alone (live and after a restart), and a
+failure to accept it never posts internal error text to the surface.**
+`@builder review this` typed in a linked Slack, Mattermost or Discord
+surface was answered by Angie alone: a linked turn parsed no mentions, so
+the builder was never reached and `@builder stop` could not target it. A
+linked turn now resolves mentions exactly as a turn typed in Angie does:
+the agents and teams named become its targets and join the channel.
+Recovery after a restart also treated a linked turn differently from live
+acceptance: a mapped author who could not read the channel (a workspace
+member outside a private, linked channel) was answered while the daemon
+stayed up but interrupted after a restart; the link is the authorization
+on both paths now, so such a turn is recovered for its author. And when a
+linked message could not be accepted, the bridge posted the raw exception
+text (SQL fragments, file paths) back to the surface; it now repeats only
+a refusal worded for people and otherwise says to check the daemon logs.
+
+**A listening agent stays quiet once its channel is stopped, joins no
+roster it was refused, answers a guest as itself, and never delays the
+person it listens to.** Four follow-ups to ambient speaking and agent
+mentions. A stop, or a cancel of the turn, that landed while a listener's
+relevance call was still out did not stop it: the silence was checked
+before the call and the turn was accepted afterwards, and a cancelled
+turn's in-flight reply could still draw listeners in. The store now refuses
+an agent-started turn inside its own transaction when the channel is
+silenced or the parent turn is no longer live, and a stopped or cancelled
+turn offers nothing to listeners at all. A reply that named an agent added
+it to the channel's roster before the guardrails decided whether it could
+speak, and a roster failure dropped the mentions after it; an agent is now
+joined only once admitted, and a roster failure drops that mention alone. A
+listener's turn on a message from a guest on a linked surface was recorded
+as a person whose id was the agent's slug, which a restart then settled as
+interrupted; it is now the listener's own turn (`author_kind: "agent"`) and
+a restart runs it for the guest's stand-in, as it runs the guest's own
+turn. The interest prefilter matched the whole `ambient_window_messages`
+window, so one mention of an interest made every later message cost a
+classifier call, and the calls ran before the agents the person addressed
+answered; the prefilter now reads the new message alone (the classifier
+still reads the window) and classification runs after the addressed agents
+have answered, so it never holds up the person's turn.
+
+**Leaving the workspace ends every standing a member had.** Removing or
+deactivating a member deleted their workspace row and nothing else: they
+stayed in every channel, so a later invite handed back every private channel
+they had been in, a channel could lose its last active owner because a
+departed owner still counted as one, and `GET /v1/channels/{id}/members`
+kept listing them. Their invites outlived them too: an admin removed from
+the workspace, or an owner demoted, left invites behind that still admitted
+new members at the invite's full role. Now removal and deactivation take the
+user out of every channel in the same transaction (the longest-standing
+member still in the workspace takes over a channel they were the last owner
+of; a channel nobody else was in is left without a member), the last-owner
+rules count only members still active in the workspace, the unused invites
+the user created are withdrawn (a demotion withdraws those above the new
+role), each as a `workspace.invite.revoked` event with a `reason`, and an
+invite whose creator is no longer an active member admits nobody while one
+above its creator's current role grants that role instead.
+**A reply in a thread under a linked Slack or Mattermost channel reaches
+the channel, and a thread link no longer hides what it hears from the
+channel link.** On those services a thread is a surface of its own, and the
+bridge looked a threaded message up as its thread and then as its thread
+again, never as the channel the thread hangs under, so a reply under a
+mirrored post went to the daemon's concierge or nowhere. It now falls back
+to the link on the parent channel. A message accepted through a link to one
+thread also records that thread in its origin, and the mirror skips only
+the link it came through: a channel linked to both a Mattermost channel and
+one thread in it now shows the thread's messages at the top level, and
+still never echoes one back into its own thread. The API serves the thread
+as an optional `thread_id` on a message's `origin`.
+
+**A mirrored post says when its author came in over a bridge, and whether
+they are a guest.** A message that arrived over a bridge and is mirrored to
+another linked surface carried only `**name**`, so a guest calling
+themselves after a member read as that member. The header is now
+`**name (guest, via discord)**` for a guest and `**name (via slack)**` for a
+mapped member; a post that came over no bridge is unchanged.
+
+**A member removed from the workspace receives nothing further on an open
+event stream.** The SSE stream and the WebSocket re-check their token every
+minute and re-read the member behind it; a removed member's access token
+still verifies but names no member, and the stream treated "no member" as a
+plain API client and dropped every visibility condition, so until the token
+expired the removed person received every event in the workspace, private
+channels included. A stream or socket opened by a member is now pinned to
+that member: when the re-check finds the member gone, or the client no
+longer holds `runs:read`, it closes with `access_revoked` (`stream.closed`
+on SSE, `closing` and close code 4403 on the socket). A stream opened by a
+plain API client is unchanged.
+**Labelling an issue for a run from a channel grants that channel the
+runs that follow, never the runs that already existed.** A code item
+no channel asked for (an operator ran it from the host) resolved to the
+first turn anywhere that ever filed or labelled its issue, and a poll
+that re-queued the issue after a later label gave the whole item, every
+earlier run included, to the labelling channel: a member could label an
+existing issue from their own channel and read the files and events of
+runs filed from channels they cannot open. A turn now claims an item only
+when it precedes the item's creation, and a run answers to the channel
+that had asked for the issue by the time the run started.
+
+**A run's reply in its channel is credited only to an agent on that run.**
+A steer names the agent it is for, and the engine took that name at its word
+when it stamped the reply: the persona was checked against the run's team,
+but the name on the `chat.reply` event was not, and the chronicle used it as
+the post's author. Anyone allowed to steer a run tied to a channel could
+therefore have the run's reply appear as written by any agent, on the run or
+not, with the wording the steer asked for. The engine now stamps the agent
+only when the run's assignment has it, and the chronicle credits a stamped
+agent only when it is on the run's team; otherwise the reply is told in the
+run's own steering voice, as an unnamed steer always was. A task id the run
+does not have was already cleared before the reply and stays so.
+
+**An OIDC sign-in trusts a provider email only when the provider has checked
+it, and a member's typed-in address can no longer steer a colleague's first
+sign-in.** Any member could set their email to an address nobody held yet;
+with `link_verified_email` on, the colleague's first sign-in was then linked
+to that member's account and, with `owner_groups` / `admin_groups` set, the
+role sync raised that account on the same sign-in, password and all. A local
+account now records whether its address came from a path its holder could
+not steer (the installation's first registration, an invite addressed to it,
+or a provider claim marked verified; `PATCH /v1/users/me` clears it), a
+first sign-in links only to such an account, and the sign-in that links
+never changes the account's role. Accounts from before this release count as
+unverified, so their first sign-in creates a second account to fold in with
+`sbxloop users merge`. An `email` claim the provider has not verified is no
+longer stored either: a first sign-in gets the undeliverable
+`oidc-...@users.invalid` address and a later sign-in keeps the address on
+record, so an unverified claim cannot take the address the real person was
+invited by, in the directory or at registration.
+
+**An operator command or config change the concierge runs on a turn a
+person started answers to that person's role.** On a turn that may start
+work (a Code, Workload or Auto intent), `sbx_control` and `set_config` ran
+as the daemon operator whoever asked: a workspace `member` could have the
+agent pause, cancel, merge, release, reset the breaker, restart or grant
+rounds, or change the configuration, and the audit trail named the
+concierge. A turn now carries the principal the API already builds for a
+stop or a steer from chat, `sbx_control` dispatches with it (the control
+service refuses an operator's verb the role does not grant, by name), and
+`set_config` takes `daemon:manage` as the admin routes do; the read verbs
+and the read tools are unchanged. A chat bridge's control channel, which
+the operator restricted, stays fully trusted and says so explicitly; a turn
+with no principal keeps the read verbs alone.
+
+**A saved agent is changed only by the person who saved it, or a workspace
+owner or admin.** `PATCH /v1/agents/{slug}` and
+`POST /v1/agents/{slug}/archive` asked only for `collaboration:write`,
+which every member holds, so any member could rewrite another person's
+agent (and be the persona behind its next mention) or archive it, which
+the API cannot undo. Both now answer `403 agent_forbidden` to anyone but
+the creator, an owner or an admin, and a saved agent is recorded against
+the person, not the client they saved it from. A stored agent whose spec
+no longer validates (a later release tightened a rule) used to answer 500
+to every edit and archive; it now answers `422 invalid_agent` on `PATCH`
+and can still be archived.
+
 **A workload task that cannot know its hosts in advance can ask for any
 host.** A research plan whose task follows links it has not seen yet declared
 `needs.hosts = ["*"]`, the model refused it, and the retry guessed bare
@@ -783,6 +1089,29 @@ a code run's checkout, is `404` like any other id from elsewhere.
   or a stream's access re-check. The single local user sees no change.
 
 ### Fixed
+
+- **A chat turn a person starts is refused once the daily token budget is
+  spent.** Every turn was charged to `[daemon] daily_token_budget`, but
+  only a turn one agent started for another was ever refused by it: one
+  member's chat could spend the whole budget by noon, after which every
+  queued run in the workspace waited for midnight while that chat kept
+  spending. A turn a person starts, in a channel or on a bridge, now
+  passes the same admission before anything reaches the model; a refused
+  turn settles as failed and its reply names the day's spend against the
+  budget and when it resets. Stopping or steering work from chat spends
+  nothing and is never refused. Without a budget nothing changes.
+
+- **A failed rollback no longer hides the provisioning failure it was
+  cleaning up after.** When the worker install failed after `sbx create`
+  and the rollback `sbx rm` then failed too (the hung-box timeout), the
+  rollback warning was reported first and the telemetry dedupe marked the
+  install error along with it, because the timeout carried that error as
+  its implicit context. The ERROR `provision_failed` report that wrapped
+  the install error with the `sbx login` hint was then dropped as a
+  duplicate, and GlitchTip showed one WARNING titled by the cleanup. A
+  report now marks only its own exception, the causes it was raised
+  `from` and an exception group's members; an error it merely
+  interrupted stays unreported until something reports it.
 
 - **An issue the concierge files or labels is polled for at once.** Field
   (db, 2026-09-19): a code task asked for in chat was filed as a labelled

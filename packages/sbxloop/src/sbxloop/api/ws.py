@@ -18,7 +18,10 @@ envelope under ``event``), ``reply{id, ok, result | problem}``,
 A subscription is a cursor: events are read from the store by ``seq``
 whenever the hub says there may be more, so a slow client holds no
 buffer and blocks nobody. Access is re-checked on a schedule and the
-connection closes when the token no longer stands.
+connection closes when the token no longer stands, when the client has
+lost ``runs:read``, or when the member it was opened for is no longer in
+the workspace (``closing{reason: access_revoked}``): a member's socket
+never widens to a plain client's unfiltered view.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.projections import Views
 from sbxloop.api.replay import cursor_after, follow
+from sbxloop.api.routes.events import stream_still_allowed
 from sbxloop.daemon.controls.principal import WORKSPACE_ID
 from sbxloop.daemon.controls.results import ControlError
 
@@ -67,6 +71,9 @@ class _Session:
         self.run_id: str | None = None
         self.type_prefix: str | None = None
         self.last_check = ctx.clock()
+        #: Pinned at open: a member's socket closes rather than carry on
+        #: as a plain client once the member is gone.
+        self.opened_as_member = auth.member is not None
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.ws.send_text(json.dumps(frame, separators=(",", ":"), default=str))
@@ -214,11 +221,19 @@ class _Session:
             return True
         self.last_check = now
         try:
-            self.auth = await self.ctx.call(resolve_token, self.ctx, self.auth.token)
+            fresh = await self.ctx.call(resolve_token, self.ctx, self.auth.token)
         except Problem as exc:
             await self.send({"type": "closing", "reason": exc.code})
-            await self.ws.close(code=CLOSE_UNAUTHENTICATED)
+            await self.ws.close(
+                code=CLOSE_FORBIDDEN if exc.code == "access_revoked" else CLOSE_UNAUTHENTICATED
+            )
             return False
+        if not stream_still_allowed(fresh, opened_as_member=self.opened_as_member):
+            self.subscribed = False
+            await self.send({"type": "closing", "reason": "access_revoked"})
+            await self.ws.close(code=CLOSE_FORBIDDEN)
+            return False
+        self.auth = fresh
         return True
 
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 from sbxloop.agents.registry import AgentRegistry, default_registry
 from sbxloop.config import ScheduleConfig
@@ -53,6 +53,7 @@ from sbxloop.daemon.controls.results import (
     QueueOutcome,
     ReleaseOutcome,
     RepoResumeOutcome,
+    RepositoryLabelsOutcome,
     RepositoryOutcome,
     RestartOutcome,
     ResumeOutcome,
@@ -65,6 +66,7 @@ from sbxloop.daemon.controls.results import (
 )
 from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
+from sbxloop.errors import GithubOpsError, ProvisionError, SbxError, WorkerError
 from sbxloop.ghids import normalize_item_id
 
 
@@ -868,6 +870,42 @@ class ControlService:
             return RepositoryOutcome(verb="remove", repo=name, message=message)
 
         spec = self._spec("repo.remove", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def sync_repo_labels(
+        self, principal: Principal, repo: str, *, idempotency: tuple[str, str] | None = None
+    ) -> RepositoryLabelsOutcome:
+        """Give a registered repository every label the loop applies, and
+        say what it carries now. A repository that is already set up is
+        read and left alone."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> RepositoryLabelsOutcome:
+            try:
+                labels = self.loop.sync_repo_labels(repo, by=principal.attribution())
+            except KeyError as exc:
+                raise ControlError("unknown_target", f"{repo} is not registered here") from exc
+            except ValueError as exc:
+                raise ControlError("not_eligible", str(exc)) from exc
+            except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+                # Fail closed: the forge would not say what the repository
+                # carries — it refused, or its sandbox could not be had —
+                # so nothing is claimed about it, here or in the record.
+                raise ControlError(
+                    "source_unavailable",
+                    f"the forge would not answer for {repo}'s labels: {_message(exc)}",
+                ) from exc
+            return RepositoryLabelsOutcome(
+                repo=str(labels["repo"]),
+                state=cast(Literal["compliant", "incomplete"], labels["state"]),
+                expected=list(labels["expected"]),
+                present=list(labels["present"]),
+                created=list(labels["created"]),
+                missing=list(labels["missing"]),
+                checked_at=float(labels["checked_at"]),
+            )
+
+        spec = self._spec("repo.labels_sync", principal, "repo", repo, idempotency=idempotency)
         return self._record(spec, apply)
 
     def reset_breaker(

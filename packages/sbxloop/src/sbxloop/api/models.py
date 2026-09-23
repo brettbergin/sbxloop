@@ -268,6 +268,9 @@ class OidcProviderOut(ApiModel):
 
 
 class AuthProviders(ApiModel):
+    #: Server-enforced local-auth policy, bounded OIDC sessions and signed logout.
+    policy_version: int = 1
+    oidc_session_max_age_s: int | None = None
     #: Username and password sign-in (``/v1/auth/local/login``) is offered.
     local: bool
     #: The OpenID Connect provider, when one is configured and reachable.
@@ -341,6 +344,9 @@ class Item(ApiModel):
     #: The agent in each run role: the planned team once the item was
     #: dispatched, the roles asked for before. ``None`` when none were.
     assignment: dict[str, str] | None = None
+    #: A conversation the requesting viewer can open, when one exists.
+    #: This is a presentation link, not the item's execution admission.
+    channel_id: str | None = None
 
 
 class ItemDetail(Item):
@@ -438,6 +444,45 @@ class QueuePage(ApiModel):
     breaker_open: bool = False
 
 
+class RepositoryLabel(ApiModel):
+    """One label the loop applies to ``repository``'s issues: the name it
+    carries here (a ``[[vcs.repos]]`` rename included), what it is for,
+    and whether the repository has it."""
+
+    name: str
+    #: ``trigger``, ``in_progress``, ``failed``, ``completed``, ``blocked``,
+    #: ``gated``, ``workload`` — or ``followup``, the label put on the
+    #: issues a merged run files.
+    kind: str
+    description: str
+    #: Six hex digits, no ``#``: the color a label this daemon creates gets.
+    color: str
+    #: Null while the repository's labels are unknown: nobody has been
+    #: able to look, so nothing is claimed about this one either.
+    present: bool | None = None
+
+
+class RepositoryLabels(ApiModel):
+    """Whether a repository carries the labels sbxloop relies on.
+
+    ``compliant``: it carries every one of them, as of ``checked_at``.
+    ``incomplete``: ``missing`` names the ones it does not carry — a
+    label sync creates exactly those. ``unknown``: nobody has been able
+    to look yet (no reading has been taken, the forge would not answer,
+    or the configured names have changed since the last reading), which
+    is never reported as compliant.
+    """
+
+    state: Literal["compliant", "incomplete", "unknown"]
+    #: Every label name the loop applies to this repository.
+    expected: list[str] = Field(default_factory=list)
+    #: The ones it does not carry; empty while ``state`` is not ``incomplete``.
+    missing: list[str] = Field(default_factory=list)
+    labels: list[RepositoryLabel] = Field(default_factory=list)
+    #: When the labels were last read from the forge; null while unknown.
+    checked_at: str | None = None
+
+
 class Repository(ApiModel):
     id: str
     workspace_id: str = WORKSPACE_ID
@@ -456,6 +501,10 @@ class Repository(ApiModel):
     #: The registration's enabled state differs from what this daemon
     #: process polls: polling follows at the next start.
     restart_required: bool = False
+    #: Whether the repository carries the labels the loop applies, as of
+    #: the daemon's last reading (``[daemon] label_check_interval_s``) or
+    #: the last label sync.
+    labels: RepositoryLabels
 
 
 class RepositoryCreate(ApiModel):
@@ -889,6 +938,20 @@ class RestartRequest(ApiModel):
 class RepositoryResult(ApiModel):
     #: The repository as it stands after the command; None once removed.
     repository: Repository | None = None
+    message: str = ""
+    operation: OperationOut
+
+
+class RepositoryLabelSync(ApiModel):
+    """A label sync: the repository as it stands after it, what the sync
+    created, and — when the forge refused a creation — what is still
+    missing."""
+
+    repository: Repository | None = None
+    labels: RepositoryLabels
+    #: The labels this sync created; empty when the repository already
+    #: carried every one of them.
+    created: list[str] = Field(default_factory=list)
     message: str = ""
     operation: OperationOut
 

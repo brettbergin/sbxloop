@@ -51,6 +51,12 @@ class LocalUserRow(Base):
     oidc_subject: Mapped[str | None] = mapped_column(Text)
     avatar_url: Mapped[str | None] = mapped_column(Text)
     last_seen_at: Mapped[float | None] = mapped_column(REAL)
+    #: Whether ``email`` came from a path its holder could not steer to
+    #: someone else's address: the installation's first registration, an
+    #: invite addressed to it, or a provider claim marked verified. Cleared
+    #: when the person changes it themselves. A provider identity is linked
+    #: to a local account on a first sign-in only when this is set.
+    email_verified: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
 
 class WorkspaceMemberRow(Base):
@@ -392,6 +398,39 @@ class MessageArtifactRow(Base):
     media_type: Mapped[str] = mapped_column(Text, nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class ChannelInputFileRow(Base):
+    """An immutable user upload, independent of generated run artifacts.
+
+    The original lives under ``SbxloopHome.channel_files`` at a path derived
+    only from this opaque id. ``reserved`` rows have no committed bytes yet;
+    only the uploader may see them. A later message association will make an
+    ``uploaded`` file visible to the rest of its channel.
+    """
+
+    __tablename__ = "collaboration_input_files"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "uploader_id", "client_upload_id"),
+        Index("idx_collaboration_input_files_channel", "channel_id", "created_at"),
+        Index("idx_collaboration_input_files_workspace", "workspace_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    uploader_id: Mapped[str] = mapped_column(Text, nullable=False)
+    client_upload_id: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    declared_size: Mapped[int | None] = mapped_column(Integer)
+    size: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str | None] = mapped_column(Text)
+    position: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    uploaded_at: Mapped[float | None] = mapped_column(REAL)
+    deleted_at: Mapped[float | None] = mapped_column(REAL)
 
 
 class ChannelSummaryRow(Base):

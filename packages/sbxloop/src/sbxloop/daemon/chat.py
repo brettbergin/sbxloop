@@ -65,8 +65,9 @@ from sbxloop.daemon.chat_choices import (
     render_prose,
 )
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message, strip_mentions
-from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
+from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX, ConciergeReply
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
+from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.discord_format import (
     UNKNOWN_BACKEND,
     UNKNOWN_MODEL,
@@ -102,7 +103,7 @@ from sbxloop.log import get_logger
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
-    from sbxloop.daemon.concierge import Concierge, ConciergeReply
+    from sbxloop.daemon.concierge import Concierge
     from sbxloop_worker.protocol import HostToolResponse
 
 log = get_logger(__name__)
@@ -868,8 +869,12 @@ class ChatBridge(ABC):
         """The active link for the surface this message arrived on, or None.
 
         A thread is looked up as a thread first (``parent`` is the channel it
-        lives in), then the surface itself, so linking a whole channel and
-        linking one thread in it both work.
+        lives in), then as the channel it lives in, so linking a whole
+        channel and linking one thread in it both work: a reply in any
+        thread under a linked channel belongs to that channel's link. On a
+        service where a thread is a surface of its own (Slack, Mattermost)
+        ``channel_id`` is the thread's id and a whole-channel link is stored
+        under the parent, so the parent is what the fallback must ask for.
         """
         store = self._collaboration()
         if store is None or msg.channel_id is None:
@@ -881,6 +886,7 @@ class ChatBridge(ABC):
                 )
                 if threaded is not None:
                     return threaded
+                return store.link_for_surface(self.backend, str(msg.parent_channel_id), None)
             return store.link_for_surface(self.backend, str(msg.channel_id), None)
         except Exception:
             # A link nobody can read is not a reason to drop the message:
@@ -979,7 +985,7 @@ class ChatBridge(ABC):
         except Exception as exc:
             self.log.warning("chat.linked_turn_failed", channel=link.channel_id, exc_info=True)
             await self._ack_now(msg, ACK_FAILED)
-            await self._send(msg.channel, f"⚠ {_one_line(str(exc), 300)}", reply_to=msg.raw)
+            await self._send(msg.channel, f"⚠ {_linked_turn_refusal(exc)}", reply_to=msg.raw)
             return
         await self._ack_now(msg, ACK_ANSWERED)
 
@@ -1305,6 +1311,18 @@ class ChatBridge(ABC):
                 reply_to=msg.raw,
             )
             return
+        refusal = self._turn_budget_refusal()
+        if refusal is not None:
+            # The day's token budget is spent: the turn is refused before
+            # anything reaches the model, and the refusal is the answer,
+            # posted and acknowledged as a failed turn is.
+            self.log.info(
+                "chat.concierge_turn_refused", by=self._author_name(msg), reason="token_budget"
+            )
+            await self._post_concierge_reply(
+                msg, ConciergeReply("", ok=False, error=refusal), nudge=nudge
+            )
+            return
         turn = _ConciergeTurn(msg)
         behind = self.concierge.pending
         if behind > 0:
@@ -1344,6 +1362,11 @@ class ChatBridge(ABC):
                     text,
                     author=author,
                     author_id=msg.author_id,
+                    # The control channel is the operator's (restricted by
+                    # them, on a bridge with no authority model of its own),
+                    # so a turn from it acts with every capability, as
+                    # `!sbx` does: said explicitly, never assumed (#1274).
+                    principal=Principal.trusted(author, self.backend),
                     on_tool=on_tool,
                     via=self.backend,
                     # ...and the message id keys a workload the turn starts
@@ -1364,6 +1387,21 @@ class ChatBridge(ABC):
             return
         await finish_notes()
         await self._post_concierge_reply(msg, reply, nudge=nudge)
+
+    def _turn_budget_refusal(self) -> str | None:
+        """Why the workspace's daily token budget refuses a concierge turn
+        right now, worded for the person; ``None`` when the pool admits one,
+        or when the concierge has no pool or no budget is set. A turn from a
+        bridge answers no product channel, so it is admitted against the
+        workspace's budget alone."""
+        pool = getattr(self.concierge, "usage_pool", None)
+        if pool is None:
+            return None
+        now = time.time()
+        admission = pool.admit_turn(None, None, now)
+        if admission.ok:
+            return None
+        return str(pool.refusal_text(admission, now))
 
     async def _post_concierge_reply(
         self, msg: Inbound, reply: ConciergeReply, *, nudge: bool = False
@@ -2783,6 +2821,21 @@ def choice_answer(choice: Choice) -> str:
     """The text a selected choice sends to the concierge — identical to what
     a user typing that option's value would send."""
     return choice.value
+
+
+def _linked_turn_refusal(exc: BaseException) -> str:
+    """What a linked surface hears when the message it carried was not
+    accepted as a turn. A refusal the store worded for people is repeated;
+    anything else (a database or OS error, which may quote SQL or a path)
+    is for the daemon log, and the surface, which a link may open to
+    strangers, hears only that the message did not land."""
+    # The bridge reaches the API by duck typing everywhere else; the one
+    # type it names is loaded once an API context has raised it.
+    from sbxloop.api.collaboration import CollaborationError
+
+    if isinstance(exc, CollaborationError):
+        return _one_line(exc.message, 300)
+    return "I could not post that to the channel; check the daemon logs."
 
 
 def _tool_call_summary(name: str, args: dict[str, Any]) -> str:

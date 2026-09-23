@@ -69,7 +69,12 @@ async def list_items(
         )
         more = len(rows) > limit
         rows = rows[:limit]
-        return views.items(rows), rows, more
+        channels = views.visible_item_channels(rows, _auth.member)
+        data = [
+            item.model_copy(update={"channel_id": channels.get(row.item_id)})
+            for item, row in zip(views.items(rows), rows, strict=True)
+        ]
+        return data, rows, more
 
     data, rows, more = await ctx.call(read)
     next_cursor = (
@@ -90,7 +95,9 @@ async def get_item(
 
     def read() -> ItemDetail:
         views = Views(ctx)
-        return views.item_detail(views.item_by_public_id(item_id))
+        item = views.item_by_public_id(item_id)
+        channels = views.visible_item_channels([item], _auth.member)
+        return views.item_detail(item).model_copy(update={"channel_id": channels.get(item.item_id)})
 
     return await ctx.call(read)
 

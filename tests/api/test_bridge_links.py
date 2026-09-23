@@ -12,6 +12,7 @@ from typing import Any
 
 from tests.api.test_channel_access import _channel, _people, _user_id
 from tests.api.test_collaboration import FakeConcierge, bearer, register
+from tests.api.test_collaboration_recovery import settled
 
 
 def _link(api: Any, headers: dict[str, str], channel_id: str, **body: Any) -> dict[str, Any]:
@@ -211,6 +212,56 @@ def test_a_completed_turn_leaves_the_observers_nothing_to_mirror(api: Any) -> No
     assert heard == []
 
 
+def _run_post(api: Any, channel_id: str, key: str, text: str = "Kneading the dough") -> str | None:
+    """One post a run makes into ``channel_id``, keyed for replay."""
+    return api.ctx.collaboration.post_agent_update(
+        channel_id=channel_id,
+        author_agent="planner",
+        kind="progress",
+        text=text,
+        run_id="r1",
+        dedupe_key=key,
+        now=api.clock(),
+    )
+
+
+def test_a_run_post_into_a_linked_channel_reaches_the_observers_once(api: Any) -> None:
+    # A channel linked to a surface promised that every message it shows,
+    # a run's posts included, is mirrored there; the mirror hears about a
+    # message only through the observers.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    _link(api, owner, channel_id, backend="slack")
+    heard = _heard(api)
+
+    message_id = _run_post(api, channel_id, "r1:progress:1")
+
+    assert message_id is not None
+    assert [(m.id, m.channel_id, m.kind, m.post_kind, m.content, m.agent_slug) for m in heard] == [
+        (message_id, channel_id, "agent_update", "progress", "Kneading the dough", "planner")
+    ]
+    assert heard[0].author.kind == "agent"
+    assert heard[0].author.id == "planner"
+
+
+def test_a_run_post_replayed_under_its_key_is_not_heard_again(api: Any) -> None:
+    # A resumed run says a thing once in the channel, so the surfaces
+    # linked to it hear it once too.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    channel_id = _channel(api, owner)
+    _link(api, owner, channel_id, backend="slack")
+    heard = _heard(api)
+
+    first = _run_post(api, channel_id, "r1:progress:2")
+    again = _run_post(api, channel_id, "r1:progress:2")
+
+    assert first is not None
+    assert again == first
+    assert [m.id for m in heard] == [first]
+
+
 def test_a_queued_handoff_mirrors_the_message_it_appends(api: Any) -> None:
     api.ctx.concierge = FakeConcierge()
     owner = bearer(register(api))
@@ -339,3 +390,74 @@ def test_a_guest_turn_recovered_after_a_restart_runs_for_the_guest(api: Any) -> 
     user = recovered[turn.id]
     assert user.id != owner_id
     assert user.username == "stranger"
+
+
+def test_a_linked_message_addresses_the_agents_it_mentions(api: Any) -> None:
+    # A message on a linked surface addresses agents the way a native one
+    # does: "@software-dev review this" targets software-dev, joins it to
+    # the channel, and it is software-dev that answers.
+    api.ctx.concierge = FakeConcierge()
+    owner = bearer(register(api))
+    owner_id = _user_id(api, owner)
+    channel_id = _channel(api, owner)
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel_id,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=False,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    turn, _message = api.ctx.accept_bridge_turn(
+        link,
+        content="@software-dev review this",
+        author_user_id=owner_id,
+        display_name=None,
+        external_message_id="m1",
+    )
+    assert turn.targets == ("software-dev",)
+    assert [p["agent_slug"] for p in turn.participants] == ["software-dev"]
+    joined = store.list_participants(owner_id, channel_id)
+    assert [participant.agent_slug for participant in joined] == ["software-dev"]
+    assert settled(api.client, owner, channel_id, turn.id)["status"] == "completed"
+    messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=owner).json()
+    assert [m["agent_slug"] for m in messages if m["role"] == "assistant"] == ["software-dev"]
+
+
+def test_a_mapped_turn_recovered_after_a_restart_runs_for_its_author(api: Any) -> None:
+    # The link is the authorization: a member the private channel does not
+    # admit is answered live when they post on its linked surface, so a
+    # restart before the turn started must recover it for them, not drop it.
+    api.ctx.concierge = FakeConcierge()
+    owner, member, _admin = _people(api)
+    owner_id = _user_id(api, owner)
+    member_id = _user_id(api, member)
+    channel_id = _channel(api, owner, "private")
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=member).status_code == 404
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel_id,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=False,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    turn, _message = store.accept_linked_turn(
+        link,
+        content="hello",
+        author_user_id=member_id,
+        display_name=None,
+        external_message_id="m1",
+        now=api.clock(),
+    )
+    recovered = {queued.id: user for queued, user, _content in store.recover_turns(api.clock())}
+    assert turn.id in recovered
+    assert recovered[turn.id].id == member_id
+    kept = store.get_turn(None, channel_id, turn.id)
+    assert kept is not None and kept.status == "accepted"

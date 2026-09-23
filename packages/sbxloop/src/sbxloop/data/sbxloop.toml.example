@@ -379,7 +379,7 @@ service_memory = "2g"
 # credentials = ["weather"]  # [[credentials]] names it may be granted
 # interests = ["weather", "forecast"]  # topics it may speak up about unprompted
 # can_start = ["workload"]  # run kinds it may start itself: "code", "workload" (needs a role)
-# max_runs_per_day = 4  # cap on the runs it starts itself; unset: no own cap
+# max_runs_per_day = 4  # cap on the runs it starts itself, never above [agent_team] max_agent_runs_per_day; unset: that ceiling
 # aliases = ["weatherbot"]  # other @-names for it, never another agent's
 # enabled = true  # false hides it and routes nothing to it
 
@@ -403,7 +403,7 @@ service_memory = "2g"
 # count every start, an issue filed without queueing included, from the
 # moment it is made rather than from when a poll discovers it.
 # max_chain_depth = 2              # how deep a chain of agent-started work may go
-# max_agent_runs_per_day = 4       # per-agent daily cap; `[[agents]] max_runs_per_day` overrides
+# max_agent_runs_per_day = 4       # per-agent daily ceiling; `[[agents]] max_runs_per_day` may lower it
 #
 # What a run says in the channel that asked for it. Each post is made
 # under the name of the agent that did the work: the plan by the planner,
@@ -425,7 +425,7 @@ service_memory = "2g"
 # agent_turns_per_window = 6       # agent turns one agent may take there in that window
 # pair_cooldown_s = 60             # how long an agent waits before addressing the same agent again
 # ambient = false                  # let a participant in `ambient` mode speak unprompted
-# ambient_window_messages = 5      # recent messages the prefilter and the classifier read
+# ambient_window_messages = 5      # recent messages the relevance classifier reads
 # ambient_max_per_hour = 6         # how often one ambient agent may speak in a channel
 
 # The relevance classifier runs once per ambient participant per message
@@ -821,6 +821,10 @@ service_memory = "2g"
 #                                        # carrying trigger_label too is refused)
 # `sbxloop init-repo owner/name` creates all seven (plus [landing] followup_label)
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
+# label_check_interval_s = 3600.0  # how often a registered repository's labels are read
+#                                  # back, so a console can show whether it carries the
+#                                  # set (one listing per repo per interval, one repo per
+#                                  # tick, enabled repos only); 0 turns the reading off
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # warm_pairs = 0                  # sandbox sets kept booted and installed ahead of dispatch (0-4)
@@ -966,6 +970,7 @@ service_memory = "2g"
 # retention_days = 14              # mailbox rows pruned past this (0 keeps them)
 
 # [api]
+# local_auth_enabled = true        # false requires OIDC for all human sign-ins
 # The remote operations API, served by `sbxloop daemon` in-process: REST
 # under /v1 with generated OpenAPI, for a client that admits work, watches
 # it, steers it and fetches results without parsing CLI prose. Off by
@@ -1015,8 +1020,10 @@ service_memory = "2g"
 # allowed_groups = []              # only these groups may sign in; empty = anyone
 # default_role = "member"          # a new person's role: member or admin
 # auto_provision = true            # create an account on first sign-in
+# session_max_age_s = 28800        # absolute OIDC session lifetime; refresh cannot extend it
 # link_verified_email = false      # link a local account with the same verified
-#                                  # email; only if users cannot edit their email
+#                                  # email (verified on both sides, see the guide);
+#                                  # only if users cannot edit their email
 # request_timeout_s = 10           # each call to the provider
 
 # [concierge]

@@ -27,12 +27,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from sbxloop.daemon.controls.principal import CAPABILITIES, Capability
 from sbxloop.db import ensure_schema, open_engine
-from sbxloop.db.api_models import ClientRow, RefreshTokenRow, TokenRevocationRow
+from sbxloop.db.api_models import (
+    ClientRow,
+    OidcLogoutRow,
+    OidcSessionRow,
+    RefreshTokenRow,
+    TokenRevocationRow,
+)
+from sbxloop.db.collaboration_models import LocalUserRow, WorkspaceMemberRow
 from sbxloop.ids import _token
 
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_LEN = 2**14, 8, 1, 32
@@ -143,6 +150,45 @@ class AuthError(Exception):
         self.message = message
 
 
+@dataclass(frozen=True, slots=True)
+class OidcSession:
+    id: str
+    expires_at: float
+
+
+def _check_session(
+    session: Session,
+    client_id: str,
+    session_id: str | None,
+    now: float,
+    *,
+    local_auth_enabled: bool,
+    oidc_issuer: str | None,
+) -> OidcSession | None:
+    """Enforce current human policy on access and refresh, under the store lock."""
+    user = session.scalars(select(LocalUserRow).where(LocalUserRow.client_id == client_id)).first()
+    if user is not None:
+        member = session.scalars(
+            select(WorkspaceMemberRow).where(WorkspaceMemberRow.user_id == user.id)
+        ).first()
+        if not user.active:
+            raise AuthError("user_inactive", "the user behind this client is deactivated")
+        if member is None:
+            raise AuthError("access_revoked", "the user no longer belongs to the workspace")
+        if session_id is None and (not local_auth_enabled or user.auth_source == "oidc"):
+            raise AuthError("local_auth_disabled", "sign in through the identity provider")
+    if session_id is None:
+        return None
+    row = session.get(OidcSessionRow, session_id)
+    if row is None or row.client_id != client_id or row.revoked_at is not None:
+        raise AuthError("session_revoked", "the sign-in session is no longer valid")
+    if oidc_issuer is not None and row.issuer != oidc_issuer:
+        raise AuthError("session_revoked", "the sign-in provider is no longer configured")
+    if row.expires_at <= now:
+        raise AuthError("session_expired", "sign in again through the identity provider")
+    return OidcSession(str(row.id), float(row.expires_at))
+
+
 def _client(row: ClientRow) -> Client:
     return Client(
         id=str(row.id),
@@ -160,6 +206,120 @@ def _client(row: ClientRow) -> Client:
 class ApiAuthStore:
     def __init__(self, sessions: SessionSource) -> None:
         self.sessions = sessions
+
+    def create_oidc_session(
+        self,
+        client_id: str,
+        *,
+        issuer: str,
+        subject: str,
+        provider_sid: str | None,
+        identity_issued_at: float,
+        now: float,
+        ttl_s: int,
+    ) -> OidcSession:
+        record = OidcSession("oidc_" + _token(24), now + ttl_s)
+        with self.sessions.transaction() as session:
+            ended = session.scalar(
+                select(OidcLogoutRow.jti)
+                .where(
+                    OidcLogoutRow.issuer == issuer,
+                    OidcLogoutRow.issued_at >= identity_issued_at,
+                    OidcLogoutRow.expires_at > now,
+                    or_(OidcLogoutRow.subject.is_(None), OidcLogoutRow.subject == subject),
+                    or_(
+                        OidcLogoutRow.provider_sid.is_(None),
+                        OidcLogoutRow.provider_sid == provider_sid,
+                    ),
+                )
+                .limit(1)
+            )
+            if ended is not None:
+                raise AuthError("session_revoked", "the provider session ended; sign in again")
+            session.add(
+                OidcSessionRow(
+                    id=record.id,
+                    client_id=client_id,
+                    issuer=issuer,
+                    subject=subject,
+                    provider_sid=provider_sid,
+                    issued_at=now,
+                    expires_at=record.expires_at,
+                )
+            )
+        return record
+
+    def check_session(
+        self,
+        client_id: str,
+        session_id: str | None,
+        now: float,
+        *,
+        local_auth_enabled: bool,
+        oidc_issuer: str | None,
+    ) -> OidcSession | None:
+        with self.sessions.read() as session:
+            return _check_session(
+                session,
+                client_id,
+                session_id,
+                now,
+                local_auth_enabled=local_auth_enabled,
+                oidc_issuer=oidc_issuer,
+            )
+
+    def refresh_session(
+        self, token: str, *, now: float, oidc_issuer: str | None
+    ) -> OidcSession | None:
+        """The durable OIDC session behind a freshly issued refresh token."""
+        with self.sessions.read() as session:
+            row = session.scalars(
+                select(RefreshTokenRow).where(RefreshTokenRow.token_hash == _digest(token))
+            ).first()
+            if row is None or row.revoked_at is not None or row.expires_at <= now:
+                raise AuthError("invalid_grant", "the refresh token is not valid")
+            if not row.family_id.startswith("oidc_"):
+                return None
+            return _check_session(
+                session,
+                str(row.client_id),
+                str(row.family_id),
+                now,
+                local_auth_enabled=False,
+                oidc_issuer=oidc_issuer,
+            )
+
+    def provider_logout(
+        self,
+        *,
+        issuer: str,
+        jti: str,
+        subject: str | None,
+        provider_sid: str | None,
+        issued_at: float,
+        now: float,
+        replay_until: float,
+    ) -> None:
+        """Apply a verified logout once, atomically with durable replay protection."""
+        with self.sessions.transaction() as session:
+            if session.get(OidcLogoutRow, (issuer, jti)) is not None:
+                return
+            session.add(
+                OidcLogoutRow(
+                    issuer=issuer,
+                    jti=jti,
+                    subject=subject,
+                    provider_sid=provider_sid,
+                    issued_at=issued_at,
+                    expires_at=replay_until,
+                )
+            )
+            conditions = [OidcSessionRow.issuer == issuer, OidcSessionRow.revoked_at.is_(None)]
+            if subject is not None:
+                conditions.append(OidcSessionRow.subject == subject)
+            if provider_sid is not None:
+                conditions.append(OidcSessionRow.provider_sid == provider_sid)
+            session.execute(update(OidcSessionRow).where(*conditions).values(revoked_at=now))
 
     # -- clients --------------------------------------------------------------------
 
@@ -266,7 +426,15 @@ class ApiAuthStore:
             )
         return token
 
-    def rotate_refresh(self, token: str, *, now: float, ttl_s: int) -> tuple[Client, str]:
+    def rotate_refresh(
+        self,
+        token: str,
+        *,
+        now: float,
+        ttl_s: int,
+        local_auth_enabled: bool = True,
+        oidc_issuer: str | None = None,
+    ) -> tuple[Client, str]:
         """Exchange a refresh token for a new one in the same family.
 
         A token already used is a reuse: the whole family is revoked (in a
@@ -310,6 +478,18 @@ class ApiAuthStore:
             client_row = session.get(ClientRow, str(row.client_id))
             if client_row is None or client_row.revoked_at is not None:
                 raise AuthError("invalid_grant", "the refresh token is not valid")
+            # The prefix distinguishes an OIDC family even after old session
+            # records are pruned; a missing record must never become local auth.
+            session_id = str(row.family_id) if str(row.family_id).startswith("oidc_") else None
+            bound = _check_session(
+                session,
+                str(row.client_id),
+                session_id,
+                now,
+                local_auth_enabled=local_auth_enabled,
+                oidc_issuer=oidc_issuer,
+            )
+            expires_at = min(now + ttl_s, bound.expires_at) if bound else now + ttl_s
             session.execute(
                 insert(RefreshTokenRow).values(
                     id=fresh_id,
@@ -317,7 +497,7 @@ class ApiAuthStore:
                     family_id=row.family_id,
                     token_hash=_digest(fresh),
                     issued_at=now,
-                    expires_at=now + ttl_s,
+                    expires_at=expires_at,
                 )
             )
             row.used_at = now
@@ -328,6 +508,11 @@ class ApiAuthStore:
 
     def _revoke_family(self, family_id: str, now: float) -> None:
         with self.sessions.transaction() as session:
+            session.execute(
+                update(OidcSessionRow)
+                .where(OidcSessionRow.id == family_id, OidcSessionRow.revoked_at.is_(None))
+                .values(revoked_at=now)
+            )
             session.execute(
                 update(RefreshTokenRow)
                 .where(
@@ -371,6 +556,8 @@ class ApiAuthStore:
             for statement in (
                 delete(TokenRevocationRow).where(TokenRevocationRow.expires_at < now),
                 delete(RefreshTokenRow).where(RefreshTokenRow.expires_at < now),
+                delete(OidcLogoutRow).where(OidcLogoutRow.expires_at < now),
+                delete(OidcSessionRow).where(OidcSessionRow.expires_at < now),
             ):
                 gone += int(getattr(session.execute(statement), "rowcount", 0) or 0)
             return gone

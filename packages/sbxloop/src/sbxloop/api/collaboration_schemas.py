@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -11,6 +12,10 @@ from sbxloop.api.models import ApiModel
 
 WorkspaceRole = Literal["owner", "admin", "member"]
 AuthSource = Literal["local", "oidc"]
+
+#: User ids read ``usr_<token>`` and are public, so a username may not
+#: spell one: no selector an operator types may name two accounts.
+_USERNAME_LIKE_ID = re.compile(r"^\s*usr_", re.IGNORECASE)
 
 
 class LocalRegisterRequest(ApiModel):
@@ -22,6 +27,13 @@ class LocalRegisterRequest(ApiModel):
     #: Required for every user after the installation's first: the token of
     #: a workspace invite, which sets the new user's role.
     invite_token: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def _not_a_user_id(cls, value: str) -> str:
+        if _USERNAME_LIKE_ID.match(value):
+            raise ValueError("a username may not begin with usr_")
+        return value
 
 
 class LocalLoginRequest(ApiModel):
@@ -359,6 +371,25 @@ class ChannelUpdate(ApiModel):
     visibility: ChannelVisibility | None = None
 
 
+class ExternalWorkSourceOut(ApiModel):
+    """Known admission provenance; an absent source link is not invented."""
+
+    kind: str
+    repository: str | None = None
+    url: str | None = None
+
+
+class ExternalWorkOut(ApiModel):
+    """Durable job identity and import baseline for a job conversation."""
+
+    work_id: str
+    source: ExternalWorkSourceOut
+    system_created: bool
+    historical: bool
+    read_baseline: int = Field(default=0, ge=0)
+    state: str | None = None
+
+
 class ChannelOut(ApiModel):
     id: str
     workspace_id: str
@@ -372,10 +403,12 @@ class ChannelOut(ApiModel):
     created_by: str | None = None
     silenced_until: float | None = None
     #: Messages past the reader's last read sequence. Null for a caller
-    #: with no channel membership to measure against.
+    #: with no channel membership to measure against, except automatically
+    #: created job conversations whose import baseline applies to all viewers.
     unread_count: int | None = None
     #: The caller's role in the channel; ``null`` when not a member.
     my_role: ChannelRoleName | None = None
+    external_work: ExternalWorkOut | None = None
 
 
 class ChannelPage(ApiModel):
@@ -422,6 +455,15 @@ class ArtifactRefOut(ApiModel):
     size: int
 
 
+class InputFileRefOut(ApiModel):
+    """A user-supplied original stored privately for this channel."""
+
+    id: str
+    name: str
+    size: int
+    sha256: str
+
+
 class ChannelWorkOut(ApiModel):
     item_id: str
     #: The turn the work hangs on; null for a run a channel asked for
@@ -448,6 +490,32 @@ class ChannelArtifactPage(ApiModel):
     data: list[ArtifactRefOut]
 
 
+class ChannelJobOut(ApiModel):
+    """Additive all-jobs view, including real runs without a work item."""
+
+    work_id: str
+    channel_id: str
+    item_id: str | None = None
+    turn_id: str | None = None
+    agent_slug: str | None = None
+    title: str
+    kind: str
+    state: str
+    run_id: str | None = None
+    stage: str | None = None
+    item_revision: int = 0
+    run_revision: int | None = None
+    item_actions: list[str] = Field(default_factory=list)
+    run_actions: list[str] = Field(default_factory=list)
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    source: ExternalWorkSourceOut
+    created_at: str
+    updated_at: str
+    historical: bool = False
+    #: The durable attempt remains visible after its execution record is gone.
+    unavailable: bool = False
+
+
 class AuthorOut(ApiModel):
     """Who wrote a message: a person, an agent, or sbxloop itself."""
 
@@ -460,11 +528,13 @@ BridgeBackendName = Literal["discord", "slack", "mattermost"]
 
 
 class MessageOriginOut(ApiModel):
-    """The bridge surface a message arrived on, for a message that did."""
+    """The bridge surface a message arrived on, for a message that did.
+    ``thread_id`` is set when it came in through a link to one thread."""
 
     backend: str
     surface_id: str
     external_message_id: str | None = None
+    thread_id: str | None = None
 
 
 class BridgeOut(ApiModel):
@@ -532,6 +602,7 @@ PostKindName = Literal["plan", "progress", "review", "delivery", "reply", "notic
 
 class MessageOut(ApiModel):
     id: str
+    client_message_id: str | None = None
     channel_id: str
     turn_id: str | None
     sequence: int
@@ -546,10 +617,17 @@ class MessageOut(ApiModel):
     #: Files this message carries, readable by anyone who can read the
     #: channel (feature ``collaboration.message_artifacts``).
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    input_files: list[InputFileRefOut] = Field(default_factory=list)
     #: Where the message arrived from, when it came over a bridge.
     origin: MessageOriginOut | None = None
     #: Set on the ``agent_update`` messages a run posts; null otherwise.
     post_kind: PostKindName | None = None
+    #: A real run identity, including posts with no originating item or turn.
+    source_run_id: str | None = None
+    #: Stable job identity anchors queued work before its first run exists.
+    source_work_id: str | None = None
+    #: Imported history remains silent when a client first discovers it.
+    historical: bool = False
 
 
 class ReactionSet(ApiModel):
@@ -558,7 +636,8 @@ class ReactionSet(ApiModel):
 
 
 class TurnCreate(ApiModel):
-    content: str = Field(min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
+    file_ids: list[str] = Field(default_factory=list, max_length=16)
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)

@@ -61,7 +61,9 @@ concierge, operation controls, schedules, events, artifacts, and usage instead
 of starting another scheduler or opening another SQLite writer.
 
 The installation has at most one local user. `POST /v1/auth/local/register`
-creates that profile and its scoped API principal; `/v1/auth/local/login` returns
+creates that profile and its scoped API principal; a `username` beginning
+with `usr_` is refused (`422 invalid_request`), since that is how the user
+ids in `GET /v1/users` read and no name may stand in for one; `/v1/auth/local/login` returns
 the same short-lived access and rotating refresh tokens as the existing client
 credential flow. Existing machine clients and all existing routes keep their
 original behavior.
@@ -147,7 +149,23 @@ stays archived).
 | `PATCH` | `/v1/agents/{slug}`         | `expected_revision` and changed fields | 200, the agent at the next revision |
 | `POST`  | `/v1/agents/{slug}/archive` | none                                   | 200, the agent with `enabled` false |
 
-All three need `collaboration:write`. A saved agent never takes a slug or an
+All three need `collaboration:write`. An agent belongs to the person who
+saved it: `PATCH` and archive are theirs and a workspace owner's or
+admin's, and anyone else answers 403 `agent_forbidden`. Letting an agent
+start work on its own is the operator's to grant: a `POST` whose
+`can_start` is not empty, or a `PATCH` whose `can_start` adds a kind the
+agent does not already have, needs a workspace owner or admin (for a plain
+API client, `daemon:manage`) and answers 403 `agent_forbidden` for anyone
+else, with nothing saved; the agent's owner may still narrow or clear
+`can_start`, or send it back unchanged. `max_runs_per_day` is saved as
+given, and `[agent_team] max_agent_runs_per_day` stays the ceiling where
+runs start: the agent's effective daily cap is the lower of the two, so a
+member lowers their agent's cap but never raises it above the operator's.
+Agents declared in `sbxloop.toml` are not subject to either rule; they are
+read-only here. A saved agent
+whose stored spec no longer validates (a later release tightened a rule)
+is left out of listings, answers 422 `invalid_agent` on `PATCH`, and can
+still be archived. A saved agent never takes a slug or an
 alias a built-in, configured or other saved agent already has, and a body
 naming a key the spec does not have (a host list, an egress rule) is
 refused: egress stays the operator's `[policy]`. A spec that names an
@@ -257,6 +275,47 @@ The association is durable turn data, independent of event retention; unrelated
 repositories with the same issue number do not match. No source polling or
 runner behavior changes.
 
+### Conversations for externally started work
+
+`collaboration.external_work` advertises automatic conversations for jobs
+known to the connected daemon, including issue labels, schedules, chat
+bridges, API admissions and standalone persisted runs. A job without an
+existing conversation gets a workspace-visible channel. An existing
+association keeps its channel and access rules. Repeated attempts at the
+same issue share a conversation; separate schedule occurrences do not.
+The association is presentation data: it does not change the item's
+admission channel, assignment, scheduling, accounting or source delivery.
+
+Clients with this feature use `GET /v1/channels/{id}/jobs`, a list of
+attempt snapshots. Each has a stable `work_id`, optional real `item_id`,
+`run_id` and `turn_id`, state, source, revision, available actions and
+artifacts. A run with no admitted item has no item controls. The response
+also includes work awaiting Code issue admission. The existing `/work`
+contract is unchanged and remains the fallback for older daemons.
+An attempt whose execution record was removed remains listed with
+`unavailable: true`, its recorded metadata, and no controls or artifacts.
+Item list/detail responses provide a nullable `channel_id` only when the
+viewer can read that conversation.
+
+System-created channel summaries include `external_work` metadata for
+sidebar status and source links without loading each transcript. Opening,
+progress and result messages identify the system as their author and carry
+`source_work_id`, an optional `source_run_id`, and `historical`; they do not
+invent a human turn. Channel chat and live-run steering use the ordinary
+permission checks. Events and artifacts resolve through the attempt's own
+channel, so admitting a later attempt to a private channel does not move
+an earlier attempt's history or expose the later attempt there.
+
+The initial import includes unfinished work and terminal work from the
+last 30 days. Imported messages are quiet history and do not add unread
+counts. New jobs and activity remain unread until read. The scoped event
+`collaboration.external_work.attention` carries `channel_id`, `work_id`,
+optional `run_id`, a durable `attention_id`, `kind` (`work`, `failure` or
+`action_required`), `title`, `body` and `historical: false`; clients apply
+their channel preferences and browser-notification opt-in. Reconciliation
+and event replay do not resend the same transition. Deleting a generated
+channel hides it without recreating it on the next reconciliation.
+
 ### Admitting work for named agents
 
 `POST /v1/items` takes three optional fields on an `issue` or `workload`
@@ -291,9 +350,10 @@ Angie as the lead. An item that names its channel is delivered there even when
 its key names no message in it (as part of the channel's latest turn when it
 was admitted), and never to a channel other than its own; that holds for an
 issue (`code`) admission too, whether or not any turn in the channel named the
-issue. A channel that has had no turn yet has nowhere to put a result, so the
-delivery is skipped and the daemon log says why
-(`api.work_delivery_skipped`). A work result is credited to the item's lead
+issue. With `collaboration.external_work`, a channel that has had no turn
+yet receives system-authored progress and results through the job projection.
+Older daemons skip that delivery and log `api.work_delivery_skipped`.
+A turn-associated work result is credited to the item's lead
 when it has one, and to the participant that asked otherwise.
 
 A finished workload or tool run's files are catalogued before its work result
@@ -480,7 +540,10 @@ caller; the text is cut to `[memory] max_item_chars`, and past
 `[memory] max_items_per_agent` the agent's oldest unpinned memory is dropped
 (`409 memory_full` when every one is pinned). `PATCH {content?, pinned?, expected_revision}`
 answers `409 revision_conflict` for a stale revision. `DELETE` forgets the
-memory (a soft delete). With `[memory] enabled = false`, `POST` answers
+memory (a soft delete). Both read the caller's channel access first: a
+memory from a private channel the caller cannot read answers the
+`404 memory_not_found` an unknown id answers, so it is neither changed,
+forgotten nor read back. With `[memory] enabled = false`, `POST` answers
 `409 memory_disabled`. Changes write `agent.memory.created`, `.updated` and
 `.deleted` events that name the memory, its agent and its source channel but
 never its text.
@@ -588,6 +651,27 @@ forge, or an unknown forge is `422 invalid_argument`; an unknown id is `404`.
 Every entry of `GET /v1/repositories` now carries `source` (`config` for an
 imported entry, `api`), `created_by`, `created_at` and `restart_required`.
 
+Every entry also carries `labels`: whether the repository carries the labels
+the loop applies — the seven lifecycle labels under this repository's own
+names and the follow-up label. `state` is `compliant` (it carries every one
+of them, as of `checked_at`), `incomplete` (`missing` names the ones it does
+not), or `unknown` — nobody has been able to look yet, the forge would not
+answer, or the configured names have changed since the last look. `unknown`
+is never reported as compliant, and each entry of `labels.labels` carries
+`present: null` under it rather than a guess. The daemon reads one
+repository's labels back per tick, at most one reading per repository per
+`[daemon] label_check_interval_s`, so the answer is current without a client
+asking the forge anything.
+
+`POST /v1/repositories/{id}/labels/sync` (`daemon:manage`) creates the ones
+the repository is missing and answers `200 {repository, labels, created, message, operation}` with `repo.labels_sync` recorded — the same work
+`sbxloop init-repo` does from the host, through the daemon's own forge
+sandbox. It reads the repository first, so a repository that already carries
+every label is left untouched and reports itself compliant with `created: []`. A daemon with no forge sandbox refuses with `409 not_eligible` naming
+the command that works from the host; a forge that would not answer is `503 source_unavailable`, and the last reading stands, dated, rather than being
+overwritten with a guess. The socket takes it as `repository.labels_sync`
+(target `repo_…`).
+
 A registration takes effect in what the daemon *admits* at once: intake,
 the engine's narrowing, the concierge and this catalog all answer for it.
 What the daemon *polls* was built at start, so a registration that changes
@@ -640,6 +724,23 @@ member leaves their client with no capability and revokes its refresh
 tokens. The refresh tokens are revoked in the same database transaction as
 the membership change, so either both happen or neither does.
 
+Removing or deactivating a member also ends every standing they had:
+
+- They are taken out of every channel. A private channel they were in stays
+  hidden after a later invite until someone adds them again. Where they were
+  a channel's last owner, its longest-standing member still in the workspace
+  becomes the owner; a channel nobody else was in is left without a member.
+- The invites they created and nobody had used yet are withdrawn. Demoting a
+  member withdraws the unused invites they created above the new role. Each
+  withdrawal is a `workspace.invite.revoked` event whose `reason` is
+  `creator_removed`, `creator_deactivated` or `creator_demoted`.
+
+An invite stands only while its creator does: one whose creator is no longer
+an active member admits nobody (`403 invite_invalid`), and one above its
+creator's current role grants that role instead. An invite a plain operator
+client created (`created_by` of `client:<id>`) is not measured against a
+membership.
+
 An invite's token appears only in the creation response; the daemon keeps
 its SHA-256. `ttl_hours` defaults to 72 and may be 1 to 720. An invite with
 an `email` admits only a registration with that email, compared without
@@ -685,7 +786,8 @@ The user must be an active workspace member (`404 user_not_found`). Posting a
 current member with an explicit `role` other than theirs changes that role in
 place and answers `200`; with no `role`, or the role they already have, it is
 `409 already_channel_member`. The last channel owner cannot step down (`409 last_channel_owner`), nor leave or be removed while anyone else remains: make
-another member an owner first. Changes record `collaboration.member.added`,
+another member an owner first. Only channel members still active in the
+workspace count, as another owner or as someone left behind. Changes record `collaboration.member.added`,
 `collaboration.member.updated` and `collaboration.member.removed` events with
 `{channel_id, user_id}`.
 
@@ -773,7 +875,10 @@ control service with run control scoped to this channel's own work, so a
 plain member who may post stops them too, the audit record names that
 member, and nothing another channel asked for is touched. Gated work and
 work awaiting review is left alone: it already waits on a person, and
-dropping it would discard a finished result.
+dropping it would discard a finished result. A bare `/stop` or `/cancel`
+typed in the channel is this same stop (the turn carrying it is left to
+answer, and its reply names what was cancelled, abandoned and silenced);
+see "Steering and stopping from chat" below.
 Silence quiets the agents without cancelling anything. Channel-level
 permission for stop, resume and silence is **post**, not manage: a person
 watching agents go somewhere they should not is the guard that matters, and
@@ -817,8 +922,11 @@ it does run. Commands on the control channel, run-thread steering and an
 unlinked surface behave exactly as they did. Every message appended to the
 channel — a person's, an agent's, a run's delivery, a failed turn's error,
 one agent's request to another — is posted back to each linked surface
-under a `**name**` header, except to the surface it arrived on, so two
-linked services mirror each other without a loop.
+under a `**name**` header, except to the link it arrived through, so two
+linked services mirror each other without a loop. A message that itself
+came in over a bridge is mirrored under `**name (via slack)**`, and a
+guest's under `**name (guest, via slack)**`: a guest's name is their own
+claim, not a member's.
 
 A message that arrived over a bridge carries `origin`:
 
@@ -826,6 +934,7 @@ A message that arrived over a bridge carries `origin`:
 { "backend": "discord", "surface_id": "C123", "external_message_id": "998" }
 ```
 
+`thread_id` is set as well when it came in through a link to one thread.
 Angie shows it as a "via" badge; it is `null` for everything typed here.
 
 Who somebody is on a bridge is theirs to prove, once:
@@ -843,6 +952,21 @@ short reply pointing at that command — unless the link was created with
 under the name they use on that service. A map is only as good as the
 membership behind it: an account removed from the workspace or deactivated
 is unmapped again, and the link's `allow_guests` rule decides afresh.
+
+The link is the authorization. A channel linked to a surface accepts what
+anyone the bridge admits types there, a mapped account or a guest where the
+link allows one, and the turn runs for that person without the `post` check
+a turn started here makes: the channel's owner linked the surface, so
+whoever may post on it may post in the channel, whether or not they could
+open it in Angie. A restart keeps the same rule: an accepted turn whose
+message arrived over a bridge is recovered for its author, mapped or guest,
+rather than dropped because that author cannot read the channel. Mentions
+work as they do here: `@slug` in a linked message targets that agent and
+joins it to the channel, and it is that agent that answers (so `@slug stop`
+reaches it too); a message naming nobody is answered by Angie. When a
+linked message cannot be accepted, the surface hears a refusal only if it
+was worded for people (a channel that is gone, say); any other failure is
+reported as "check the daemon logs" and detailed there alone.
 
 ## Clients and tokens
 
@@ -990,6 +1114,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
 | `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
 | `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `POST`   | `/v1/repositories/{id}/labels/sync`          | `daemon:manage`        | Create the labels the loop applies that the repository is missing     |
 | `GET`    | `/v1/repositories/available`                 | owner role             | What the host's forge credential can see, to pick one to register     |
 | `POST`   | `/v1/repositories`                           | `daemon:manage`        | Register a repository; polled from the next start                     |
 | `PATCH`  | `/v1/repositories/{id}`                      | `daemon:manage`        | Enable, disable or re-base a registered repository                    |
@@ -1051,7 +1176,7 @@ also the cursor.
    `Last-Event-ID` (or `?after=`), or `subscribe{after}` on `/v1/ws`.
 4. On a disconnect, reconnect from the last id. The stream says why it
    closed (`stream.closed` / `closing{reason}`: `daemon_stopping`,
-   `client_revoked`, `token_expired`).
+   `client_revoked`, `token_expired`, `access_revoked`).
 
 History is kept for `[api] replay_retention_s`; a cursor older than what
 remains is `410 cursor_expired` with a pointer to the snapshot, never a
@@ -1085,19 +1210,23 @@ In a channel, `collaboration.mention_steering` means a mention of an agent
 already working live work there is taken as direction for that run instead
 of starting a fresh answer: the turn's `steered_run_id` names the run. The
 mention has to be unambiguous -- one live run in the channel with that agent
-on it -- or it stays an ordinary turn. Stopping stays explicit: `/stop`,
-`/cancel`, or exactly `@agent stop` cancels the channel's runs (that agent's
-alone, for the third), through the same cancel the API's
-`POST /v1/runs/{id}/cancel` uses. A message that merely argues for stopping
-is steering, not a stop.
+on it -- or it stays an ordinary turn. Stopping stays explicit. A bare `/stop` or
+`/cancel` does exactly what `POST /v1/channels/{id}/stop` does: it cancels
+the channel's other turns, cancels the runs the channel asked for, abandons
+the work items it queued that have not started, and silences the channel
+for the same hour; the reply names each run, item and turn it stopped, or
+says nothing was running or queued, and that the channel is quiet. Exactly
+`@agent stop` is narrower: it cancels that agent's runs in the channel and
+nothing else, through the same cancel the API's `POST /v1/runs/{id}/cancel`
+uses. A message that merely argues for stopping is steering, not a stop.
 
 Both act as the person who wrote the message. A steer takes the
 capabilities their workspace role grants (`runs:steer`, which a `member`
 holds). A stop takes the rule `POST /v1/channels/{id}/stop` takes: anyone
-who may post in the channel may stop the runs that channel asked for,
+who may post in the channel may stop the work that channel asked for,
 without `runs:control`, so a plain `member` may stop as well as steer. The
 cancel is recorded in the person's name and reaches only that channel's
-runs; someone who may not post there is told nothing was stopped. Only a
+work; someone who may not post there is told nothing was stopped. Only a
 message the person wrote steers or stops: a turn another agent started
 never does, and an agent reached through another agent's handoff answers
 the request it was handed.
@@ -1125,7 +1254,12 @@ and `has_more` means what it always meant:
 A live subscription moves its cursor past events its member may not see,
 so it does not scan them again. Membership changes apply from the next
 read (the stream and the socket re-read the member when they re-check the
-token). `GET /v1/events` and `GET /v1/events/stream` accept
+token). A stream or socket a member opened is pinned to that member: once
+they are removed from the workspace, or their client loses `runs:read`, it
+closes with `access_revoked` at the next re-check (the socket with close
+code 4403) and delivers nothing further, even while their access token
+still verifies; it never widens to the unfiltered view a plain API client
+gets. `GET /v1/events` and `GET /v1/events/stream` accept
 `channel_id=<chn_...>` to follow one channel.
 
 ## Errors
@@ -1137,7 +1271,7 @@ request's `X-Request-Id`, and the fields a client needs to act:
 | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                  |
 | 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                     |
-| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                                         |
+| 403    | `forbidden` (with `capability`), `agent_forbidden`, `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                      |
 | 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                                             |
 | 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict` |
 | 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                          |

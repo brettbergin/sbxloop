@@ -309,3 +309,56 @@ def test_deleting_channel_stops_remaining_team_members(api: Any) -> None:
     assert api.ctx.turns.wait_idle(timeout=5)
     assert len(concierge.calls) == 1
     assert after_calls == []
+
+
+def test_restart_runs_an_unprompted_answer_to_a_guest_for_the_guest(api: Any) -> None:
+    """A listener's turn on a guest's message is the listener's own turn,
+    with the guest's message as its input. A restart runs it, and runs it
+    for the same stand-in the guest's own turn runs for: never for the
+    channel's owner, whose identity would answer a stranger, and never as
+    an interrupted turn."""
+    from sbxloop.api.collaboration import Author
+
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    owner_id = str(api.client.get("/v1/users/me", headers=headers).json()["id"])
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    store = api.ctx.collaboration
+    link = store.create_channel_link(
+        None,
+        channel,
+        backend="slack",
+        surface_id="C1",
+        thread_id=None,
+        allow_guests=True,
+        created_by=owner_id,
+        now=api.clock(),
+    )
+    parent, message = store.accept_linked_turn(
+        link,
+        content="the bread is rising",
+        author_user_id=None,
+        display_name="stranger",
+        external_message_id="m1",
+        now=api.clock(),
+    )
+    unprompted = store.accept_agent_turn(
+        channel,
+        message.id,
+        author=Author("agent", "baker"),
+        targets=("baker",),
+        trigger="ambient",
+        parent_turn_id=parent.id,
+        chain_depth=1,
+        now=api.clock(),
+    )
+    assert unprompted is not None
+
+    recovered = {queued.id: user for queued, user, _content in store.recover_turns(api.clock())}
+
+    assert set(recovered) == {parent.id, unprompted.id}
+    assert recovered[unprompted.id].username == "stranger"
+    assert recovered[unprompted.id].id != owner_id
+    # Queued to run, not settled as interrupted.
+    remaining = store.get_turn(None, channel, unprompted.id)
+    assert remaining is not None and remaining.status == "accepted"

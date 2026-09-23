@@ -265,6 +265,18 @@ class DaemonGithub:
         target = self.name if name is None else name
         return any(info.name == target for info in self.sbx.ls())
 
+    @property
+    def provisioned(self) -> bool:
+        """Whether a sandbox is up right now.
+
+        What a background reader asks before spending a call, so its work
+        never pays for a microVM boot of its own: the poll's boot is the
+        one the daemon exists for, and a reading that can wait rides it
+        rather than racing it.
+        """
+        with self._lifecycle_lock:
+            return self._ops is not None
+
     def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
         # to one provision, never to a competing request's new sandbox.

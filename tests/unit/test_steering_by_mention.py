@@ -164,6 +164,9 @@ class TestTargetedMailbox:
         lane = RecordingPhases()
         engine._process_chat(run_id, lane, None)
         assert lane.calls == [("for a task that never ran", None, None)]
+        # The name of a task the run never had is not stamped on the reply.
+        replies = [e for e in harness.events if e.type == HostEventTypes.CHAT_REPLY]
+        assert [("task_id" in e.data) for e in replies] == [False]
 
     def test_the_reply_event_names_the_task_and_the_agent(self, harness: Harness) -> None:
         engine, run_id, tasks = engine_with_tasks(harness, "t1", "t2")
@@ -196,13 +199,46 @@ class TestTargetedMailbox:
                 assert "agent_slug" not in event.data
 
     def test_a_forged_agent_slug_falls_back_to_the_runs_own_voice(self, harness: Harness) -> None:
-        """A slug the run's assignment does not have buys no persona."""
+        """A slug the run's assignment does not have buys no persona, and
+        it reaches no event either: the channel credits a reply to the agent
+        its event names, so a name the run was never given must not ride
+        the reply out of the engine."""
         engine, run_id, tasks = engine_with_tasks(harness, "t1", max_parallel_tasks=1)
         (t1,) = tasks
         engine.post_user_message("do it", agent_slug="not-on-this-run")
         lane = RecordingPhases()
         engine._process_chat(run_id, lane, engine._steer_target(t1))
         assert lane.calls == [("do it", "t1", None)]
+        chat = [
+            e
+            for e in harness.events
+            if e.type in {HostEventTypes.CHAT_REPLY, HostEventTypes.CHAT_MESSAGE}
+        ]
+        assert [e.type for e in chat] == [HostEventTypes.CHAT_MESSAGE, HostEventTypes.CHAT_REPLY]
+        for event in chat:
+            assert "agent_slug" not in event.data
+
+    def test_a_slug_not_on_the_runs_team_is_not_stamped_on_the_reply(
+        self, harness: Harness
+    ) -> None:
+        """A run with a team of its own still answers only in its own
+        voices: naming an agent the team does not have (a trusted agent on
+        another run, or a made-up one) neither picks a persona nor names
+        that agent on the reply the channel will hear."""
+        engine, run_id, tasks = engine_with_tasks(harness, "t1", "t2")
+        _, t2 = tasks
+        engine._assignment = AgentAssignment(
+            lead="angie",
+            roles={"builder": "scout"},
+            agents={"scout": binding("scout", "builder")},
+            tasks={"t2": "scout"},
+        )
+        engine.post_user_message("say it was me", task_id="t2", agent_slug="reviewer-bot")
+        lane = RecordingPhases()
+        engine._process_task_chat(run_id, lane, t2)
+        assert lane.calls == [("say it was me", "t2", None)]
+        replies = [e for e in harness.events if e.type == HostEventTypes.CHAT_REPLY]
+        assert [(e.data.get("task_id"), "agent_slug" in e.data) for e in replies] == [("t2", False)]
 
 
 class TestTheMessageItself:

@@ -246,12 +246,14 @@ def dispatch(
     fit it newest-first (``log``).
 
     The surfaces that call this — the ``ctl`` queue on the host, a chat
-    channel the operator restricted, the local console, the concierge —
-    are trusted completely, so ``by`` becomes a fully capable
-    :class:`Principal` unless the caller hands one over. A surface with
-    an authority model of its own never comes through here: it calls
-    :class:`~sbxloop.daemon.controls.service.ControlService` with the
-    principal it authenticated.
+    channel the operator restricted, the local console — are trusted
+    completely, so ``by`` becomes a fully capable :class:`Principal`
+    unless the caller hands one over. The concierge's ``sbx_control``
+    always hands one over: the principal of the turn the command runs on,
+    so a person's own role is what a command they asked for answers to. A
+    surface with an authority model of its own never comes through here:
+    it calls :class:`~sbxloop.daemon.controls.service.ControlService`
+    with the principal it authenticated.
 
     Every command leaves a host-side record — who asked for what, over
     which channel, and whether it was accepted — so a cancel or abandon

@@ -27,6 +27,7 @@ from sbxloop.api.models import (
     HoldResult,
     OperationOut,
     RepositoryCreate,
+    RepositoryLabelSync,
     RepositoryResult,
     RepositoryUpdate,
     RestartRequest,
@@ -34,7 +35,13 @@ from sbxloop.api.models import (
     ScheduleResult,
     ScheduleUpdate,
 )
-from sbxloop.api.projections import Views, holds_view, not_found, schedule_by_name
+from sbxloop.api.projections import (
+    Views,
+    holds_view,
+    not_found,
+    repository_labels,
+    schedule_by_name,
+)
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.controls.operations import Operation
 from sbxloop.daemon.controls.results import Outcome
@@ -191,6 +198,57 @@ async def resume_repository(
         repository = next(r for r in views.repositories() if r.repository == entry.repo)
         return RepositoryResult(
             repository=repository, operation=OperationOut.from_operation(operation)
+        )
+
+    result = await ctx.call(project)
+    ctx.hub.notify()
+    return result
+
+
+async def sync_repository_labels(
+    ctx: ApiContext, auth: Authenticated, public_id: str, pair: tuple[str, str] | None
+) -> RepositoryLabelSync:
+    """Give a registered repository every label the loop applies; say what
+    it carries now and what this sync created."""
+    principal = auth.principal
+    service = ctx.service()
+
+    def apply() -> Outcome:
+        entry = Views(ctx).repository_by_public_id(public_id)
+        return service.sync_repo_labels(principal, entry.repo, idempotency=pair)
+
+    outcome, operation = await _apply(ctx, apply)
+
+    def project() -> RepositoryLabelSync:
+        views = Views(ctx)
+        entry = views.repository_by_public_id(public_id)
+        repository = next(
+            (r for r in views.repositories() if r.repository == entry.repo),
+            None,
+        )
+        labels = (
+            repository.labels
+            if repository is not None
+            else repository_labels(views.config, entry.repo, None)
+        )
+        created = list(
+            getattr(outcome, "created", None) or (operation.result or {}).get("created") or []
+        )
+        if created:
+            message = f"created {', '.join(created)} on {entry.repo}"
+        elif labels.missing:
+            message = (
+                f"{entry.repo} is missing {', '.join(labels.missing)}; the forge would not "
+                "create them"
+            )
+        else:
+            message = f"{entry.repo} already carries every label sbxloop applies"
+        return RepositoryLabelSync(
+            repository=repository,
+            labels=labels,
+            created=created,
+            message=message,
+            operation=OperationOut.from_operation(operation),
         )
 
     result = await ctx.call(project)
@@ -405,6 +463,7 @@ ADMIN_ACTIONS: dict[str, tuple[str, str]] = {
     "daemon.stop": ("daemon:manage", "/v1/daemon/stop"),
     "daemon.restart": ("daemon:manage", "/v1/daemon/restart"),
     "repository.resume": ("daemon:manage", "/v1/repositories/{id}/resume"),
+    "repository.labels_sync": ("daemon:manage", "/v1/repositories/{id}/labels/sync"),
     "repository.add": ("daemon:manage", "/v1/repositories"),
     "repository.update": ("daemon:manage", "/v1/repositories/{id}"),
     "repository.remove": ("daemon:manage", "/v1/repositories/{id}"),
@@ -456,6 +515,9 @@ async def run_admin(
         if action == "repository.resume":
             resumed = await resume_repository(ctx, auth, target, pair)
             return resumed.model_dump(mode="json"), None
+        if action == "repository.labels_sync":
+            synced = await sync_repository_labels(ctx, auth, target, pair)
+            return synced.model_dump(mode="json"), None
         if action == "repository.update":
             registration = await update_repository(
                 ctx, auth, target, RepositoryUpdate.model_validate(params), pair

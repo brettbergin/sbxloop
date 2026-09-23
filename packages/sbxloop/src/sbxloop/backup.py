@@ -7,6 +7,8 @@ consistently), the rendered unit files, the launchers and ``home.json``,
 plus ``MANIFEST`` (sha256 and size per file) and ``meta.json`` (who, when,
 which version, why). Runs, workspaces, caches and the venv are not in it:
 every one of those is rebuilt from a repository or an index.
+Channel input originals are durable user data and are included with their
+database rows.
 
 ``init --migrate`` takes one before it moves anything, the deploy takes one
 before it installs, and an operator takes one with ``sbxloop backup``
@@ -20,9 +22,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +47,7 @@ DB_NAME = "state.db"
 #: What a backup carries, relative to the home: the files a host cannot
 #: regenerate. The database is copied through SQLite, not the filesystem.
 CONFIG_FILES: tuple[str, ...] = ("sbxloop.toml", "secrets.env", "github-app.pem")
+_CHANNEL_FILE_ID = re.compile(r"fin_[0-9abcdefghjkmnpqrstvwxyz]{24}\Z")
 
 
 class BackupError(SbxloopError):
@@ -122,6 +127,42 @@ def create_backup(
         dst.parent.mkdir(exist_ok=True)
         _copy_db(home.state_db, dst)
         copied.append((f"state/{DB_NAME}", dst))
+        # Read the same database snapshot this backup will restore. A live
+        # cancellation may remove bytes after it; fail rather than publish a
+        # backup whose database points at a missing or different original.
+        # This copy is already complete. Open it immutable so SQLite cannot
+        # leave -wal/-shm sidecars inside the finished backup.
+        with sqlite3.connect(f"file:{dst}?mode=ro&immutable=1", uri=True) as snapshot:
+            has_files = snapshot.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='collaboration_input_files'"
+            ).fetchone()
+            originals = (
+                snapshot.execute(
+                    "SELECT id, size, sha256 FROM collaboration_input_files "
+                    "WHERE status IN ('uploaded', 'attached') ORDER BY id"
+                ).fetchall()
+                if has_files
+                else []
+            )
+        for file_id, size, digest in originals:
+            if not isinstance(file_id, str) or _CHANNEL_FILE_ID.fullmatch(file_id) is None:
+                raise BackupError("database contains an invalid channel input file id")
+            src = home.channel_files / file_id
+            if src.is_symlink() or not src.is_file():
+                raise BackupError(f"channel input {file_id} is missing or unsafe")
+            rel = f"channel-files/{file_id}"
+            original = target / rel
+            original.parent.mkdir(mode=0o700, exist_ok=True)
+            if home.os_name == "nt":
+                make_private(original.parent, os_name=home.os_name)
+            else:
+                original.parent.chmod(0o700)
+            shutil.copy2(src, original)
+            make_private(original, os_name=home.os_name)
+            if original.stat().st_size != size or _sha256(original) != digest:
+                raise BackupError(f"channel input {file_id} changed during backup")
+            copied.append((rel, original))
     for src in sorted(home.systemd.glob("*.service")) if home.systemd.is_dir() else []:
         dst = target / "systemd" / src.name
         dst.parent.mkdir(exist_ok=True)
@@ -215,20 +256,59 @@ def restore_backup(home: SbxloopHome, name: str, *, daemon_live: bool = False) -
             "the daemon is running; stop it (systemctl --user stop sbxloop-daemon) first"
         )
     info = find_backup(home, name)
+    # Verify every backed-up byte before overwriting a live home.
+    manifest = (info.path / MANIFEST).read_text().splitlines()
+    verified: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+    for line in manifest:
+        match = re.fullmatch(r"([0-9a-f]{64})\s+(\d+)\s+(.+)", line)
+        if match is None:
+            raise BackupError("backup manifest is malformed")
+        digest, size, entry_name = match.groups()
+        rel = Path(entry_name)
+        if rel.is_absolute() or rel in seen or any(part in (".", "..") for part in rel.parts):
+            raise BackupError("backup manifest contains an unsafe or duplicate path")
+        seen.add(rel)
+        src = info.path / rel
+        if (
+            src.is_symlink()
+            or not src.is_file()
+            or not src.resolve().is_relative_to(info.path.resolve())
+            or src.stat().st_size != int(size)
+            or _sha256(src) != digest
+        ):
+            raise BackupError(f"backup file {entry_name!r} failed integrity verification")
+        verified.append((rel, src))
     restored: list[str] = []
-    for src in sorted(p for p in info.path.rglob("*") if p.is_file()):
-        rel = src.relative_to(info.path)
-        if rel.name in (MANIFEST, META) or rel.parts[0] == "legacy":
+    for rel, src in sorted(verified):
+        if rel.parts[0] == "legacy":
             continue
         dst = home.root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         if rel.name == DB_NAME:
-            for suffix in ("-wal", "-shm"):
-                dst.with_name(dst.name + suffix).unlink(missing_ok=True)
-            _copy_db(src, dst)
+            # The backup's database is already a consistent SQLite snapshot.
+            # Reopening the live destination with SQLite after removing its
+            # WAL sidecars can fail when it previously used WAL mode. Replace
+            # it from a private same-directory temporary file instead.
+            fd, temporary_name = tempfile.mkstemp(prefix="state-restore-", dir=dst.parent)
+            os.close(fd)
+            temporary = Path(temporary_name)
+            try:
+                shutil.copyfile(src, temporary)
+                make_private(temporary, os_name=home.os_name)
+                for suffix in ("-wal", "-shm"):
+                    dst.with_name(dst.name + suffix).unlink(missing_ok=True)
+                temporary.replace(dst)
+            finally:
+                temporary.unlink(missing_ok=True)
         else:
             shutil.copy2(src, dst)
-        if rel.name.endswith(("secrets.env", ".pem")):
+        if rel.parts[0] == "channel-files" or rel.name.endswith(("secrets.env", ".pem")):
+            if rel.parts[0] == "channel-files":
+                if home.os_name == "nt":
+                    make_private(dst.parent, os_name=home.os_name)
+                else:
+                    dst.parent.chmod(0o700)
             make_private(dst, os_name=home.os_name)
         restored.append(str(rel))
     log.info("backup.restored", path=str(info.path), files=len(restored))
