@@ -100,6 +100,13 @@ def test_pdf_analyzer_identity_is_provisioned_before_deploy_hold(deploy: str) ->
     )
 
 
+def test_release_wheels_use_the_digest_checked_asset_endpoint(deploy: str) -> None:
+    fetch = _step(deploy, "Fetch the release wheels")
+    assert '"${PIPELINE}" download-wheels' in fetch
+    assert '"${PIPELINE}" verify-download' in fetch
+    assert "gh release download" not in fetch
+
+
 @pytest.mark.parametrize("fixture", ["deploy", "example"])
 class TestAuthenticationOutage:
     def test_preflight_precedes_any_hold_or_upgrade(
