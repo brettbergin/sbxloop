@@ -3,8 +3,9 @@
 Complex PDF, Office, image, archive, and executable parsers must not run in the
 credentialed sbxloop API process or in a normal agent sandbox. Their input is
 untrusted, and the agent sandbox may hold an inference credential and network
-access. This gate proves the minimum disposable runtime boundary before adding
-those parsers; it does not itself enable a format analyzer.
+access. This gate proves the disposable runtime boundary used by the PDF text
+analyzer. Other rich formats still require their own bounded parsers and
+real-sandbox CI checks.
 
 The `Channel analysis isolation` workflow boots a fresh Docker Sandbox shell VM
 with one CPU, 512 MiB of memory, a 30-second probe deadline, a disposable
@@ -21,14 +22,33 @@ workspace omission](https://docs.docker.com/reference/cli/sbx/create/shell/),
 [per-sandbox network deny](https://docs.docker.com/reference/cli/sbx/policy/deny/network/),
 and [VM host-filesystem isolation](https://docs.docker.com/ai/sandboxes/security/defaults/).
 CI must pass on the actual sbx release; source review or a fake CLI test is not
-equivalent. A local deny can narrow policy, so the probe works even when the
-host's global policy is `balanced`.
+equivalent. The workflow also invokes the production PDF runner on a two-page
+fixture and verifies the page-two text. It installs sbx 0.43.0, matching the
+current production default. A local deny can narrow policy, so the
+probe also sets a deny-all policy and an explicit global network deny in the
+dedicated analysis app. The probe requires real external HTTPS response
+content: a transparent proxy can accept a TCP handshake before enforcing
+policy, so a successful connection alone does not establish egress.
 
-This is an isolation prerequisite, not an analyzer service. The next change
-must create a production job runner that instantiates this same profile for
-each analysis, copies only the selected immutable original into the VM,
-limits scratch/output and parser-specific CPU/memory/page/expansion work,
-validates the returned schema, and handles cancellation, restart, and cleanup.
-The probe does not prove that a particular production host can start this
-profile; that remains **field-unverified** until it is run there. No rich
-format is advertised as supported on the basis of this workflow alone.
+An uploaded PDF (identified by its `%PDF-` header, regardless of name) of at
+most 20 MB gets a durable analysis job. The host verifies its stored checksum,
+copies only that original and trusted parser code to a read-only mount, and
+starts a separate `sbxloop-analysis` shell VM with the proven profile. The
+worker has a 45-second execution deadline, 100-page limit, 10 MB content-stream
+check per page, 8,000-character page limit and 240,000-character document limit.
+The host validates its bounded JSON output before storing it in the database.
+The job survives daemon restart and removes its VM on completion. The agent
+reads saved text with `read_pdf_channel_input`, which checks current channel
+membership and the turn's message snapshot every time. Extracted text remains
+untrusted data. Scanned pages have no OCR text; encrypted PDFs and pages beyond
+the limits report that limitation explicitly. Other file types retain generic
+byte, search and string inspection.
+
+The self-deploy workflow signs the production host into the separate
+`sbxloop-analysis` app and initializes its deny-all policy before taking a
+deploy hold; it fails before upgrading if either setup step fails. Operators
+of other installations must run `sbx --app-name sbxloop-analysis login`,
+`sbx --app-name sbxloop-analysis policy init deny-all`, and
+`sbx --app-name sbxloop-analysis policy deny network '**'` once on their host.
+The CI probe does not prove that a particular production host can start this
+profile; that remains **field-unverified** until it is run there.
