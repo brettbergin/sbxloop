@@ -66,6 +66,18 @@ channel owns only for runs that deliver files into the conversation
 (workload and tool runs); a code run's checkout is refused, and delivered
 files read as before. (#1265)
 
+**A run posts only into the channel that asked for it, and its dedupe key
+is its own.** The run-post store took the channel a post named on trust and
+looked its dedupe key up across every run and channel, so a post naming
+another channel landed there, and a key another run or channel had already
+used returned that post's message id and wrote nothing. A post is now
+refused, and nothing is written, unless it names the channel that asked for
+its run (the attempt's bound channel once the run is recorded, the item's
+channel before that). A key another run or channel already holds no longer
+suppresses the post: it is stored under a key scoped to its run and channel,
+and a replay of it finds that post. No caller does either today; this is
+defence in depth. (#1262)
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped

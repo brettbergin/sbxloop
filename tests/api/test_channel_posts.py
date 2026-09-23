@@ -135,6 +135,166 @@ def test_the_same_dedupe_key_posts_once(api: Any) -> None:
     assert [m["id"] for m in _messages(api, headers, channel)] == [first]
 
 
+def _other_channel_with_work(api: Any, headers: dict[str, str]) -> tuple[str, WorkItem]:
+    """A second channel of the same owner, with an item of its own."""
+    other = _channel(api, headers)
+    item = WorkItem(
+        item_id="api:other-bread",
+        source_key="api:other-bread",
+        title="Other bread list",
+        body="Bake something else",
+        kind="workload",
+        channel_id=other,
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    return other, item
+
+
+def test_a_post_naming_a_channel_that_did_not_ask_for_its_item_is_refused(api: Any) -> None:
+    """A run posts only into the channel that asked for it: a post that
+    names another channel is dropped, nothing is written anywhere, and the
+    key stays free for the post the asking channel should get."""
+    headers, channel, item = _channel_with_work(api)
+    other = _channel(api, headers)
+    post = ChannelPost(
+        channel_id=other,
+        author_agent="builder",
+        kind="delivery",
+        text="Here is the bread list",
+        run_id="r1",
+        item_id=item.item_id,
+        dedupe_key="r1:delivery",
+    )
+
+    assert api.ctx.poster.post(post) is None
+
+    assert _messages(api, headers, other) == []
+    assert _messages(api, headers, channel) == []
+    assert api.ctx.poster.run_post_keys("r1") == frozenset()
+    delivered = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="delivery",
+            text="Here is the bread list",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="r1:delivery",
+        )
+    )
+    assert delivered is not None
+    assert [m["id"] for m in _messages(api, headers, channel)] == [delivered]
+
+
+def test_a_run_posts_into_the_channel_that_asked_for_the_run_not_the_item_it_names(
+    api: Any,
+) -> None:
+    """A started run answers to the channel that asked for it. Naming another
+    channel's item alongside that channel does not open it to the run."""
+    headers, _asking, item = _channel_with_work(api)
+    other, theirs = _other_channel_with_work(api, headers)
+    api.harness.dstore.mark_running(item.item_id, "r1", api.clock())
+
+    refused = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=other,
+            author_agent="builder",
+            kind="delivery",
+            text="Here is the bread list",
+            run_id="r1",
+            item_id=theirs.item_id,
+            dedupe_key="r1:delivery",
+        )
+    )
+
+    assert refused is None
+    assert _messages(api, headers, other) == []
+    assert api.ctx.poster.run_post_keys("r1") == frozenset()
+
+
+def test_the_same_dedupe_key_from_another_run_posts_separately(api: Any) -> None:
+    """One run's dedupe key never suppresses another run's post, and never
+    hands it the other run's message."""
+    headers, channel, item = _channel_with_work(api)
+
+    def _post(run_id: str, text: str) -> str | None:
+        return api.ctx.poster.post(
+            ChannelPost(
+                channel_id=channel,
+                author_agent="builder",
+                kind="progress",
+                text=text,
+                run_id=run_id,
+                item_id=item.item_id,
+                dedupe_key="shared:progress:2",
+            )
+        )
+
+    first = _post("r1", "Finished task 2 of 5: knead the dough")
+    second = _post("r2", "Finished task 2 of 5: proof the dough")
+
+    assert first is not None
+    assert second is not None
+    assert second != first
+    assert [(m["id"], m["content"]) for m in _messages(api, headers, channel)] == [
+        (first, "Finished task 2 of 5: knead the dough"),
+        (second, "Finished task 2 of 5: proof the dough"),
+    ]
+    # Each run still says its own thing once, under the key it named.
+    assert _post("r1", "Finished task 2 of 5: knead the dough") == first
+    assert _post("r2", "Finished task 2 of 5: proof the dough") == second
+    assert len(_messages(api, headers, channel)) == 2
+    assert api.ctx.poster.run_post_keys("r1") == frozenset({"shared:progress:2"})
+    assert api.ctx.poster.run_post_keys("r2") == frozenset({"shared:progress:2"})
+
+
+def test_the_same_dedupe_key_in_another_channel_posts_separately(api: Any) -> None:
+    """A key already posted in one channel is not an answer for a post in
+    another: each channel gets its own message, whoever records it."""
+    headers, channel, item = _channel_with_work(api)
+    other, theirs = _other_channel_with_work(api, headers)
+
+    ours = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=channel,
+            author_agent="builder",
+            kind="delivery",
+            text="Here is the bread list",
+            run_id="r1",
+            item_id=item.item_id,
+            dedupe_key="shared:delivery",
+        )
+    )
+    elsewhere = api.ctx.poster.post(
+        ChannelPost(
+            channel_id=other,
+            author_agent="builder",
+            kind="delivery",
+            text="Here is the other bread list",
+            run_id="r2",
+            item_id=theirs.item_id,
+            dedupe_key="shared:delivery",
+        )
+    )
+    # The store itself scopes the key to the channel, even for one run.
+    direct = api.ctx.collaboration.post_agent_update(
+        channel_id=other,
+        author_agent="builder",
+        kind="delivery",
+        text="Here is the bread list, again",
+        run_id="r1",
+        dedupe_key="shared:delivery",
+        now=api.clock(),
+    )
+
+    assert ours is not None
+    assert elsewhere is not None
+    assert direct is not None
+    assert len({ours, elsewhere, direct}) == 3
+    assert [m["id"] for m in _messages(api, headers, channel)] == [ours]
+    assert [m["id"] for m in _messages(api, headers, other)] == [elsewhere, direct]
+
+
 def test_a_silenced_channel_drops_progress_and_keeps_delivery(api: Any) -> None:
     headers, channel, item = _channel_with_work(api)
     _silence(api, channel, api.clock() + 600)

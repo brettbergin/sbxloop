@@ -86,6 +86,34 @@ HISTORY_CHARS = 60_000
 LINK_CODE_TTL_S = 600.0
 
 
+#: Starts the ledger key of a run post whose own key another run or channel
+#: already holds. No caller's key may start with it, so a scoped key never
+#: meets one a caller named.
+SCOPED_POST_KEY_PREFIX = ""
+
+
+def scoped_run_post_key(run_id: str, channel_id: str, dedupe_key: str) -> str:
+    """The ledger key ``run_id`` posts ``dedupe_key`` under in ``channel_id``
+    when the key alone is already another run's or another channel's."""
+    return SCOPED_POST_KEY_PREFIX + json.dumps([run_id, channel_id, dedupe_key])
+
+
+def run_post_key_name(stored: str) -> str:
+    """The dedupe key a run named, for a ledger key stored either way."""
+    if stored.startswith(SCOPED_POST_KEY_PREFIX):
+        return str(json.loads(stored[len(SCOPED_POST_KEY_PREFIX) :])[2])
+    return stored
+
+
+def _posted_by(session: Any, posted: ChannelRunPostRow, run_id: str, channel_id: str) -> bool:
+    """Whether ``posted`` is ``run_id``'s own post in ``channel_id``. A post
+    whose message is gone is judged by its run alone."""
+    if str(posted.run_id) != run_id:
+        return False
+    message = session.get(MessageRow, posted.message_id)
+    return message is None or str(message.channel_id) == channel_id
+
+
 class CollaborationError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -3955,6 +3983,11 @@ class CollaborationStore:
         once the write has committed, so the surfaces linked to the channel
         mirror it. A replay under a key already posted returns the message
         it posted before and tells nobody: the run said it once.
+
+        A key is the run's own, in its own channel: one another run or
+        another channel already posted under neither suppresses this post
+        nor answers for it. The post is stored under a key scoped to this
+        run and channel instead.
         """
         if kind not in POST_KINDS:
             # ``PostKind`` is a type, not a check: a caller naming a kind
@@ -3964,8 +3997,17 @@ class CollaborationStore:
                 "api.channel_post_unknown_kind", channel=channel_id, key=dedupe_key, kind=kind
             )
             return None
+        if dedupe_key.startswith(SCOPED_POST_KEY_PREFIX):
+            # Scoped keys are the ledger's own; a caller naming one could
+            # take the place of another run's post.
+            log.warning("api.channel_post_reserved_key", channel=channel_id, run=run_id)
+            return None
         with self.dstore.immediate_transaction() as session:
+            stored_key = dedupe_key
             posted = session.get(ChannelRunPostRow, dedupe_key)
+            if posted is not None and not _posted_by(session, posted, run_id, channel_id):
+                stored_key = scoped_run_post_key(run_id, channel_id, dedupe_key)
+                posted = session.get(ChannelRunPostRow, stored_key)
             if posted is not None:
                 return str(posted.message_id)
             channel = session.get(ChannelRow, channel_id)
@@ -4002,7 +4044,7 @@ class CollaborationStore:
             )
             session.execute(
                 insert(ChannelRunPostRow).values(
-                    dedupe_key=dedupe_key,
+                    dedupe_key=stored_key,
                     run_id=run_id,
                     message_id=message_id,
                     kind=kind,
