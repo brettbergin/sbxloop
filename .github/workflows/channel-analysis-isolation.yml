@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           root=$(mktemp -d "$RUNNER_TEMP/channel-analysis.XXXXXX")
-          mkdir -p "$root/input" "$root/private"
+          mkdir -p "$root/work" "$root/input" "$root/private"
           cp tests/fixtures/channel_analysis/inert_keylogger_indicators.elf "$root/input/original.bin"
           expected_sha256=$(sha256sum "$root/input/original.bin" | cut -d ' ' -f 1)
           printf 'host-only neighbor\n' > "$root/private/neighbor.bin"
@@ -90,7 +90,7 @@ jobs:
           python3 -c 'import socket; s=socket.create_connection(("example.com", 443), timeout=5); s.close()'
           timeout 600s sbx --app-name "$SBXLOOP_APP_NAME" create \
             --name="$SBX_PROBE_NAME" --cpus 1 --memory 512m \
-            --deny-network '**' --skills off shell "$root/input:ro"
+            --deny-network '**' --skills off shell "$root/work" "$root/input:ro"
           timeout 30s sbx --app-name "$SBXLOOP_APP_NAME" exec "$SBX_PROBE_NAME" \
             python3 "$root/input/probe.py" "$root/input/original.bin" "$expected_sha256" \
             "$root/private/neighbor.bin" "$root/private/host-output.bin"

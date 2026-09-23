@@ -7,9 +7,9 @@ access. This gate proves the minimum disposable runtime boundary before adding
 those parsers; it does not itself enable a format analyzer.
 
 The `Channel analysis isolation` workflow boots a fresh Docker Sandbox shell VM
-with one CPU, 512 MiB of memory, a 30-second probe deadline, a read-only mount
-containing the inert ELF fixture in `tests/fixtures/channel_analysis`, shared
-skills disabled, no injected credentials,
+with one CPU, 512 MiB of memory, a 30-second probe deadline, a disposable
+writable scratch workspace and a separate read-only mount containing the inert
+ELF fixture in `tests/fixtures/channel_analysis`, shared skills disabled, no injected credentials,
 and a per-sandbox `**` network deny. The test checks that the input is readable
 but cannot be changed, sibling host files and output paths are invisible,
 common service credentials and a host-only sentinel are absent, outbound TCP
