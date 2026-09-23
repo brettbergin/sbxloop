@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -46,6 +45,7 @@ from sbxloop.api.collaboration_schemas import (
     BridgePage,
     ChannelArtifactPage,
     ChannelCreate,
+    ChannelJobOut,
     ChannelLinkCreate,
     ChannelLinkOut,
     ChannelLinkPage,
@@ -63,12 +63,11 @@ from sbxloop.api.collaboration_schemas import (
     ChannelStopOut,
     ChannelUpdate,
     ChannelWorkOut,
-    ConnectionMutation,
-    ConnectionOut,
-    ConnectionTestOut,
     DetailOut,
     ExternalIdentityOut,
     ExternalIdentityPage,
+    ExternalWorkOut,
+    InputFileRefOut,
     LinkCodeOut,
     LocalLoginRequest,
     LocalRegisterRequest,
@@ -81,7 +80,6 @@ from sbxloop.api.collaboration_schemas import (
     PreferenceOut,
     PreferenceUpdate,
     ReactionSet,
-    ServiceDefinitionOut,
     TeamCreate,
     TeamOut,
     TeamUpdate,
@@ -103,10 +101,6 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
-MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
-#: How long a stop keeps the channel quiet before it lifts on its own; a
-#: person who wants it quiet for longer says so with `silence`.
-STOP_SILENCE_S = 3600.0
 
 PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
@@ -160,82 +154,6 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
 )
 PREFERENCE_NAMES = frozenset(item["name"] for item in PREFERENCE_DEFINITIONS)
 
-SERVICE_DEFINITIONS: tuple[dict[str, object], ...] = (
-    {
-        "key": "gitlab",
-        "name": "GitLab",
-        "description": "GitLab repositories, merge requests, and issues",
-        "auth_type": "api_key",
-        "color": "#FC6D26",
-        "fields": [],
-        "agent_slug": None,
-        "available": False,
-        "unavailable_reason": (
-            "GitLab execution is not available in this SBXLOOP version. "
-            "Connection setup will be available when its forge backend is implemented."
-        ),
-    },
-    {
-        "key": "gitea",
-        "name": "Gitea",
-        "description": "Self-hosted Gitea repositories, pull requests, and issues",
-        "auth_type": "api_key",
-        "color": "#609926",
-        "fields": [],
-        "agent_slug": None,
-        "available": False,
-        "unavailable_reason": (
-            "Gitea execution is not available in this SBXLOOP version. "
-            "Connection setup will be available when its forge backend is implemented."
-        ),
-    },
-    {
-        "key": "github",
-        "name": "GitHub",
-        "description": "Repository management — pull requests, issues, and code review",
-        "auth_type": "api_key",
-        "color": "#333333",
-        "fields": [
-            {
-                "key": "personal_access_token",
-                "label": "Personal Access Token",
-                "type": "password",
-            }
-        ],
-        "agent_slug": "github",
-    },
-    {
-        "key": "slack",
-        "name": "Slack",
-        "description": "Team messaging through sbxloop's Slack bridge",
-        "auth_type": "token",
-        "color": "#4A154B",
-        "fields": [
-            {"key": "bot_token", "label": "Bot Token (xoxb-…)", "type": "password"},
-            {"key": "app_token", "label": "App Token (xapp-…)", "type": "password"},
-        ],
-        "agent_slug": None,
-    },
-    {
-        "key": "discord",
-        "name": "Discord",
-        "description": "Community messaging through sbxloop's Discord bridge",
-        "auth_type": "token",
-        "color": "#5865F2",
-        "fields": [{"key": "bot_token", "label": "Bot Token", "type": "password"}],
-        "agent_slug": None,
-    },
-    {
-        "key": "mattermost",
-        "name": "Mattermost",
-        "description": "Self-hosted messaging through sbxloop's Mattermost bridge",
-        "auth_type": "token",
-        "color": "#0058CC",
-        "fields": [{"key": "bot_token", "label": "Bot Token", "type": "password"}],
-        "agent_slug": None,
-    },
-)
-
 
 def _problem(exc: CollaborationError) -> Problem:
     status = 404 if exc.code.endswith("not_found") else 409
@@ -282,6 +200,11 @@ def _channel_out(channel: Channel) -> ChannelOut:
         silenced_until=channel.silenced_until,
         unread_count=channel.unread_count,
         my_role=channel.my_role,
+        external_work=(
+            None
+            if channel.external_work is None
+            else ExternalWorkOut.model_validate(channel.external_work)
+        ),
     )
 
 
@@ -355,8 +278,12 @@ def _work_out(message: Message) -> ChannelWorkOut | None:
 
 
 def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
+    origin = message.origin or {}
+    source_run_id = origin.get("source_run_id")
+    source_work_id = origin.get("source_work_id")
     return MessageOut(
         id=message.id,
+        client_message_id=message.client_message_id,
         channel_id=message.channel_id,
         turn_id=message.turn_id,
         sequence=message.sequence,
@@ -370,7 +297,14 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         author=_author_out(message.author, ctx),
         post_kind=message.post_kind,
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
+        input_files=[
+            InputFileRefOut(id=ref.id, name=ref.name, size=ref.size, sha256=ref.sha256)
+            for ref in message.input_files
+        ],
         origin=_origin_out(message.origin),
+        source_run_id=source_run_id if isinstance(source_run_id, str) else None,
+        source_work_id=source_work_id if isinstance(source_work_id, str) else None,
+        historical=origin.get("historical") is True,
     )
 
 
@@ -385,15 +319,17 @@ def _artifact_ref_out(ref: ArtifactRef) -> ArtifactRefOut:
 
 
 def _origin_out(origin: dict[str, Any] | None) -> MessageOriginOut | None:
-    """The three public facts of a message's origin. The stored value may
-    carry more — a guest's name, which is served as the author instead."""
+    """The public facts of a message's origin. The stored value may carry
+    more — a guest's name, which is served as the author instead."""
     if not isinstance(origin, dict) or not origin.get("backend"):
         return None
     external = origin.get("external_message_id")
+    thread = origin.get("thread_id")
     return MessageOriginOut(
         backend=str(origin["backend"]),
         surface_id=str(origin.get("surface_id") or ""),
         external_message_id=None if external is None else str(external),
+        thread_id=None if thread is None else str(thread),
     )
 
 
@@ -468,6 +404,8 @@ async def register_local(
     body: LocalRegisterRequest,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
 ) -> TokenResponse:
+    if not ctx.api.local_auth_enabled:
+        raise Problem(403, "local_auth_disabled", "sign in through the identity provider")
     try:
         user = await ctx.call(
             ctx.collaboration.register_user,
@@ -492,6 +430,8 @@ async def login_local(
     request: Request,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
 ) -> TokenResponse:
+    if not ctx.api.local_auth_enabled:
+        raise Problem(403, "local_auth_disabled", "sign in through the identity provider")
     address = request.client.host if request.client else "unknown"
     keys = [f"local-user:{body.username}", f"addr:{address}"]
     now = ctx.clock()
@@ -766,130 +706,6 @@ async def delete_preference(
     return DetailOut(detail=f"Preference {clean_name!r} deleted")
 
 
-# -- operator-managed connections -----------------------------------------------
-
-
-def _connections(ctx: ApiContext) -> list[ConnectionOut]:
-    values: list[ConnectionOut] = []
-    github_enabled = bool(ctx.config.github.repo or ctx.config.github.repos)
-    if github_enabled:
-        values.append(
-            ConnectionOut(
-                id="github",
-                service_type="github",
-                display_name="sbxloop configuration",
-                auth_type="api_key",
-                status="connected",
-                masked_credentials={"credential": "managed by sbxloop"},
-            )
-        )
-    envs = {
-        "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
-        "discord": ("DISCORD_BOT_TOKEN",),
-        "mattermost": ("MATTERMOST_BOT_TOKEN",),
-    }
-    for name, required_env in envs.items():
-        section = getattr(ctx.config, name)
-        if not section.enabled:
-            continue
-        ready = all(os.environ.get(key) for key in required_env)
-        values.append(
-            ConnectionOut(
-                id=name,
-                service_type=name,
-                display_name="sbxloop configuration",
-                auth_type="token",
-                status="connected" if ready else "error",
-                masked_credentials={
-                    key: "configured" if os.environ.get(key) else "missing" for key in required_env
-                },
-            )
-        )
-    return values
-
-
-def _operator_managed() -> Problem:
-    return Problem(
-        409,
-        "operator_managed_connection",
-        "configure credentials with sbxloop's environment and sbxloop.toml; "
-        "remote protected credential intake is tracked by sbxloop issue #1043",
-    )
-
-
-@router.get("/connections/services", response_model=list[ServiceDefinitionOut])
-async def connection_services(
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> list[ServiceDefinitionOut]:
-    return [ServiceDefinitionOut.model_validate(item) for item in SERVICE_DEFINITIONS]
-
-
-@router.get("/connections", response_model=list[ConnectionOut])
-async def list_connections(
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> list[ConnectionOut]:
-    return _connections(ctx)
-
-
-@router.get("/connections/{connection_id}", response_model=ConnectionOut)
-async def get_connection(
-    connection_id: str,
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> ConnectionOut:
-    value = next((item for item in _connections(ctx) if item.id == connection_id), None)
-    if value is None:
-        raise Problem(404, "connection_not_found", "connection not found")
-    return value
-
-
-@router.post("/connections", response_model=ConnectionOut)
-async def create_connection(
-    _body: ConnectionMutation,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> ConnectionOut:
-    raise _operator_managed()
-
-
-@router.patch("/connections/{connection_id}", response_model=ConnectionOut)
-async def update_connection(
-    _connection_id: str,
-    _body: ConnectionMutation,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> ConnectionOut:
-    raise _operator_managed()
-
-
-@router.delete("/connections/{connection_id}", status_code=204)
-async def delete_connection(
-    _connection_id: str,
-    _auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
-) -> None:
-    raise _operator_managed()
-
-
-@router.post("/connections/{connection_id}/test", response_model=ConnectionTestOut)
-async def test_connection(
-    connection_id: str,
-    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
-) -> ConnectionTestOut:
-    value = next((item for item in _connections(ctx) if item.id == connection_id), None)
-    if value is None:
-        raise Problem(404, "connection_not_found", "connection not found")
-    success = value.status == "connected"
-    return ConnectionTestOut(
-        success=success,
-        message=(
-            "sbxloop configuration is present"
-            if success
-            else "the sbxloop connection is configured but a required credential is missing"
-        ),
-        status=value.status,
-    )
-
-
 # -- workflow definitions --------------------------------------------------------
 
 
@@ -1133,38 +949,37 @@ async def channel_work(
     return await ctx.call(ctx.project_work, channel_id)
 
 
+@router.get("/channels/{channel_id}/jobs", response_model=list[ChannelJobOut])
+async def channel_jobs(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> list[ChannelJobOut]:
+    from sbxloop.api.external_work import jobs, reconcile
+
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    if ctx.ready.is_set() and not ctx.stopping.is_set():
+        await ctx.call(reconcile, ctx)
+    await ctx.call(ctx.project_work, channel_id)
+    snapshots = await ctx.call(jobs, ctx, channel_id)
+    return [ChannelJobOut.model_validate(snapshot) for snapshot in snapshots]
+
+
 async def _targets(
     ctx: ApiContext, user: LocalUser, content: str, requested: list[str]
 ) -> tuple[str, ...]:
-    selectors = list(requested)
-    selectors.extend(match.group(1).casefold() for match in MENTION.finditer(content))
-    result: list[str] = []
-    for selector in dict.fromkeys(selectors):
-        agent = await ctx.call(ctx.agents.get, selector)
-        if addressable(agent, selector):
-            result.append(selector)
-            continue
-        team = await ctx.call(ctx.collaboration.get_team, user.id, selector)
-        if team is not None and team.enabled:
-            for slug in team.agent_slugs:
-                if addressable(await ctx.call(ctx.agents.get, slug), slug):
-                    result.append(slug)
-            continue
-        if selector in requested:
-            raise Problem(422, "unknown_target", f"unknown agent or team: {selector}")
-    return tuple(dict.fromkeys(result))
-
-
-def _mentioned_agents(ctx: ApiContext, content: str, targets: tuple[str, ...]) -> tuple[str, ...]:
-    """The agents a turn names, by ``@slug`` or as a target: each joins the
-    channel. A runner turn's mentions count too, though they seed no reply.
-    Reads the registry, so it runs through ``ctx.call``."""
-    slugs: list[str] = []
-    for selector in (*targets, *(m.group(1).casefold() for m in MENTION.finditer(content))):
-        agent = _addressable(ctx, selector)
-        if agent is not None:
-            slugs.append(agent)
-    return tuple(dict.fromkeys(slugs))
+    """The agents the turn addresses, as :meth:`ApiContext.mention_targets`
+    resolves them for a bridge message too; a requested selector nobody
+    answers to is ``422 unknown_target``."""
+    try:
+        return await ctx.call(ctx.mention_targets, user, content, requested)
+    except CollaborationError as exc:
+        if exc.code == "unknown_target":
+            raise Problem(422, exc.code, exc.message) from exc
+        raise _problem(exc) from exc
 
 
 def _assignees(ctx: ApiContext, slugs: tuple[str, ...]) -> dict[str, str]:
@@ -1197,6 +1012,10 @@ async def create_turn(
     # The member is checked after availability, so a stopped concierge is
     # reported as such whoever asks.
     user = member_of(auth).user
+    if not body.content.strip() and not body.file_ids:
+        raise Problem(422, "empty_turn", "a turn needs text or at least one file")
+    if not body.content.strip() and body.intent != "conversation":
+        raise Problem(422, "file_only_intent", "file-only turns must use conversation intent")
     runner_selected = body.intent in {"code", "workload"}
     if runner_selected and body.target_slugs:
         raise Problem(
@@ -1210,7 +1029,7 @@ async def create_turn(
     # A mention is a request to reply. It records the agent as a target and
     # joins it to the channel; it never rewrites what the caller asked for.
     intent = body.intent
-    participants = await ctx.call(_mentioned_agents, ctx, body.content, targets)
+    participants = await ctx.call(ctx.mentioned_agents, body.content, targets)
     assignees = (
         await ctx.call(_assignees, ctx, participants) if intent in WORK_INTENTS else None
     ) or None
@@ -1223,6 +1042,7 @@ async def create_turn(
             targets=targets,
             client_turn_id=body.client_turn_id,
             client_message_id=body.client_message_id,
+            file_ids=tuple(body.file_ids),
             actor=auth.principal.audit(),
             intent=intent,
             participants=participants,
@@ -1305,16 +1125,14 @@ async def stop_channel(
     running turns are cancelled, the runs the channel asked for are
     cancelled and the work it queued is abandoned through the daemon's
     control service (scoped to this channel's own work, so a member who
-    may post needs no run control), and the channel is silenced until
-    ``resume`` or a ``silence`` of its own lifts it.
+    may post needs no run control), and the channel is silenced for an
+    hour (``sbxloop.api.context.STOP_SILENCE_S``) until ``resume`` or a
+    ``silence`` of its own lifts it. A ``/stop`` typed in the channel goes
+    through the same :meth:`ApiContext.stop_channel`.
     """
-    until = ctx.clock() + STOP_SILENCE_S
-    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, until, ctx.clock())
-    if channel is None:
+    outcome = await ctx.call(ctx.stop_channel, channel_id, member, principal=auth.principal)
+    if outcome is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    outcome = await ctx.call(
-        ctx.cancel_channel, channel_id, channel.silenced_until, principal=auth.principal
-    )
     return ChannelStopOut.model_validate(outcome)
 
 
@@ -1618,7 +1436,11 @@ async def list_bridges(
         data=[
             BridgeOut(
                 backend=service.name,  # type: ignore[arg-type]
-                configured=bool(ctx.config.chat_section(service.name).enabled),  # type: ignore[arg-type]
+                configured=(
+                    ctx.config.chat_backend == service.name
+                    and bool(ctx.config.chat_section(service.name).enabled)
+                    and all(os.environ.get(env) for env in service.token_envs)
+                ),
                 label=service.label,
             )
             for service in CHAT_SERVICES

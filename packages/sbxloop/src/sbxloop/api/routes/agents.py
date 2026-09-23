@@ -1,15 +1,20 @@
 """The agent directory: the built-ins, ``[[agents]]`` and people's own agents.
 
 Reads cover every source; only a person's own agents are created, edited
-(against the revision the caller last read) and archived. A built-in or
-configured agent answers 409 ``agent_read_only``. Every agent, from any
+(against the revision the caller last read) and archived, and only by the
+person who saved one or a workspace owner or admin (403 ``agent_forbidden``
+for anyone else). Letting an agent start work on its own (``can_start``)
+is the operator's to grant: only a workspace owner or admin sets it on a
+new agent or adds a kind to a saved one (403 ``agent_forbidden`` for a
+member, who may still narrow or clear it). A built-in or configured agent
+answers 409 ``agent_read_only``. Every agent, from any
 source, also has a long-term memory a person can list, add to, edit and
 forget (``/agents/{slug}/memories``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -20,6 +25,7 @@ from sbxloop.agents.memory import AgentMemoryError, Memory, WorkspaceChannelVisi
 from sbxloop.agents.registry import (
     AgentArchived,
     AgentExists,
+    AgentForbidden,
     AgentInvalid,
     AgentNotFound,
     AgentRegistry,
@@ -29,7 +35,8 @@ from sbxloop.agents.registry import (
     addressable,
 )
 from sbxloop.api.agents import AgentDefinition
-from sbxloop.api.auth.deps import Authenticated, get_ctx, require
+from sbxloop.api.auth.deps import Authenticated, get_ctx, require, role_of
+from sbxloop.api.channel_access import MANAGING_ROLES
 from sbxloop.api.collaboration_schemas import (
     AgentCreate,
     AgentOut,
@@ -105,6 +112,8 @@ def _problem(exc: SbxloopError) -> Problem:
         return Problem(409, "agent_archived", str(exc))
     if isinstance(exc, AgentRegistryReadOnly):
         return Problem(409, "agent_read_only", str(exc))
+    if isinstance(exc, AgentForbidden):
+        return Problem(403, "agent_forbidden", str(exc))
     raise exc
 
 
@@ -116,7 +125,40 @@ _REFUSALS = (
     AgentArchived,
     AgentRegistryReadOnly,
     AgentSlugTaken,
+    AgentForbidden,
 )
+
+
+def _saver(auth: Authenticated) -> tuple[str, bool]:
+    """Who saves, edits or archives an agent: the local user behind the
+    client (so a person keeps their agents from every client they sign in
+    with), or the client itself when no user stands behind it. The flag
+    says whether they may change anyone's agent: a workspace owner or
+    admin, which for a plain API client means holding ``daemon:manage``."""
+    member = auth.member
+    who = member.user.id if member is not None else auth.client.id
+    return who, role_of(auth) in MANAGING_ROLES
+
+
+def _refuse_start_grant(
+    requested: Iterable[str] | None, current: Iterable[str] = (), *, manager: bool
+) -> None:
+    """Refuse a body that would let an agent start a kind of run it cannot
+    already, unless a workspace owner or admin sends it. ``can_start`` is
+    what makes an agent queue runs and file issues by itself, and its daily
+    cap is the operator's ceiling either way, so the grant is the
+    operator's call too. Narrowing, clearing, or saving the same list back
+    (an editor that sends the whole form) is the agent owner's."""
+    if manager or not requested:
+        return
+    granted = set(requested) - set(current)
+    if granted:
+        raise Problem(
+            403,
+            "agent_forbidden",
+            "only a workspace owner or admin may let an agent start work on its own "
+            f"(can_start: {', '.join(sorted(granted))})",
+        )
 
 
 def _found(registry: AgentRegistry, slug: str) -> RegistryAgent:
@@ -165,8 +207,10 @@ async def create_agent(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
 ) -> AgentOut:
     spec = AgentSpec.model_validate(body.model_dump())
+    by, manager = _saver(auth)
+    _refuse_start_grant(spec.can_start, manager=manager)
     try:
-        agent = await ctx.call(ctx.agents.create, spec, auth.principal.id)
+        agent = await ctx.call(ctx.agents.create, spec, by)
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
@@ -182,8 +226,12 @@ async def update_agent(
 ) -> AgentOut:
     patch = body.model_dump(exclude_unset=True)
     expected = patch.pop("expected_revision")
+    by, manager = _saver(auth)
+    if not manager and patch.get("can_start"):
+        current = await ctx.call(_found, ctx.agents, slug)
+        _refuse_start_grant(patch["can_start"], current.spec.can_start, manager=manager)
     try:
-        agent = await ctx.call(ctx.agents.update, slug, patch, expected, auth.principal.id)
+        agent = await ctx.call(ctx.agents.update, slug, patch, expected, by, manager=manager)
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
@@ -196,8 +244,9 @@ async def archive_agent(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
 ) -> AgentOut:
+    by, manager = _saver(auth)
     try:
-        agent = await ctx.call(ctx.agents.archive, slug, auth.principal.id)
+        agent = await ctx.call(ctx.agents.archive, slug, by, manager=manager)
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
@@ -336,6 +385,7 @@ async def update_memory(
 ) -> MemoryOut:
     agent = await ctx.call(_agent_slug, ctx, slug)
     author = await ctx.call(_author, ctx, auth)
+    readable = await ctx.call(_reader, ctx, auth)
     try:
         memory = await ctx.call(
             ctx.memory.update,
@@ -345,6 +395,7 @@ async def update_memory(
             expected_revision=body.expected_revision,
             author=author,
             agent=agent,
+            readable=readable,
         )
     except AgentMemoryError as exc:
         raise _memory_problem(exc) from exc
@@ -361,8 +412,9 @@ async def delete_memory(
 ) -> None:
     agent = await ctx.call(_agent_slug, ctx, slug)
     author = await ctx.call(_author, ctx, auth)
+    readable = await ctx.call(_reader, ctx, auth)
     try:
-        await ctx.call(ctx.memory.forget, agent, memory_id, author=author)
+        await ctx.call(ctx.memory.forget, agent, memory_id, author=author, readable=readable)
     except AgentMemoryError as exc:
         raise _memory_problem(exc) from exc
     ctx.hub.notify()

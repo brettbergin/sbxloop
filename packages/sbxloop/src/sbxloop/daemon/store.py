@@ -73,6 +73,7 @@ from sbxloop.db.daemon_models import (
     MergeGateRow,
     PendingClarificationRow,
     PriorAttemptRow,
+    RepositoryRow,
     RequesterRow,
     ReviewHoldRow,
     RunResumeRow,
@@ -87,7 +88,9 @@ from sbxloop.ghids import (
     API_PREFIX,
     CHAT_PREFIX,
     SCHED_PREFIX,
+    chat_source_message_id,
     format_gh_id,
+    is_chat_id,
     normalize_item_id,
     try_parse_gh_id,
 )
@@ -604,6 +607,60 @@ class StoredSchedule(NamedTuple):
     created_at: float | None
 
 
+class StoredRepository(NamedTuple):
+    """A registered repository as the store holds it: the registration
+    plus its provenance. ``removed_at`` is set on a registration that was
+    removed and whose row stays so the file's copy is not imported again.
+
+    The ``labels_*`` fields are the last look at the repository's sbxloop
+    labels (#630): when it was taken, the names it was taken for, and the
+    ones the repository did not carry. ``labels_checked_at`` of ``None``
+    means no look has been taken — never that the repository carries them.
+    """
+
+    repo: str
+    kind: str | None
+    enabled: bool
+    deliver_base: str | None
+    source: str  # "config" (imported from sbxloop.toml) or "api"
+    created_by: str | None
+    created_at: float
+    updated_at: float
+    removed_at: float | None = None
+    labels_checked_at: float | None = None
+    labels_expected: tuple[str, ...] = ()
+    labels_missing: tuple[str, ...] = ()
+
+
+def _label_names(raw: str | None) -> tuple[str, ...]:
+    """A stored JSON array of label names; an unreadable one is no names,
+    which reads as a check that has to be taken again."""
+    if not raw:
+        return ()
+    try:
+        names = json.loads(raw)
+    except ValueError:
+        return ()
+    return tuple(str(name) for name in names) if isinstance(names, list) else ()
+
+
+def _row_to_repository(row: RepositoryRow) -> StoredRepository:
+    return StoredRepository(
+        repo=str(row.repo),
+        kind=row.kind,
+        enabled=bool(row.enabled),
+        deliver_base=row.deliver_base,
+        source=str(row.source),
+        created_by=row.created_by,
+        created_at=float(row.created_at),
+        updated_at=float(row.updated_at),
+        removed_at=row.removed_at,
+        labels_checked_at=row.labels_checked_at,
+        labels_expected=_label_names(row.labels_expected),
+        labels_missing=_label_names(row.labels_missing),
+    )
+
+
 def _row_to_gate(row: MergeGateRow) -> MergeGate:
     try:
         notify = tuple(str(v) for v in json.loads(row.notify_ids or "[]"))
@@ -864,6 +921,21 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         chain_depth=int(row.chain_depth or 0),
         revision=int(row.revision or 0),
     )
+
+
+def _message_link(item_id: str, run_kind: str, source_key: str) -> str | None:
+    """The chat message this item's key names, for the indexed link the
+    chat projection joins on (revision 0032).
+
+    Only a chat ask has one: its key is the asking message's id, with an
+    optional suffix after a colon naming which participant or target of
+    that message the work belongs to. Work keyed by an issue, a schedule
+    or an inbox file names no message and is linked by its channel, so it
+    stores nothing here rather than a prefix that could collide.
+    """
+    if not is_chat_id(item_id):
+        return None
+    return chat_source_message_id(run_kind, source_key)
 
 
 #: The ``daemon_state`` key prefix of a chat turn's admission note.
@@ -1781,6 +1853,7 @@ class DaemonStore:
                     profile=item.profile,
                     recipe=item.recipe,
                     recipe_target=item.recipe_target,
+                    message_id=_message_link(item_id, item.kind, item.source_key),
                     origin_agent=item.origin_agent,
                     parent_item_id=item.parent_item_id,
                     chain_depth=item.chain_depth,
@@ -2208,6 +2281,20 @@ class DaemonStore:
             row = session.scalars(select(WorkItemRow).where(_id_where(item_id))).first()
             return _row_to_item(row) if row else None
 
+    def get_many(self, item_ids: Sequence[str]) -> dict[str, WorkItem]:
+        """The items for ``item_ids``, keyed by the id asked for, in one
+        query. Ids are matched exactly: this serves readers that already
+        hold the id **as stored** (a projection that selected it from the
+        table), so it does not need :meth:`get`'s either-spelling lookup,
+        and an id with no row is simply absent from the result.
+        """
+        wanted = list(dict.fromkeys(item_ids))
+        if not wanted:
+            return {}
+        with self._read() as session:
+            rows = session.scalars(select(WorkItemRow).where(WorkItemRow.item_id.in_(wanted))).all()
+            return {str(row.item_id): _row_to_item(row) for row in rows}
+
     def next_queued(
         self,
         now: float,
@@ -2291,6 +2378,30 @@ class DaemonStore:
                     select(WorkItemRow).where(WorkItemRow.state == "running")
                 )
             ]
+
+    def channel_live_work(self, channel_id: str) -> tuple[list[str], list[str]]:
+        """``(running run ids, queued item ids)`` for one channel's work.
+
+        What a channel-wide stop acts on. Narrow on purpose: three columns
+        of the few live rows, keyed off the state index, rather than
+        :meth:`items`, which is unbounded, sorts on ``created_at`` and
+        hydrates every item's body to answer a question about one channel.
+        """
+        running: list[str] = []
+        queued: list[str] = []
+        with self._read() as session:
+            rows = session.execute(
+                select(WorkItemRow.item_id, WorkItemRow.state, WorkItemRow.run_id).where(
+                    WorkItemRow.state.in_(("running", "queued")),
+                    WorkItemRow.channel_id == channel_id,
+                )
+            ).all()
+        for item_id, state, run_id in rows:
+            if state == "running" and run_id:
+                running.append(str(run_id))
+            elif state == "queued":
+                queued.append(str(item_id))
+        return running, queued
 
     def items(self, states: Sequence[ItemState] | None = None) -> list[WorkItem]:
         """Every known item (optionally filtered by state), oldest first —
@@ -2959,6 +3070,132 @@ class DaemonStore:
                 )
             )
             return True
+
+    # -- the registered repositories ------------------------------------------------
+
+    def repositories(self, *, include_removed: bool = False) -> list[StoredRepository]:
+        """Every registered repository in registration order; the removed
+        ones too when asked (they keep their row, see :class:`StoredRepository`)."""
+        with self._read() as session:
+            # Registration order: by time, then by the row's own order for
+            # registrations made within one clock tick.
+            query = select(RepositoryRow).order_by(RepositoryRow.created_at, text("rowid"))
+            if not include_removed:
+                query = query.where(RepositoryRow.removed_at.is_(None))
+            return [_row_to_repository(row) for row in session.scalars(query)]
+
+    def repository(self, repo: str) -> StoredRepository | None:
+        """The registration of ``repo`` (a forge name is case-insensitive),
+        None when there is none or it was removed."""
+        with self._read() as session:
+            row = session.scalars(
+                select(RepositoryRow).where(
+                    func.lower(RepositoryRow.repo) == repo.casefold(),
+                    RepositoryRow.removed_at.is_(None),
+                )
+            ).first()
+            return None if row is None else _row_to_repository(row)
+
+    def add_repository(
+        self,
+        repo: str,
+        *,
+        kind: str | None,
+        enabled: bool,
+        deliver_base: str | None,
+        source: str,
+        by: str | None,
+        now: float,
+        revive: bool,
+    ) -> bool:
+        """Register ``repo``. A name registered already (case-insensitively)
+        is left as it is (False). A removed registration of that name is
+        taken over when ``revive`` (the API registering it again) and
+        blocks otherwise (the file's copy, imported once and not again)."""
+        # The check and the write are one transaction: two callers adding
+        # the same name must not both see "not registered".
+        with self._lock, begin_immediate(self._engine) as conn:
+            row = conn.execute(
+                select(RepositoryRow.repo, RepositoryRow.removed_at).where(
+                    func.lower(RepositoryRow.repo) == repo.casefold()
+                )
+            ).first()
+            if row is not None and (row.removed_at is None or not revive):
+                return False
+            values: dict[str, Any] = {
+                "kind": kind,
+                "enabled": 1 if enabled else 0,
+                "deliver_base": deliver_base,
+                "source": source,
+                "created_by": by,
+                "created_at": now,
+                "updated_at": now,
+                "removed_at": None,
+            }
+            if row is None:
+                conn.execute(insert(RepositoryRow).values(repo=repo, **values))
+            else:
+                conn.execute(
+                    update(RepositoryRow)
+                    .where(RepositoryRow.repo == row.repo)
+                    .values(repo=repo, **values)
+                )
+            return True
+
+    def update_repository(self, repo: str, *, now: float, **values: Any) -> bool:
+        """Change a registration's fields in place; False when ``repo`` is
+        not registered (or was removed)."""
+        if "enabled" in values:
+            values["enabled"] = 1 if values["enabled"] else 0
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(RepositoryRow.repo == repo, RepositoryRow.removed_at.is_(None))
+                .values(updated_at=now, **values)
+            )
+            return _rowcount(result) == 1
+
+    def record_repository_labels(
+        self,
+        repo: str,
+        *,
+        expected: Sequence[str],
+        missing: Sequence[str],
+        now: float,
+    ) -> bool:
+        """Record the look just taken at ``repo``'s sbxloop labels: the
+        names it was taken for and the ones the repository did not carry.
+        False when ``repo`` is not registered (or was removed).
+
+        Only a look that answered is recorded. A forge that refused the
+        listing leaves the previous record standing, stale and dated, so
+        a reader can tell "last seen set up an hour ago" from "set up".
+        """
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(
+                    func.lower(RepositoryRow.repo) == repo.casefold(),
+                    RepositoryRow.removed_at.is_(None),
+                )
+                .values(
+                    labels_checked_at=now,
+                    labels_expected=json.dumps(list(expected)),
+                    labels_missing=json.dumps(list(missing)),
+                )
+            )
+            return _rowcount(result) == 1
+
+    def remove_repository(self, repo: str, *, now: float) -> bool:
+        """Mark a registration removed, keeping its row; False when there
+        was none."""
+        with self._write() as session:
+            result = session.execute(
+                update(RepositoryRow)
+                .where(RepositoryRow.repo == repo, RepositoryRow.removed_at.is_(None))
+                .values(removed_at=now, updated_at=now)
+            )
+            return _rowcount(result) == 1
 
     def remove_schedule(self, name: str) -> bool:
         """Forget a schedule, state and all: a schedule re-added under the

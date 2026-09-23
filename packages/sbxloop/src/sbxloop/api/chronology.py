@@ -117,7 +117,15 @@ def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
     assert visible is not None  # nosec B101 - a member always narrows
     conditions.append(
         or_(
-            ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
+            ApiEventRow.channel_id.in_(
+                select(ChannelRow.id).where(visible, ChannelRow.deleted_at.is_(None))
+            ),
+            # Former readers still need the tombstone to remove the chat
+            # from their list, but its run history no longer grants access.
+            and_(
+                ApiEventRow.type == "collaboration.channel.deleted",
+                ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
+            ),
             and_(ApiEventRow.channel_id.is_(None), ApiEventRow.run_id.is_(None)),
         )
     )
@@ -163,11 +171,29 @@ class Chronology:
             if copied < self.BATCH:
                 return total
 
+    def _idle(self) -> bool:
+        """True when the engine has written nothing past the watermark.
+
+        Every open stream projects on every wake, and nearly every wake has
+        nothing to copy. Answering that from a read keeps the common case
+        off the store's one write lock, where N open browser tabs otherwise
+        cost N ``BEGIN IMMEDIATE`` a second competing with the daemon's own
+        writes. An event committed after this read is copied by the next
+        wake: the watermark only ever moves forward, so nothing is skipped,
+        only deferred by one tick.
+        """
+        with self.dstore.read() as session:
+            newest = session.scalar(select(func.max(EventRow.seq)))
+            return int(newest or 0) <= _int_state(session, WATERMARK_KEY)
+
     def _project_batch(self, now: float) -> int:
-        # Reserve the write lock before reading the source rows. The engine
-        # store writes through another connection; if it committed between a
-        # deferred read and this batch's INSERT, WAL would reject the stale
-        # snapshot's read-to-write upgrade with SQLITE_BUSY.
+        if self._idle():
+            return 0
+        # There is something to copy, so reserve the write lock before
+        # reading the source rows. The engine store writes through another
+        # connection; if it committed between a deferred read and this
+        # batch's INSERT, WAL would reject the stale snapshot's
+        # read-to-write upgrade with SQLITE_BUSY.
         with self.dstore.immediate_transaction() as session:
             watermark = _int_state(session, WATERMARK_KEY)
             rows = session.execute(

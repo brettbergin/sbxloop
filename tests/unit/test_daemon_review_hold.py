@@ -31,6 +31,9 @@ def config(tmp_path: Path, **overrides: Any) -> Config:
     data: dict[str, Any] = {
         "home": str(tmp_path / "state"),
         "github": {"repo": "o/r", "reviewers": ["alice", "o/reviewers"]},
+        # The tick's label reading (#630) is another forge call; these
+        # tests count the ones the review poll makes, so it is off here.
+        "daemon": {"label_check_interval_s": 0},
         "landing": {"review_poll_interval_s": 600, "review_wait_s": 3600, **overrides},
     }
     return Config.model_validate(data)

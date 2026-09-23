@@ -7,9 +7,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pytest
 from sqlalchemy.exc import OperationalError
 
 from sbxloop.api.auth.deps import resolve_token
+from sbxloop.api.errors import Problem
 
 
 def _register(api: Any, **extra: Any) -> dict[str, Any]:
@@ -77,10 +79,12 @@ def test_a_removed_member_is_no_longer_the_local_profile(api: Any) -> None:
     guest = _register(api, email="g@example.test", username="guest", invite_token=raw)
     store.remove_member(store.member_for_client(guest["client_id"]).user.id)
 
-    assert resolve_token(api.ctx, guest["access_token"]).member is None
+    with pytest.raises(Problem) as refused:
+        resolve_token(api.ctx, guest["access_token"])
+    assert refused.value.code == "access_revoked"
     response = api.client.get("/v1/users/me", headers=_bearer(guest))
-    assert response.status_code == 403
-    assert response.json()["code"] == "local_profile_required"
+    assert response.status_code == 401
+    assert response.json()["code"] == "access_revoked"
 
 
 def test_last_seen_is_recorded_at_most_once_a_minute(api: Any) -> None:

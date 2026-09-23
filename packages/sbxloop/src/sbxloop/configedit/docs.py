@@ -9,9 +9,9 @@ the key's own line when there is one, else the run of comment lines
 directly above it. A key the parser cannot pair gets nothing — never an
 invented sentence; the caller falls back to the type summary.
 
-Keys are the example's dotted form (``github.repos.repo`` for a
-``[[github.repos]]`` entry); :func:`doc_for` strips an editor path's indices
-so ``github.repos[1].repo`` finds it.
+Keys are the example's dotted form (``vcs.repos.repo`` for a
+``[[vcs.repos]]`` entry); :func:`doc_for` strips an editor path's indices
+so ``vcs.repos[1].repo`` finds it.
 """
 
 from __future__ import annotations
@@ -109,8 +109,16 @@ def _looks_like_value(value: str) -> bool:
 
 @cache
 def doc_lines() -> dict[str, str]:
-    """The packaged example's docs, parsed once per process."""
-    return parse(_example_text())
+    """The packaged example's docs, parsed once per process.
+
+    ``[[github.repos]]`` is the legacy spelling of ``[[vcs.repos]]`` (#2255):
+    the example documents the entry once, under the current name, and the
+    legacy path reads the same lines."""
+    docs = parse(_example_text())
+    for key, doc in list(docs.items()):
+        if key == "vcs.repos" or key.startswith("vcs.repos."):
+            docs.setdefault("github" + key.removeprefix("vcs"), doc)
+    return docs
 
 
 def doc_for(dotted: str) -> str | None:

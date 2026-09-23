@@ -43,7 +43,7 @@ class PublishError(Exception):
 
 
 def result_label(name: str) -> LabelSpec:
-    return LabelSpec(name, *RESULT_LABEL_DESCRIPTOR)
+    return LabelSpec(name, *RESULT_LABEL_DESCRIPTOR, kind="result")
 
 
 def sink_of(task: TaskRecord) -> str:

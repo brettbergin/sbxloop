@@ -677,7 +677,7 @@ class TestDaemonGithubInstance:
         """A fixed name plus remove_stale() at startup meant a second daemon
         on the host killed the first's github sandbox (#254)."""
         from sbxloop.config import Config
-        from sbxloop.daemon.github import SANDBOX_NAME_PREFIX, DaemonGithub, sandbox_name_for
+        from sbxloop.daemon.github import DaemonGithub, sandbox_name_for
         from sbxloop.events import EventBus
 
         a = Config.model_validate({"home": str(tmp_path / "a")})
@@ -685,7 +685,7 @@ class TestDaemonGithubInstance:
         gh_a = DaemonGithub(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         gh_b = DaemonGithub(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         assert gh_a.name != gh_b.name
-        assert gh_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
+        assert gh_a.name.endswith("-daemon-vcs-github")
         assert gh_a.name == sandbox_name_for(a.paths)  # stable across restarts
 
     def test_reprovision_is_rate_limited(self, tmp_path: Any) -> None:

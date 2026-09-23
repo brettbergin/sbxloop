@@ -86,7 +86,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "# allow_insecure_endpoint = ",
         "# api = ",
         "# reasoning_effort = ",
-        "# [github.repos.openai]",
+        "# [vcs.repos.openai]",
     ):
         assert key in DEFAULT_CONFIG_TOML, key
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text()
@@ -97,7 +97,7 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "`[agent.openai] allow_insecure_endpoint`",
         "`[agent.openai] api`",
         "`[agent.openai] reasoning_effort`",
-        "`[github.repos.openai] base_url`",
+        "`[vcs.repos.openai] base_url`",
     ):
         assert key in guide, key
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
@@ -115,6 +115,19 @@ def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 1}
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
     assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
+
+
+def test_the_label_reading_cadence_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[daemon] label_check_interval_s`."""
+    assert Config.model_validate({}).daemon.label_check_interval_s == 3600.0
+    (line,) = [
+        line
+        for line in DEFAULT_CONFIG_TOML.splitlines()
+        if line.startswith("# label_check_interval_s = ")
+    ]
+    assert tomllib.loads(line.removeprefix("# ")) == {"label_check_interval_s": 3600.0}
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    assert "| `[daemon] label_check_interval_s` | `3600.0`" in guide
 
 
 def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
@@ -140,6 +153,13 @@ def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
     assert documented == fields
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
     assert f"#{oidc.client_secret_env}=" in secrets.read_text(encoding="utf-8")
+
+
+def test_local_auth_policy_is_documented_with_its_compatible_default() -> None:
+    assert Config.model_validate({}).api.local_auth_enabled is True
+    assert "# local_auth_enabled = true" in DEFAULT_CONFIG_TOML
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
+    assert "`[api] local_auth_enabled`" in guide
 
 
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
@@ -320,9 +340,10 @@ def test_example_mentions_every_key_the_config_model_knows() -> None:
     assert not missing, f"keys absent from sbxloop.toml.example: {missing}"
 
 
-def test_example_documents_both_github_forms() -> None:
+def test_example_documents_the_repo_entry_and_the_legacy_form() -> None:
     text = EXAMPLE.read_text()
-    assert "[[github.repos]]" in text
+    assert "[[vcs.repos]]" in text
+    # The single `[github] repo` is documented as the legacy form (#2255).
     assert re.search(r"^# repo = \"you/your-repo\"", text, re.MULTILINE)
     for key in ("deliver_base", "enabled", "token_env", "trigger_label", "labels", "workspace"):
         assert re.search(rf"^#\s*{key} = ", text, re.MULTILINE), key
@@ -535,12 +556,15 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             continue  # a multi-line value (the exclude list); covered below
         if section in ("registries", "credentials", "workloads", "schedules", "mcp", "agents"):
             continue  # array-of-tables entries load as whole blocks, below
-        if section == "github.repos":
-            doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
-        elif section == "github.repos.agent_models":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
-        elif section == "github.repos.openai":
-            doc = {"github": {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
+        if section in ("vcs.repos", "github.repos"):
+            top = section.split(".")[0]
+            doc: dict[str, Any] = {top: {"repos": [{"repo": "you/your-repo", **parsed}]}}
+        elif section in ("vcs.repos.agent_models", "github.repos.agent_models"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
+        elif section in ("vcs.repos.openai", "github.repos.openai"):
+            top = section.split(".")[0]
+            doc = {top: {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
         elif section == "agent.models":
             doc = {"agent": {"models": parsed}}
         elif section == "agent.openai":

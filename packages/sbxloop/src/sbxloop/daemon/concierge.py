@@ -51,7 +51,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, suppress
+from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -71,6 +71,7 @@ from sbxloop.daemon.chat_choices import (
 )
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
+from sbxloop.daemon.controls.principal import Capability, Principal
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.model import WorkItem, live_runs, requested_roles_json
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -198,6 +199,12 @@ class TurnContext:
     #: context instead.
     owner: object = field(default=None, compare=False, repr=False)
     author_id: str | None = None
+    #: Who the turn acts as when a tool runs an operator command or writes
+    #: the config: the person who asked, holding what their role grants
+    #: (#1274). ``None`` is a turn nobody vouched for, which such tools
+    #: treat as read-only; a surface that trusts its channel says so with
+    #: an explicit :meth:`Principal.trusted`.
+    principal: Principal | None = None
     via: str | None = None
     message_id: str | None = None
     session_key: str | None = None
@@ -210,6 +217,11 @@ class TurnContext:
     start_work: bool = True
     role: Role = "concierge"
     read_only: bool = False
+    #: The turn descends, through handoffs, from an agent whose starts
+    #: answer to the agent-team guardrails (its ``can_start``): the
+    #: concierge's own start tools, which check none of them, are withheld
+    #: from it as they are from that agent.
+    guarded_start: bool = False
     handoff: Callable[[str, str], str] | None = None
     #: The agents ``handoff_agent`` offers; ``None`` offers the built-ins.
     handoff_agents: tuple[str, ...] | None = None
@@ -248,6 +260,12 @@ class TurnContext:
 #: Who ``handoff_agent`` may address when the turn does not say.
 _HANDOFF_BUILTINS = ("concierge", "planner", "builder", "critic", "operator")
 
+#: What a turn with no principal may do through ``sbx_control``: the read
+#: verbs (``status``, ``queue``, ``items``, ``schedules``, ``log``) and
+#: nothing that acts. Failing closed here means a caller that forgets to
+#: say who is asking cannot drive the daemon as its operator.
+_UNVOUCHED_CAPABILITIES: frozenset[Capability] = frozenset({"runs:read", "diagnostics:read"})
+
 _CURRENT_TURN: ContextVar[TurnContext | None] = ContextVar("sbxloop_concierge_turn", default=None)
 
 
@@ -282,6 +300,15 @@ class ConciergeReply(NamedTuple):
     #: Product clients publish these with the agent's prose so a peer handoff
     #: can never hide the work that the peer was asked to inspect.
     work_products: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, eq=False)
+class _QueuedTurn:
+    """A submitted turn waiting in its session's lane: the Future its caller
+    holds and the work that settles it."""
+
+    future: Future[ConciergeReply]
+    run: Callable[[], ConciergeReply]
 
 
 class SessionHost(Protocol):
@@ -447,9 +474,10 @@ class Concierge:
         # None and so resumes the one default session, so they all share a
         # single reserved lane. Each lane is FIFO in arrival order, so a
         # surface's messages are still answered in the order they were sent
-        # whatever ``[concierge] max_concurrent_turns`` is set to.
-        self._lanes: dict[str, deque[object]] = {}
-        self._lanes_changed = threading.Condition()
+        # whatever ``[concierge] max_concurrent_turns`` is set to. Only a
+        # lane's head is on the pool; the rest wait here, holding no worker.
+        self._lanes: dict[str, deque[_QueuedTurn]] = {}
+        self._lanes_lock = threading.Lock()
         self._tool_lock = threading.Lock()
         self._closed = False
         self._tools: dict[str, HostTool] = {t.spec.name: t for t in self._build_tools()}
@@ -547,6 +575,10 @@ class Concierge:
         return self._turn.read_only
 
     @property
+    def _turn_guarded_start(self) -> bool:
+        return self._turn.guarded_start
+
+    @property
     def _turn_handoff(self) -> Callable[[str, str], str] | None:
         return self._turn.handoff
 
@@ -578,6 +610,27 @@ class Concierge:
     def _turn_model(self) -> ModelSelection:
         return self._turn.model
 
+    def _turn_principal(self, by: str) -> Principal:
+        """Who an operator command or config write on this turn runs as.
+
+        The turn's principal keeps its identity, capabilities and workspace,
+        so the control service refuses what the person's role does not
+        grant and the audit record names them; its attribution becomes the
+        ``by`` the tool composed (``<author> (via concierge)``), so the
+        source hears the sentence it always heard. A turn with no principal
+        gets the read verbs alone.
+        """
+        principal = self._turn.principal
+        if principal is None:
+            return Principal(
+                kind="system",
+                id="unvouched",
+                display=by,
+                via="concierge",
+                capabilities=_UNVOUCHED_CAPABILITIES,
+            )
+        return replace(principal, display=by, via="concierge")
+
     @property
     def _via(self) -> str:
         return self._turn_via or self._default_via
@@ -596,6 +649,7 @@ class Concierge:
         *,
         author: str,
         author_id: str | None = None,
+        principal: Principal | None = None,
         on_tool: ToolCallback | None = None,
         via: str | None = None,
         message_id: str | None = None,
@@ -606,6 +660,7 @@ class Concierge:
         history: str | None = None,
         agent_role: Role = "concierge",
         read_only: bool = False,
+        guarded_start: bool = False,
         handoff: Callable[[str, str], str] | None = None,
         on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
         on_code_work: Callable[[str, int, str], None] | None = None,
@@ -621,7 +676,12 @@ class Concierge:
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
-        recorded as the requester of any issue this turn files; ``via`` is
+        recorded as the requester of any issue this turn files;
+        ``principal`` is who the turn's operator command or config write is
+        authorized as (the person who asked, with what their role grants):
+        a turn without one may only read through those tools, so a surface
+        whose channel is the operator's passes ``Principal.trusted``
+        explicitly; ``via`` is
         the bridge the message came in on, so the reply is worded for it;
         ``message_id`` is the transport's id for the message, the key of a
         workload this turn starts (#760) so asking twice queues once.
@@ -633,7 +693,10 @@ class Concierge:
         it answers and the agent that speaks (the role when unset);
         ``agent_tools`` are the answering agent's own tools (its memory),
         offered only when the turn may act. ``start_work`` false withholds
-        the tools that start managed work, so the turn can only reply.
+        the tools that start managed work, so the turn can only reply;
+        ``guarded_start`` withholds only the concierge's own start tools,
+        for a turn an agent with ``can_start`` handed off to, so the
+        handoff is not the way round that agent's guardrails.
         ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
         this turn starts is admitted with: the channel it answers to, the
         lead and the agent per run role (already checked by the caller).
@@ -646,9 +709,6 @@ class Concierge:
             if self._closed:
                 raise RuntimeError("concierge is closed")
             self._pending += 1
-        # Take this turn's place in its session's lane now, under the
-        # caller's ordering, not when a pool thread happens to pick it up.
-        lane_key, ticket = self._join_lane(session_key)
 
         def turn() -> ConciergeReply:
             with self._state_lock:
@@ -657,6 +717,7 @@ class Concierge:
                 model=self._idle_turn.model,
                 owner=self,
                 author_id=author_id,
+                principal=principal,
                 via=via,
                 message_id=message_id,
                 session_key=session_key,
@@ -666,6 +727,7 @@ class Concierge:
                 start_work=start_work,
                 role=agent_role,
                 read_only=read_only,
+                guarded_start=guarded_start,
                 handoff=handoff,
                 handoff_agents=None if handoff_agents is None else tuple(handoff_agents),
                 model_override=model,
@@ -703,64 +765,85 @@ class Concierge:
                 updates["work_products"] = tuple(dict.fromkeys(turn_work_products))
             return reply._replace(**updates) if updates else reply
 
-        def run() -> ConciergeReply:
-            # One turn at a time per session: the next one in the lane starts
-            # only once this one has written the session back.
-            self._await_lane(lane_key, ticket)
-            try:
-                return turn()
-            finally:
-                self._leave_lane(lane_key, ticket)
-
-        def release(future: Future[ConciergeReply]) -> None:
-            # A cancelled turn never runs, so nothing else would give its
-            # lane place back and the turns behind it would wait forever.
-            if future.cancelled():
-                self._leave_lane(lane_key, ticket)
-
+        queued = _QueuedTurn(Future(), turn)
         try:
-            future = self._executor.submit(run)
+            self._enqueue(session_key or "", queued)
         except BaseException:
-            self._leave_lane(lane_key, ticket)
-            with self._state_lock:
-                self._pending -= 1
+            self._forget_pending()
             raise
-        future.add_done_callback(release)
-        return future
+        return queued.future
 
     # -- session lanes ----------------------------------------------------------
 
-    def _join_lane(self, session_key: str | None) -> tuple[str, object]:
-        """Reserve the back of the lane a turn on ``session_key`` runs in.
+    def _enqueue(self, lane_key: str, queued: _QueuedTurn) -> None:
+        """Take this turn's place at the back of its session's lane, now,
+        under the caller's ordering; hand it to the pool if the lane was empty.
 
         The reserved key ``""`` is the default session every bridge turn
         resumes; a keyed turn (one product channel's participant) has a lane
-        of its own.
+        of its own. Only a lane's head is ever on the pool: a turn waiting for
+        the one ahead of it holds no worker, so it can neither keep another
+        session's turn from a worker nor keep the turn it waits for from one.
         """
-        lane_key = session_key or ""
-        ticket = object()
-        with self._lanes_changed:
-            self._lanes.setdefault(lane_key, deque()).append(ticket)
-        return lane_key, ticket
+        with self._lanes_lock:
+            if self._closed:
+                raise RuntimeError("concierge is closed")
+            lane = self._lanes.setdefault(lane_key, deque())
+            lane.append(queued)
+            if len(lane) > 1:
+                return
+            try:
+                self._executor.submit(self._drive, lane_key, queued)
+            except BaseException:
+                del self._lanes[lane_key]
+                raise
 
-    def _await_lane(self, lane_key: str, ticket: object) -> None:
-        """Block until every turn reserved before this one has finished."""
-        with self._lanes_changed:
-            self._lanes_changed.wait_for(lambda: self._head_of(lane_key) is ticket)
+    def _drive(self, lane_key: str, queued: _QueuedTurn) -> None:
+        """Run a lane's head on a pool worker, then start the next turn in the
+        lane: one turn at a time per session, each after the one before it has
+        written the session back."""
+        try:
+            if queued.future.set_running_or_notify_cancel():
+                try:
+                    reply = queued.run()
+                except BaseException as exc:
+                    queued.future.set_exception(exc)
+                else:
+                    queued.future.set_result(reply)
+            else:
+                self._forget_pending()
+        finally:
+            with self._lanes_lock:
+                lane = self._lanes.get(lane_key)
+                if lane and lane[0] is queued:
+                    lane.popleft()
+                abandoned = self._start_head(lane_key)
+            for waiting in abandoned:
+                waiting.future.cancel()
 
-    def _leave_lane(self, lane_key: str, ticket: object) -> None:
-        with self._lanes_changed:
-            lane = self._lanes.get(lane_key)
-            if lane is not None:
-                with suppress(ValueError):
-                    lane.remove(ticket)
-                if not lane:
-                    del self._lanes[lane_key]
-            self._lanes_changed.notify_all()
-
-    def _head_of(self, lane_key: str) -> object | None:
+    def _start_head(self, lane_key: str) -> list[_QueuedTurn]:
+        """Hand the lane's next turn to the pool, passing over any cancelled
+        while it waited. Called with ``_lanes_lock`` held; returns the turns
+        left to cancel when the pool has shut down under the lane."""
         lane = self._lanes.get(lane_key)
-        return lane[0] if lane else None
+        while lane:
+            head = lane[0]
+            if not head.future.cancelled():
+                try:
+                    self._executor.submit(self._drive, lane_key, head)
+                except RuntimeError:
+                    break
+                return []
+            lane.popleft()
+            self._forget_pending()
+        abandoned = list(lane or ())
+        self._lanes.pop(lane_key, None)
+        return abandoned
+
+    def _forget_pending(self) -> None:
+        """A turn that will never run is no longer waiting."""
+        with self._state_lock:
+            self._pending -= 1
 
     def reset_session(self, session_key: str | None = None) -> None:
         self.dstore.set_value(self._session_state_key(STATE_SESSION_ID, session_key), None)
@@ -771,6 +854,13 @@ class Concierge:
     def close(self) -> None:
         with self._state_lock:
             self._closed = True
+        with self._lanes_lock:
+            # A turn still waiting in a lane never reaches the pool now; the
+            # one running at a lane's head finishes and starts nothing.
+            waiting = [queued for lane in self._lanes.values() for queued in lane]
+            self._lanes.clear()
+        for queued in waiting:
+            queued.future.cancel()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self.host.close()
         store, self._store = self._store, None
@@ -930,8 +1020,8 @@ class Concierge:
             )
         elif not self._turn_start_work:
             persona += (
-                "\n\nThis turn cannot start managed work: no workload, issue, scan or "
-                "schedule tools are available. Answer in this reply."
+                "\n\nThis turn cannot start managed work or change anything: only read "
+                "tools are available. Answer in this reply."
             )
         history = ""
         if self._turn_history:
@@ -1101,9 +1191,9 @@ class Concierge:
 
     def _repo_label(self) -> str:
         """How the tool descriptions name the repositories they act on."""
-        repos = [r.repo for r in self.config.github.repo_list() if r.enabled]
+        repos = [r.repo for r in self.config.repo_list() if r.enabled]
         if not repos:
-            return self.config.github.repo or "(no GitHub repository configured)"
+            return self.config.primary_repo or "(no GitHub repository configured)"
         if len(repos) == 1:
             return repos[0]
         return "the configured repositories (" + ", ".join(repos) + ")"
@@ -1117,7 +1207,7 @@ class Concierge:
                     health[str(row["repo"]).casefold()] = row
         except Exception:  # the listing must not depend on the loop answering
             health = {}
-        for entry in self.config.github.repo_list():
+        for entry in self.config.repo_list():
             base = entry.deliver_base or "(repo default)"
             state = "enabled" if entry.enabled else "disabled"
             trigger = self.config.labels_for(entry.repo).trigger
@@ -1252,17 +1342,16 @@ class Concierge:
             # Adapted to the roster's (args, by) shape: the tool reads the
             # channel, so who asked does not change what it may see.
             offered[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
+        # A reviewer, a read-only peer and a turn that may only reply (a
+        # conversation that mentions an agent) keep the read tools alone: a
+        # reply is the only outcome such a turn can have, so nothing that
+        # starts work, runs an operator command, changes the config or writes
+        # to the forge is offered.
         available = (
             {name: tool for name, tool in offered.items() if name in reads}
-            if self._turn_role == "critic" or self._turn_read_only
+            if self._turn_role == "critic" or self._turn_read_only or not self._turn_start_work
             else offered
         )
-        if not self._turn_start_work:
-            # A turn that may only reply (a conversation that mentions an
-            # agent) keeps its read tools but none that start managed work.
-            available = {
-                name: tool for name, tool in available.items() if name not in UNGUARDED_START_TOOLS
-            }
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]
             if self._turn_role != "concierge":
@@ -1306,11 +1395,15 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
-        if any(tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools):
+        if self._turn_guarded_start or any(
+            tool.spec.name in WORK_TOOL_NAMES for tool in self._turn_agent_tools
+        ):
             # An agent offered its own guarded start_run / file_issue starts
             # work only through them: these check none of its can_start,
             # chain depth, daily cap or dedupe, so leaving them beside the
-            # guarded pair would make every one of those a suggestion.
+            # guarded pair would make every one of those a suggestion. A
+            # peer such an agent handed off to is not offered them either,
+            # or the handoff would be the way round the same guardrails.
             for name in UNGUARDED_START_TOOLS:
                 available.pop(name, None)
         for tool in self._turn_agent_tools:
@@ -1732,7 +1825,7 @@ class Concierge:
                     self._tool_set_config,
                 ),
             ]
-        if self.config.github.repo_list():
+        if self.config.repo_list():
             tools.append(
                 HostTool(
                     HostToolSpec(
@@ -1749,7 +1842,7 @@ class Concierge:
                     self._tool_list_repos,
                 )
             )
-        if self.github is not None and self.config.github.repo:
+        if self.github is not None and self.config.primary_repo:
             tools.append(
                 HostTool(
                     HostToolSpec(
@@ -1808,7 +1901,7 @@ class Concierge:
             )
         if (
             self.github is not None
-            and self.config.github.repo
+            and self.config.primary_repo
             and self.config.concierge.create_issues
         ):
             trigger = self.config.daemon.trigger_label
@@ -2021,8 +2114,15 @@ class Concierge:
                 "process itself — and is not available from here; `cancel` stops the current "
                 "run, `pause` keeps the daemon from claiming more."
             )
+        # Authorized as the person the turn belongs to (#1274): `dispatch`
+        # would otherwise trust the concierge completely, whoever asked.
         reply = dispatch(
-            self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
+            self.loop,
+            command,
+            prefix=self._chat.command_prefix,
+            by=by,
+            via="concierge",
+            principal=self._turn_principal(by),
         )
         if reply.after is not None:
             # Not here: the model has not composed its answer yet, and a
@@ -2356,6 +2456,8 @@ class Concierge:
         profile_text = f"profile `{profile.name}`" if profile is not None else "no profile"
         if not queued:
             return f"`{item.item_id}` is already queued or running ({profile_text})."
+        # The row is in; the loop need not sit out its poll interval.
+        self.loop.wake()
         status = self.loop.status()
         note = ""
         if status.get("paused"):
@@ -2364,9 +2466,8 @@ class Concierge:
             note = " The breaker is OPEN — nothing runs until it resets."
         return (
             f"queued workload `{item.item_id}` under {profile_text} — the daemon starts it "
-            f"within {self.config.daemon.poll_interval_s:g}s, after anything already queued; "
-            "a run thread will appear here and the person will be pinged when the result "
-            f"is published.{note}"
+            "now, after anything already queued; a run thread will appear here and the "
+            f"person will be pinged when the result is published.{note}"
         )
 
     def _entrygraph_tools(self) -> list[HostTool]:
@@ -2443,7 +2544,7 @@ class Concierge:
             if existing is not None:
                 lines.append(f"`{item_id}` already exists ({existing.state}) for {target}.")
                 continue
-            entry = self.config.github.find_repo(target)
+            entry = self.config.find_repo(target)
             title = f"Run entrygraph against {target}"
             item = WorkItem(
                 item_id=item_id,
@@ -2472,6 +2573,8 @@ class Concierge:
                 by=by,
                 fresh=queued,
             )
+            if queued:
+                self.loop.wake()
             state = "queued" if queued else "already queued or running"
             lines.append(f"{state} entrygraph workload `{item_id}` for {target}.")
         lines.append(
@@ -2545,13 +2648,13 @@ class Concierge:
         prefix = str(args.get("prefix") or "").strip().strip(".")
         if not selector:
             return prefix or None, None
-        entry = self.config.github.find_repo(selector)
+        entry = self.config.find_repo(selector)
         if entry is None:
-            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "(none)"
+            known = ", ".join(r.repo for r in self.config.repo_list()) or "(none)"
             return None, f"unknown repository {selector!r} — configured repositories: {known}"
         index = next(
             i
-            for i, candidate in enumerate(self.config.github.repo_list())
+            for i, candidate in enumerate(self.config.repo_list())
             if candidate.repo.casefold() == entry.repo.casefold()
         )
         base = f"github.repos[{index}]"
@@ -2596,6 +2699,14 @@ class Concierge:
         if error is not None:
             return error
         assert dotted is not None
+        # The operator's config is a `daemon:manage` write, as it is on the
+        # admin routes: the person the turn belongs to must hold it (#1274).
+        principal = self._turn_principal(by)
+        if not principal.can("daemon:manage"):
+            return (
+                f"`{dotted}` is not changed: {principal.id} (via {principal.via}) lacks "
+                "daemon:manage. Nothing was written."
+            )
         unset = bool(args.get("unset", False))
         value = str(args.get("value") if args.get("value") is not None else "")
         if not unset and not value.strip():
@@ -2637,6 +2748,7 @@ class Concierge:
             new=change.new,
             unset=unset,
             by=by,
+            principal=principal.audit(),
             confirmation=confirmation,
             backup=str(backup) if backup else None,
         )
@@ -2694,7 +2806,7 @@ class Concierge:
         return text
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
-        entries = self.config.github.repo_list()
+        entries = self.config.repo_list()
         if not entries:
             return "no GitHub repository is configured — this daemon runs nothing on GitHub."
         lines = [f"{len(entries)} configured repository(ies):"]
@@ -2844,6 +2956,10 @@ class Concierge:
             queued=queued,
         )
         self._note_code_admission(str(ref.number), repo)
+        if queued:
+            # The labelled issue is on the forge; the next poll finds it,
+            # and the poll need not wait out the interval (field: 55s).
+            self.loop.wake()
         if not queued:
             return (
                 f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
@@ -3003,10 +3119,11 @@ class Concierge:
         self._note_code_admission(str(number), repo)
         if self._turn_code_work is not None:
             self._turn_code_work(repo, number, f"Issue #{number}")
+        # The label is on the forge; the poll need not wait out the interval.
+        self.loop.wake()
         return (
-            f"added `{trigger}` to #{number} — the daemon claims it on its next poll "
-            f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
-            "already queued."
+            f"added `{trigger}` to #{number} — the daemon polls for it now "
+            "and runs it after anything already queued."
         )
 
     def _tool_comment_on_issue(self, args: dict[str, Any], by: str) -> str:

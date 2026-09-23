@@ -19,7 +19,9 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.7",
-    "python-dotenv>=1.0",
+    "python-dotenv>=1.2.3",
+    # The Connections API probes providers with httpx and is imported at daemon startup.
+    "httpx>=0.27",
     "typer>=0.27.2",
     "rich>=13.7",
     # Unpinned here because the version is dynamic; the build hook
@@ -90,7 +92,7 @@ Issues = "https://github.com/brettbergin/sbxloop/issues"
 sbxloop-worker = { workspace = true }
 
 [build-system]
-requires = ["hatchling>=1.27", "hatch-vcs"]
+requires = ["hatchling>=1.32.3", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 # Both workspace packages version from the same repo-root git tag, keeping the

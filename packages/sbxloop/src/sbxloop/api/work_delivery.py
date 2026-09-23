@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 
 from sbxloop.api.agents import ANGIE_SLUG
+from sbxloop.api.collaboration import HISTORY_MESSAGES
 from sbxloop.api.projections import Views
 from sbxloop.api.publicids import run_public_id
 from sbxloop.db.collaboration_models import ChannelRow, MessageRow, TurnRow
@@ -22,6 +24,10 @@ log = get_logger(__name__)
 
 #: Files named on one work result; the run's own catalog lists the rest.
 WORK_ARTIFACTS_MAX = 50
+#: How far back a code link is looked for, in turns. The same window the
+#: channel's messages page carries (``collaboration.HISTORY_MESSAGES``),
+#: named here so the scan cannot quietly become unbounded again.
+CODE_LINK_TURNS = HISTORY_MESSAGES
 #: Run kinds whose catalogued files are what a sink delivered.
 DELIVERING_KINDS = frozenset({"workload", "tool"})
 
@@ -47,14 +53,15 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     """Work linked to the conversation that asked for it: by the item's own
     channel when it names one, and by the message its key names otherwise.
     A key that names a message in a channel other than the item's does not
-    link it there."""
-    boundary = or_(
-        WorkItemRow.source_key == MessageRow.id,
-        func.substr(WorkItemRow.source_key, 1, func.length(MessageRow.id) + 1)
-        == MessageRow.id + ":",
-    )
+    link it there.
+
+    The message is read from the item's own ``message_id``, recorded at
+    admission and backfilled for older rows by revision 0032. It used to be
+    matched against a prefix of ``source_key``, which is a function on a
+    column: no index could serve it, so one delivery read cost a pass over
+    the messages table per work item."""
     conditions = [
-        boundary,
+        WorkItemRow.message_id == MessageRow.id,
         or_(WorkItemRow.channel_id.is_(None), WorkItemRow.channel_id == MessageRow.channel_id),
         MessageRow.role == "user",
         TurnRow.input_message_id == MessageRow.id,
@@ -184,8 +191,45 @@ def _agent(link: WorkLink) -> str:
     return link.targets[index] if index < len(link.targets) else ANGIE_SLUG
 
 
+def _code_items(
+    session: Any, refs: set[tuple[str, str]]
+) -> dict[tuple[str, str], tuple[str, str | None, str | None]]:
+    """``(repo, source_key) -> (item_id, lead_agent, channel_id)`` for the
+    code items the scanned turns named, in one query rather than one per
+    reference."""
+    if not refs:
+        return {}
+    rows = session.execute(
+        select(
+            WorkItemRow.repo,
+            WorkItemRow.source_key,
+            WorkItemRow.item_id,
+            WorkItemRow.lead_agent,
+            WorkItemRow.channel_id,
+        ).where(
+            WorkItemRow.run_kind == "code",
+            WorkItemRow.repo.in_(sorted({repo for repo, _ in refs})),
+            WorkItemRow.source_key.in_(sorted({key for _, key in refs})),
+        )
+    ).all()
+    found: dict[tuple[str, str], tuple[str, str | None, str | None]] = {}
+    for repo, source_key, item_id, lead, item_channel in rows:
+        key = (str(repo), str(source_key))
+        if key in refs and key not in found:
+            found[key] = (str(item_id), lead, item_channel)
+    return found
+
+
 def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
-    """Join exact repository/issue identities; never infer links from agent prose."""
+    """Join exact repository/issue identities; never infer links from agent prose.
+
+    The walk is bounded to the channel's most recent
+    :data:`CODE_LINK_TURNS` turns (the window the messages page itself
+    carries), so a long-lived conversation does not re-read and re-parse
+    its whole history on every poll. A code result older than that window
+    is already written into the channel as a message; this scan only
+    finds work that still has to be delivered.
+    """
     conditions = [
         TurnRow.channel_id == ChannelRow.id,
         ChannelRow.state == "active",
@@ -197,27 +241,29 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     seen: set[tuple[str, str, str]] = set()
     with ctx.loop.dstore.read() as session:
         turns = session.scalars(
-            select(TurnRow).where(and_(*conditions)).order_by(TurnRow.created_at.desc())
+            select(TurnRow)
+            .where(and_(*conditions))
+            .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
+            .limit(CODE_LINK_TURNS)
         ).all()
-        for turn in turns:
-            participants = tuple(json.loads(turn.participants_json))
+        parsed = [(turn, tuple(json.loads(turn.participants_json))) for turn in turns]
+        items = _code_items(
+            session,
+            {
+                (str(ref["repo"]), str(ref["source_key"]))
+                for _turn, participants in parsed
+                for participant in participants
+                for ref in participant.get("code_work", [])
+            },
+        )
+        for turn, participants in parsed:
             for index, participant in enumerate(participants):
                 for ref_index, ref in enumerate(participant.get("code_work", [])):
                     key = (turn.channel_id, ref["repo"], ref["source_key"])
                     if key in seen:
                         continue
                     seen.add(key)
-                    found = session.execute(
-                        select(
-                            WorkItemRow.item_id,
-                            WorkItemRow.lead_agent,
-                            WorkItemRow.channel_id,
-                        ).where(
-                            WorkItemRow.repo == ref["repo"],
-                            WorkItemRow.source_key == ref["source_key"],
-                            WorkItemRow.run_kind == "code",
-                        )
-                    ).first()
+                    found = items.get((str(ref["repo"]), str(ref["source_key"])))
                     if found is not None and found[2] and found[2] != turn.channel_id:
                         # The admission named a channel, and it is not this
                         # one: the result belongs there, not wherever the
@@ -307,8 +353,15 @@ def _result(ctx: Any, run_id: str, state: str, fallback: str | None) -> str:
 def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]]:
     views = Views(ctx)
     snapshots: list[dict[str, Any]] = []
-    for link in [*_links(ctx, channel_id), *_code_links(ctx, channel_id)]:
-        item = ctx.loop.dstore.get(link.item_id)
+    links = [*_links(ctx, channel_id), *_code_links(ctx, channel_id)]
+    # The items behind the links, then the runs behind those items: two
+    # queries for the page rather than two per link. Every one of them
+    # runs under the store's single lock, so the count is what the
+    # browser's poll costs the daemon.
+    items = ctx.loop.dstore.get_many([link.item_id for link in links])
+    runs = ctx.loop.store.get_runs([item.run_id for item in items.values() if item.run_id])
+    for link in links:
+        item = items.get(link.item_id)
         if item is None:
             if link.code_title is not None and channel_id is not None:
                 snapshots.append(
@@ -330,14 +383,11 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
                 )
             continue
         public_item = views.item(item)
-        run = None
+        run = runs.get(item.run_id) if item.run_id else None
         public_run = None
-        if item.run_id:
-            try:
-                run = ctx.loop.store.get_run(item.run_id)
+        if run is not None:
+            with contextlib.suppress(SbxloopError):
                 public_run = views.run(run)
-            except SbxloopError:
-                pass
         state = run.state if run is not None else item.state
         terminal = state in {"merged", "completed", "failed", "blocked", "cancelled", "gated"}
         terminal_key = run.run_id if run is not None else f"item:{item.attempts}:{state}"

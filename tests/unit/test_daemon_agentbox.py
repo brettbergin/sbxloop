@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +22,6 @@ from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.agentbox import (
     REPROVISION_MIN_INTERVAL_S,
-    SANDBOX_NAME_PREFIX,
     DaemonAgent,
     sandbox_name_for,
 )
@@ -79,12 +79,24 @@ class TestNaming:
         agent_a = DaemonAgent(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         agent_b = DaemonAgent(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         assert agent_a.name != agent_b.name
-        assert agent_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
+        assert agent_a.name.endswith("-daemon-chat-concierge")
         assert agent_a.name == sandbox_name_for(a.paths)
         assert agent_a.workspace == (a.paths.daemon / "concierge-workspace").resolve()
 
 
 class TestLifecycle:
+    def test_existing_concierge_keeps_its_session_name_during_upgrade(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.sbx.naming import legacy_concierge_name
+
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch)
+        old = legacy_concierge_name(agent.config.paths)
+        agent.provisioner.ensure_agent_only(old, agent.workspace, run_id="concierge")
+        agent.client()
+        assert agent.name == old
+        assert created_names(fake_sbx) == [old]
+
     @pytest.mark.parametrize("old_vm", [False, True])
     def test_changed_or_unknown_allocation_preserves_concierge_history(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_vm: bool
@@ -379,11 +391,18 @@ class StubSbx:
         self.names: set[str] = set()
         self.created: list[str] = []
         self.removed: list[str] = []
+        # `rm` blocks until `rm_release` is set (it is, unless a test clears
+        # it to hold a teardown in flight) and flags `rm_started` on entry.
+        self.rm_started = threading.Event()
+        self.rm_release = threading.Event()
+        self.rm_release.set()
 
     def ls(self) -> list[SimpleNamespace]:
         return [SimpleNamespace(name=name) for name in sorted(self.names)]
 
     def rm(self, name: str, *, force: bool = True, settle: bool = True) -> None:
+        self.rm_started.set()
+        self.rm_release.wait(10)
         self.removed.append(name)
         self.names.discard(name)
 
@@ -591,4 +610,118 @@ class TestLeases:
                 assert agent.lease_generation(a) == agent.lease_generation(b)
                 assert agent.lease_generation(a) == current_generation
         finally:
+            agent.close()
+
+
+def run_in_thread(fn: Callable[[], object]) -> tuple[threading.Thread, list[object]]:
+    """Run ``fn`` on a thread; its return value or exception lands in the list."""
+    outcome: list[object] = []
+
+    def target() -> None:
+        try:
+            outcome.append(fn())
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+class TestRemovalOffTheLock:
+    """Removing a retired box (`sbx rm`, which can take the whole settle
+    timeout, or longer on a wedged host) never holds the lease-pool lock:
+    other turns' leases, their timeouts and generation reads stay responsive
+    while it runs, and only the next provision waits for it to finish."""
+
+    def held_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[DaemonAgent, StubSbx, WorkerClient, threading.Thread]:
+        """A failed turn condemns the box while another turn still uses it;
+        that turn's release runs the removal, which is held in `rm`."""
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        sbx.rm_release.clear()
+        busy_lease = agent.lease()
+        busy = busy_lease.__enter__()
+        with agent.lease() as failed:
+            failed_generation = agent.lease_generation(failed)
+        assert agent.note_failure(WorkerError("died"), generation=failed_generation)
+        releaser, _ = run_in_thread(lambda: busy_lease.__exit__(None, None, None))
+        assert sbx.rm_started.wait(5)
+        return agent, sbx, busy, releaser
+
+    def test_leases_and_generation_reads_stay_responsive_during_a_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx, busy, releaser = self.held_removal(tmp_path, monkeypatch)
+        try:
+            reader, read = run_in_thread(lambda: agent.lease_generation(busy))
+            reader.join(2)
+            assert not reader.is_alive(), "lease_generation() blocked behind sbx rm"
+            assert read == [None]
+
+            def attempt() -> None:
+                with agent.lease(timeout=0.05):
+                    pass
+
+            waiter, outcome = run_in_thread(attempt)
+            waiter.join(2)
+            assert not waiter.is_alive(), "lease() blocked behind sbx rm past its timeout"
+            assert isinstance(outcome[0], WorkerTimeoutError)
+            # The removal is still in flight: nothing above waited it out.
+            assert sbx.removed == [] and releaser.is_alive()
+        finally:
+            sbx.rm_release.set()
+            releaser.join(5)
+            agent.close()
+        assert sbx.removed == [agent.name]
+
+    def test_the_next_provision_waits_for_the_removal_to_finish(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Creating the same name while its teardown is still running loses
+        the new box to the old one's reaper (#952): the replacement is
+        provisioned only once the removal has finished."""
+        agent, sbx, _busy, releaser = self.held_removal(tmp_path, monkeypatch)
+        got: list[WorkerClient] = []
+
+        def attempt() -> None:
+            with agent.lease(timeout=5) as client:
+                got.append(client)
+
+        try:
+            waiter, outcome = run_in_thread(attempt)
+            waiter.join(0.3)
+            assert waiter.is_alive() and got == []
+            assert sbx.created == [agent.name]
+            sbx.rm_release.set()
+            waiter.join(5)
+            assert not waiter.is_alive() and outcome == [None]
+            assert sbx.removed == [agent.name]
+            assert sbx.created == [agent.name, agent.name]
+        finally:
+            sbx.rm_release.set()
+            releaser.join(5)
+            agent.close()
+
+    def test_an_explicit_remove_runs_off_the_lock_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        sbx.rm_release.clear()
+        try:
+            with agent.lease() as held:
+                held_generation = agent.lease_generation(held)
+                remover, _ = run_in_thread(agent.remove)
+                assert sbx.rm_started.wait(5)
+                reader, read = run_in_thread(lambda: agent.lease_generation(held))
+                reader.join(2)
+                assert not reader.is_alive(), "lease_generation() blocked behind sbx rm"
+                assert read == [held_generation]
+                assert sbx.removed == [] and remover.is_alive()
+                sbx.rm_release.set()
+                remover.join(5)
+            assert sbx.removed == [agent.name]
+        finally:
+            sbx.rm_release.set()
             agent.close()

@@ -102,7 +102,7 @@ class SandboxesScreen(ConsoleScreen):
             infos = deps.sbx().ls()
             with deps.mailbox.read_engine() as engine:
                 verdicts = classify_sandboxes(
-                    infos, engine, include_kept=self.include_kept, now=deps.clock()
+                    infos, engine, include_kept=self.include_kept, now=deps.clock(), home=deps.home
                 )
         except SbxloopError as exc:
             error = str(exc)

@@ -34,6 +34,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from sbxloop.sbx.naming import run_name
 from tests.fakes.ops_stub import OpsStub
 from tests.fakes.rawdb import backdate, query_raw
 from tests.unit.test_hostgit import (
@@ -1176,15 +1177,26 @@ class TestShutdownAndRecovery:
         h.loop.recover()
         h.loop.tick()
         agent, gh = "sbxloop-r_live-agent", "sbxloop-r_live-github"
-        assert [c for c in calls if c[0] == "rm"] == [("rm", agent), ("rm", gh)]
+        new_agent = run_name(h.config.paths, "r_live", "agent")
+        new_gh = run_name(h.config.paths, "r_live", "github")
+        assert [c for c in calls if c[0] == "rm"] == [
+            ("rm", new_agent),
+            ("rm", agent),
+            ("rm", new_gh),
+            ("rm", gh),
+        ]
         secret_calls = [c[1] for c in calls if c[0] == "secret_rm"]
         # Agent: every backend's custom secret (host+env — sbx rejects env-only
         # selection), because prune has no config and the backend may have
         # changed since provisioning (#617); github: the built-in service secret.
         assert secret_calls == [
+            {"host": "api.github.com", "env": "COPILOT_GITHUB_TOKEN", "sandbox": new_agent},
+            {"host": "api.anthropic.com", "env": "ANTHROPIC_API_KEY", "sandbox": new_agent},
+            {"host": "api.openai.com", "env": "OPENAI_API_KEY", "sandbox": new_agent},
             {"host": "api.github.com", "env": "COPILOT_GITHUB_TOKEN", "sandbox": agent},
             {"host": "api.anthropic.com", "env": "ANTHROPIC_API_KEY", "sandbox": agent},
             {"host": "api.openai.com", "env": "OPENAI_API_KEY", "sandbox": agent},
+            {"service": "github", "sandbox": new_gh},
             {"service": "github", "sandbox": gh},
         ]
         assert h.runs == [("r_live", True)]
@@ -1216,8 +1228,8 @@ class TestShutdownAndRecovery:
         h.outcomes = ["merged"]
         h.loop.recover()
         h.loop.tick()
-        # One agent secret_rm per backend (#617) plus the github service secret.
-        assert len(calls) == 4
+        # Current and legacy names each clear every backend plus the VCS secret.
+        assert len(calls) == 8
         assert h.runs == [("r_live", True)]
 
     @staticmethod
@@ -1606,7 +1618,14 @@ class TestOperatorItemControls:
         h.dstore.abandon("gh:issue:1", "operator: doomed plan", 4.0)  # CLI, no daemon
         h.loop.recover()
         assert h.source.calls == [("abandoned", "operator: doomed plan")]
-        assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
+        from sbxloop.sbx.naming import run_name
+
+        assert removed == [
+            run_name(h.config.paths, "r_dead", "agent"),
+            "sbxloop-r_dead-agent",
+            run_name(h.config.paths, "r_dead", "github"),
+            "sbxloop-r_dead-github",
+        ]
         rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'")
         assert rows[0][0] == "abandoned"
         item = h.dstore.get("gh:issue:1")
@@ -1725,7 +1744,14 @@ class TestOperatorItemControls:
         h.dstore.finish_ledger("r_dead", "interrupted", 3.0)
         h.dstore.mark_resume_pending("gh:issue:1", 4.0)
         h.loop.abandon_item("gh:issue:1", "never mind")
-        assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
+        from sbxloop.sbx.naming import run_name
+
+        assert removed == [
+            run_name(h.config.paths, "r_dead", "agent"),
+            "sbxloop-r_dead-agent",
+            run_name(h.config.paths, "r_dead", "github"),
+            "sbxloop-r_dead-github",
+        ]
         assert h.source.calls == [("abandoned", "never mind")]
         removed.clear()
         h.dstore.retry("gh:issue:1", 5.0)
@@ -1733,7 +1759,12 @@ class TestOperatorItemControls:
         h.dstore.finish_ledger("r_dead2", "interrupted", 7.0)
         h.dstore.mark_resume_pending("gh:issue:1", 8.0)
         h.loop.requeue_item("gh:issue:1")  # same for an unpin
-        assert removed == ["sbxloop-r_dead2-agent", "sbxloop-r_dead2-github"]
+        assert removed == [
+            run_name(h.config.paths, "r_dead2", "agent"),
+            "sbxloop-r_dead2-agent",
+            run_name(h.config.paths, "r_dead2", "github"),
+            "sbxloop-r_dead2-github",
+        ]
         assert h.dstore.unsettled_runs() == []
 
 

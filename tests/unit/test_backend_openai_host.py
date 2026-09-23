@@ -14,6 +14,7 @@ from sbxloop.config import Config
 from sbxloop.engine.model import EgressSpec, TaskNeeds
 from sbxloop.errors import ProvisionError
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import run_name
 from sbxloop.sbx.provision import Provisioner, agent_policy_allows
 from sbxloop.sbx.secretstate import parse_secret_ls_entry, tracked_custom_secrets
 from sbxloop_worker.protocol import (
@@ -96,14 +97,14 @@ def test_plain_http_refuses_unless_allowed_on_purpose() -> None:
 
 def test_a_repository_override_is_held_to_the_same_rules() -> None:
     base = {"agent": {"backend": "openai", "openai": {"base_url": "https://models.example/v1"}}}
-    with pytest.raises(ValidationError, match=r"\[github.repos.openai\] \(o/r\).*plain http"):
+    with pytest.raises(ValidationError, match=r"\[vcs.repos.openai\] \(o/r\).*plain http"):
         Config.model_validate(
             {
                 **base,
                 "github": {"repos": [{"repo": "o/r", "openai": {"base_url": "http://p:8000/v1"}}]},
             }
         )
-    with pytest.raises(ValidationError, match=r"github\.repos\[\]\.openai\.base_url"):
+    with pytest.raises(ValidationError, match=r"vcs\.repos\[\]\.openai\.base_url"):
         Config.model_validate(
             {**base, "github": {"repos": [{"repo": "o/r", "openai": {"base_url": "nope"}}]}}
         )
@@ -367,7 +368,7 @@ def test_a_plan_still_may_not_declare_a_bare_host_or_literal(declared: str) -> N
     ):
         EgressSpec(domain=declared, reason="model")
     with pytest.raises(
-        ValidationError, match=r"needs\.hosts must be domains or \*\.domain wildcards"
+        ValidationError, match=r"needs\.hosts must be domains, \*\.domain wildcards"
     ):
         TaskNeeds(hosts=[declared])
 
@@ -473,13 +474,22 @@ def test_key_and_endpoint_reach_the_worker_without_the_key_in_argv(
         assert exports["SBXLOOP_WORKER_BACKEND"] == "openai"
         assert exports[OPENAI_BASE_URL_ENV] == "http://10.0.0.12:8000/v1"
     else:
-        env_file = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        env_file = (
+            fake_sbx.sandbox_fs(run_name(config.paths, "r1", "agent"))
+            / "home/agent/.sbxloop/env.sh"
+        )
         content = env_file.read_text()
         assert f"OPENAI_API_KEY={token}" in content
         assert "SBXLOOP_WORKER_BACKEND=openai" in content
         assert f"{OPENAI_BASE_URL_ENV}=http://10.0.0.12:8000/v1" in content
     assert token not in json.dumps(fake_sbx.invocations())
-    assert ["allow", "network", "10.0.0.12", "--sandbox", "sbxloop-r1-agent"] in fake_sbx.policies()
+    assert [
+        "allow",
+        "network",
+        "10.0.0.12",
+        "--sandbox",
+        run_name(config.paths, "r1", "agent"),
+    ] in fake_sbx.policies()
 
 
 def test_a_refused_network_allow_fails_closed_naming_the_endpoint(

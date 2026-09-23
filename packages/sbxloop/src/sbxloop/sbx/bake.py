@@ -135,7 +135,7 @@ def bake_template(
                 extras=config.agent.backend,
                 ensure_dev_tools=True,
                 languages=languages,
-                # The global list only: a `[[github.repos]]` override is
+                # The global list only: a `[[vcs.repos]]` override is
                 # paid at that repository's provision (#681).
                 # Archive extraction must work even when a later run adds
                 # a language that was not selected for this bake.
@@ -175,6 +175,10 @@ def bake_template(
             sandbox.mkdirs(SBXLOOP_DIR)
             sandbox.write_text(BAKE_MANIFEST, json.dumps(manifest))
 
+            # sbx refuses to save a running sandbox (0.43: "is running and
+            # must be stopped before saving"); the scratch box is done.
+            report(f"stopping {name}")
+            cli.stop(name)
             report(f"saving template {ref}")
             cli.template_save(name, ref)
         except SbxloopError as exc:

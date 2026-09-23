@@ -178,7 +178,7 @@ def _refuse_secret_env(data: Any, where: str) -> Any:
     return data
 
 
-WorkerTransport = Literal["stream", "poll"]
+WorkerTransport = Literal["stream", "resident", "poll"]
 WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
@@ -308,7 +308,7 @@ class OpenAIBackendConfig(_ConfigModel):
 
 
 class OpenAIEndpointOverride(_ConfigModel):
-    """`[github.repos.openai]`: sparse overrides of `[agent.openai]` for one
+    """`[vcs.repos.openai]`: sparse overrides of `[agent.openai]` for one
     repository, so code that must stay on a private endpoint can pin it
     while the rest keep the default. Omit a key to inherit. The endpoint
     only: the credential (`api_key_env`) is one per host, since the run's
@@ -324,7 +324,7 @@ class OpenAIEndpointOverride(_ConfigModel):
     @field_validator("base_url")
     @classmethod
     def _check_url(cls, value: str | None) -> str | None:
-        return _check_base_url(value, "github.repos[].openai.base_url")
+        return _check_base_url(value, "vcs.repos[].openai.base_url")
 
     def over(self, base: OpenAIBackendConfig) -> OpenAIBackendConfig:
         """``base`` with every key set here written over it."""
@@ -417,7 +417,7 @@ class SandboxConfig(_ConfigModel):
     # delivers a tree diffed against base.
     continue_branch_optional: bool = False
     # A git partial-clone filter (`blob:none`) for run clones cut from a
-    # *remote* — the no-local-checkout `[[github.repos]]` path (#632). Off by
+    # *remote* — the no-local-checkout `[[vcs.repos]]` path (#632). Off by
     # default on purpose: a partial clone fetches blobs lazily from inside
     # the sandbox, which holds no git credential and pays a network round
     # trip per touched file; see the "Clone size" note in `sbxloop.hostgit`.
@@ -461,7 +461,7 @@ class SandboxConfig(_ConfigModel):
     # `RAILS_ENV`, `DATABASE_URL`, a `PIP_INDEX_URL` — written as given and
     # visible wherever the config is. It may not name a variable the loop
     # delivers itself (`GH_TOKEN`, the agent credential, `SBXLOOP_*`). A
-    # `[[github.repos]]` entry replaces it for its own runs. There is no
+    # `[[vcs.repos]]` entry replaces it for its own runs. There is no
     # secret counterpart (#766): the only credential in the agent sandbox
     # is the agent's own — see `_no_secret_env`.
     env: dict[str, str] = Field(default_factory=dict)
@@ -475,7 +475,7 @@ class SandboxConfig(_ConfigModel):
     # `playwright install --with-deps`, a `pre-commit install-hooks`).
     # Each command's exit and output tail is a `sandbox.setup` event; a
     # non-zero exit fails the run at provisioning (the gate would fail
-    # anyway, and this names the cause). A `[[github.repos]]` entry replaces
+    # anyway, and this names the cause). A `[[vcs.repos]]` entry replaces
     # either list for its own runs.
     apt_packages: list[str] = Field(default_factory=list)
     setup_commands: list[str] = Field(default_factory=list)
@@ -859,6 +859,17 @@ def _valid_repo(value: str, kind: VcsKind | None = None) -> bool:
     )
 
 
+def check_repo_name(value: str, kind: str) -> None:
+    """Refuse ``value`` unless it names a repository on ``kind``:
+    ``owner/name``, or on GitLab ``group/subgroup/project``. The sentence
+    is for the person who typed it."""
+    if kind not in VCS_KINDS:
+        raise ValueError(f"forge must be one of {', '.join(VCS_KINDS)}, got {kind!r}")
+    if not _valid_repo(value, kind):
+        shape = "group/subgroup/project" if kind == "gitlab" else "owner/name"
+        raise ValueError(f"a {kind} repository must be {shape}, got {value!r}")
+
+
 # What a PR title / commit message template may interpolate (#621).
 # `{title}` is the model-authored title when the plan gave one, else the
 # outcome; the rest are the run's own facts.
@@ -917,7 +928,7 @@ def _check_login(value: str, key: str) -> str:
 
 # The seven lifecycle labels, in the order `LabelSet` (and the daemon's
 # `GitHubLabels`) take them. Each is a `[daemon] <kind>_label` with a
-# `[[github.repos]] <kind>_label` override.
+# `[[vcs.repos]] <kind>_label` override.
 LABEL_KINDS = ("trigger", "in_progress", "failed", "completed", "blocked", "gated", "workload")
 
 
@@ -987,61 +998,14 @@ def _check_api_root(value: str, key: str, example: str, *, allow_http: bool = Fa
     return value
 
 
-class VcsConfig(_ConfigModel):
-    """The version-control backend (#1009): which forge the configured
-    repositories live on, and where its API is served from.
-
-    ``kind`` is the daemon-wide default; a ``[[github.repos]]`` entry may
-    name its own. ``api_url`` is the forge's API root; for ``github`` it is
-    the same setting as ``[github] api_url``, and the two must agree when
-    both are set. ``token_env`` names the host variable the forge token is
-    read from — ``GITLAB_TOKEN`` / ``GITEA_TOKEN`` by default for those
-    kinds; for GitHub the credential is the ``GH_TOKEN``/``GITHUB_TOKEN``
-    pair or the App installation, so the key is only read for a
-    ``[[github.repos]]`` entry's own ``token_env`` there. ``[github]`` remains
-    the section a repository is declared in: it reads as ``[vcs] kind =
-    "github"``, and the loader says so once when no ``[vcs]`` section names
-    the forge.
-    """
-
-    kind: VcsKind = "github"
-    api_url: str | None = None
-    token_env: str | None = None
-
-    @field_validator("kind", mode="before")
-    @classmethod
-    def _check_kind(cls, value: object) -> VcsKind:
-        return _check_vcs_kind(value, "vcs.kind")
-
-    @field_validator("token_env")
-    @classmethod
-    def _check_token_env(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
-            raise ValueError(f"vcs.token_env must be an environment variable name, got {value!r}")
-        return value
-
-    @field_validator("api_url")
-    @classmethod
-    def _check_api_url(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if value is None:
-            return None
-        return _check_api_root(
-            value,
-            "vcs.api_url",
-            "'https://api.github.com' or 'https://gitlab.example.com/api/v4'",
-            allow_http=info.data.get("kind") in ("gitlab", "gitea"),
-        )
-
-
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
-    Declared as ``[[github.repos]]`` entries. Everything here is per-repo;
-    the daemon-wide guardrails (daily run cap, per-item retry cap, the
-    consecutive-failure circuit breaker and one-run-at-a-time) stay global.
+    Declared as ``[[vcs.repos]]`` entries (#2255), whatever forge the
+    repository lives on; ``[[github.repos]]`` is the legacy spelling of the
+    same entry. Everything here is per-repo; the daemon-wide guardrails
+    (daily run cap, per-item retry cap, the consecutive-failure circuit
+    breaker and one-run-at-a-time) stay global.
     """
 
     repo: str
@@ -1110,69 +1074,65 @@ class RepoConfig(_ConfigModel):
     @classmethod
     def _check_repo(cls, value: str) -> str:
         if not _valid_repo(value):
-            raise ValueError(f"github.repos[].repo must be owner/name, got {value!r}")
+            raise ValueError(f"vcs.repos[].repo must be owner/name, got {value!r}")
         return value
 
     @field_validator("pr_title_template", "commit_message_template")
     @classmethod
     def _check_templates(cls, value: str | None, info: ValidationInfo) -> str | None:
-        return (
-            None if value is None else _check_template(value, f"github.repos[].{info.field_name}")
-        )
+        return None if value is None else _check_template(value, f"vcs.repos[].{info.field_name}")
 
     @field_validator("branch_prefix")
     @classmethod
     def _check_prefix(cls, value: str | None) -> str | None:
-        return (
-            None if value is None else _check_branch_prefix(value, "github.repos[].branch_prefix")
-        )
+        return None if value is None else _check_branch_prefix(value, "vcs.repos[].branch_prefix")
 
     @field_validator("bot_login")
     @classmethod
     def _check_bot_login(cls, value: str | None) -> str | None:
-        return None if value is None else _check_login(value, "github.repos[].bot_login")
+        return None if value is None else _check_login(value, "vcs.repos[].bot_login")
 
     @field_validator("kind", mode="before")
     @classmethod
     def _check_kind(cls, value: object) -> VcsKind | None:
-        return None if value is None else _check_vcs_kind(value, "github.repos[].kind")
+        return None if value is None else _check_vcs_kind(value, "vcs.repos[].kind")
 
     @field_validator("env")
     @classmethod
     def _check_env(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         if value is not None:
-            _check_env_names(list(value), "github.repos[].env")
+            _check_env_names(list(value), "vcs.repos[].env")
         return value
 
     @model_validator(mode="before")
     @classmethod
     def _no_secret_env(cls, data: Any) -> Any:
-        return _refuse_secret_env(data, "[[github.repos]]")
+        return _refuse_secret_env(data, "[[vcs.repos]]")
 
     @field_validator("registries")
     @classmethod
     def _check_registries(cls, value: list[RegistryConfig] | None) -> list[RegistryConfig] | None:
         if value is not None:
-            _check_registries(value, "github.repos[].registries")
+            _check_registries(value, "vcs.repos[].registries")
         return value
 
     @field_validator("apt_packages")
     @classmethod
     def _check_apt_packages(cls, value: list[str] | None) -> list[str] | None:
-        return None if value is None else _check_apt_packages(value, "github.repos[].apt_packages")
+        return None if value is None else _check_apt_packages(value, "vcs.repos[].apt_packages")
 
     @field_validator("setup_commands")
     @classmethod
     def _check_setup_commands(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        return _check_setup_commands(value, "github.repos[].setup_commands")
+        return _check_setup_commands(value, "vcs.repos[].setup_commands")
 
     @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
     @classmethod
     def _check_label(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is not None and not value.strip():
-            raise ValueError(f"github.repos[].{info.field_name} must be non-empty when set")
+            raise ValueError(f"vcs.repos[].{info.field_name} must be non-empty when set")
         return value
 
     @property
@@ -1184,13 +1144,93 @@ class RepoConfig(_ConfigModel):
         return self.repo.rsplit("/", 1)[1]
 
 
+class VcsConfig(_ConfigModel):
+    """The version-control backend (#1009): which forge the configured
+    repositories live on, where its API is served from, and the
+    repositories themselves.
+
+    ``repos`` is where a repository is declared — ``[[vcs.repos]]``, one
+    entry per repository, whatever forge it lives on (#2255). ``kind`` is
+    the daemon-wide default forge; an entry may name its own. ``api_url``
+    is the forge's API root; for ``github`` it is the same setting as
+    ``[github] api_url``, and the two must agree when both are set.
+    ``token_env`` names the host variable the forge token is read from —
+    ``GITLAB_TOKEN`` / ``GITEA_TOKEN`` by default for those kinds; for
+    GitHub the credential is the ``GH_TOKEN``/``GITHUB_TOKEN`` pair or the
+    App installation, so the key is only read for an entry's own
+    ``token_env`` there.
+
+    The legacy spelling — ``[[github.repos]]``, or the single ``[github]
+    repo`` — still loads: :class:`Config` folds it into this list and the
+    loader says so once. A file that declares repositories under both, and
+    not the same ones, is refused by name.
+    """
+
+    kind: VcsKind = "github"
+    api_url: str | None = None
+    token_env: str | None = None
+    repos: list[RepoConfig] = Field(default_factory=list)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _check_kind(cls, value: object) -> VcsKind:
+        return _check_vcs_kind(value, "vcs.kind")
+
+    @property
+    def enabled(self) -> bool:
+        """Whether a repository is declared at all — the forge is on (#2255).
+        The GitHub section's ``enabled`` answers the same."""
+        return bool(self.repos)
+
+    @field_validator("repos")
+    @classmethod
+    def _check_repos(cls, value: list[RepoConfig]) -> list[RepoConfig]:
+        seen: set[str] = set()
+        for entry in value:
+            key = entry.repo.casefold()
+            if key in seen:
+                raise ValueError(f"vcs.repos contains duplicate repository {entry.repo!r}")
+            seen.add(key)
+        return value
+
+    @field_validator("token_env")
+    @classmethod
+    def _check_token_env(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError(f"vcs.token_env must be an environment variable name, got {value!r}")
+        return value
+
+    @field_validator("api_url")
+    @classmethod
+    def _check_api_url(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        return _check_api_root(
+            value,
+            "vcs.api_url",
+            "'https://api.github.com' or 'https://gitlab.example.com/api/v4'",
+            allow_http=info.data.get("kind") in ("gitlab", "gitea"),
+        )
+
+
 class GithubConfig(_ConfigModel):
-    """The GitHub integration. ``repo`` is the gate: unset (the default)
-    disables GitHub entirely — no github sandbox is provisioned, no GH_TOKEN
-    is required, and the run ends ``completed`` after its gate with nothing
-    delivered. Setting it makes ``repo`` the one repository sbxloop works
-    with: every run that passes its gate opens a pull request there and
-    carries it through review, CI and merge (see ``[landing]``)."""
+    """The GitHub backend's own settings: where GitHub is, how the loop
+    names what it writes there, and the identity and reviewers it acts
+    with. A repository is declared under ``[[vcs.repos]]`` (#2255);
+    ``repo`` and ``repos`` here are the legacy spelling of that
+    declaration, still accepted, and after loading they are a *view* of the
+    declared list that :class:`Config` keeps in step (``repo`` is the first
+    enabled repository, ``repos`` the whole list), so every consumer that
+    reads the section sees exactly what ``[vcs]`` declares.
+
+    With no repository declared anywhere the forge is off: no github
+    sandbox is provisioned, no GH_TOKEN is required, and the run ends
+    ``completed`` after its gate with nothing delivered. With one, every
+    run that passes its gate opens a pull request there and carries it
+    through review, CI and merge (see ``[landing]``)."""
 
     repo: str | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
@@ -1221,7 +1261,7 @@ class GithubConfig(_ConfigModel):
     # `{run_id}` and `{repo}`; the defaults reproduce what the loop always
     # wrote. `branch_prefix` is what the run id is appended to — a ruleset
     # that only admits `feature/*` branches wants it changed. Each is
-    # overridable per `[[github.repos]]` entry.
+    # overridable per `[[vcs.repos]]` entry.
     pr_title_template: str = DEFAULT_PR_TITLE_TEMPLATE
     commit_message_template: str = DEFAULT_COMMIT_MESSAGE_TEMPLATE
     branch_prefix: str = DEFAULT_BRANCH_PREFIX
@@ -1235,7 +1275,7 @@ class GithubConfig(_ConfigModel):
     # review the loop cannot give (#675): user logins, or `org/team` slugs.
     # Requested once, when the run parks `awaiting_review`, so the PR shows
     # up in their review queue; write access suffices. Overridable per
-    # `[[github.repos]]` entry. Empty asks nobody — the chat notice still
+    # `[[vcs.repos]]` entry. Empty asks nobody — the chat notice still
     # names the requester.
     reviewers: list[str] = Field(default_factory=list)
     # How many repositories were enabled in the *un-narrowed* config this was
@@ -1342,8 +1382,8 @@ class GithubConfig(_ConfigModel):
                 self.deliver_base = primary.deliver_base
         elif self._configured_without_repo():
             raise ValueError(
-                "github is configured but no repository is set: add `[github] repo` "
-                "or at least one [[github.repos]] entry"
+                "github is configured but no repository is set: add at least one "
+                "[[vcs.repos]] entry"
             )
         return self
 
@@ -1719,9 +1759,12 @@ class LandingConfig(_ConfigModel):
     by a re-delivery onto the same branch, so a round costs real turns; a
     run past either budget ends ``failed`` with the PR still a draft.
 
-    CI is polled every ``ci_poll_interval_s`` for at most ``ci_timeout_s``
-    per wait; the wait is not charged to ``[budgets] max_wall_clock_s``,
-    which bounds agent work. ``ci_settle_s`` is how long "no check runs
+    CI is polled for at most ``ci_timeout_s`` per wait, starting every
+    ``ci_poll_min_s`` and doubling up to ``ci_poll_interval_s`` while the
+    same thing is waited on (a check that finishes in a minute is seen in
+    seconds; a slow one costs one call a minute); the wait is not charged
+    to ``[budgets] max_wall_clock_s``, which bounds agent work.
+    ``ci_settle_s`` is how long "no check runs
     yet" must persist before it counts as "this repository has no CI":
     Actions registers its check runs a few seconds after a push, and
     merging in that gap would merge before CI started.
@@ -1761,6 +1804,10 @@ class LandingConfig(_ConfigModel):
     # exhausted run straight to a human (`ctl grant-rounds` still works).
     retry_rounds: int = Field(default=2, ge=0)
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
+    # The first wait on a forge-side change; each wait on the same thing
+    # doubles until ci_poll_interval_s (field, 2026-09-19: a green MR spent
+    # three minutes in 60s polls between its CI and its merge).
+    ci_poll_min_s: float = Field(default=10.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)
     # The wait for a human review (#675): how often the parked PR is read
@@ -1846,19 +1893,35 @@ class DaemonConfig(_ConfigModel):
     # a comment on the issue. An issue carrying both this and
     # `trigger_label` is refused, named.
     workload_label: str = "sbxloop:workload"
+    # How often a registered repository's labels are read back, so a
+    # console can say whether the repository carries the set the loop
+    # applies (`sbxloop init-repo`, or the API's label sync, creates them).
+    # One listing call per repository per interval, one repository per
+    # tick, and never for a disabled one; 0 turns the reading off, and a
+    # repository then reports its labels as unread until a sync is asked
+    # for.
+    label_check_interval_s: float = Field(default=3600.0, ge=0)
     max_runs_per_day: int = 12
     # How many runs execute at once. One (the default) is the serial loop:
     # a tick dispatches a run and settles it before the next. Above one, a
     # tick launches runs up to this many and returns; the next tick settles
     # what finished. Two code runs never share a repository.
     max_concurrent_runs: int = Field(default=1, ge=1, le=4)
+    # Sandbox sets provisioned before a run asks for them (#47): the daemon
+    # keeps this many ready (microVMs booted, workers installed) under run
+    # ids nobody has used yet, and a fresh run takes one instead of paying
+    # the boot and the install ladder. 0 warms nothing.
+    warm_pairs: int = Field(default=0, ge=0, le=4)
+    # A ready set older than this is removed and replaced.
+    warm_ttl_s: float = Field(default=6 * 3600.0, gt=0)
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"
     # The workspace's daily token budget: input plus output tokens reported
     # by every run and every chat turn since 00:00 in `run_cap_timezone`.
-    # Once reached, no new run starts (and a chat guardrail may refuse a
-    # turn) until the next day. Unset: tokens never refuse work.
+    # Once reached, no new run starts and no chat turn, whoever asked for
+    # it, is sent to the model until the next day; the person is told so
+    # in reply. Unset: tokens never refuse work.
     daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
@@ -2223,8 +2286,15 @@ DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
     "mcp",
     "credentials",
     "registries",
-    "vcs",
+    # The forge and every credential name; a repository's own delivery
+    # settings under [[vcs.repos]] stay the concierge's to change.
+    "vcs.kind",
+    "vcs.api_url",
+    "vcs.token_env",
+    "vcs.repos.kind",
+    "vcs.repos.token_env",
     "agents",
+    "github.repos.kind",
     "github.repos.token_env",
     "telemetry.dsn_env",
 )
@@ -2787,11 +2857,19 @@ class ApiOidcConfig(_ConfigModel):
     #: Create an account on a first sign-in; off, only linked or existing
     #: accounts may sign in.
     auto_provision: bool = True
+    #: Absolute lifetime of an application session; refresh never extends it.
+    session_max_age_s: int = Field(default=28800, ge=300, le=86400)
     #: Link a first sign-in to the local account holding the same email when
-    #: the provider says the address is verified. Off by default: a provider
-    #: that lets people edit their email, or asserts ``email_verified`` for
-    #: any address, would otherwise hand them that account (the owner's
-    #: included). Off, or unverified, the person gets an account of their own.
+    #: the provider says the address is verified and the local side does
+    #: too: the address came from the installation's first registration, an
+    #: invite addressed to it or an earlier verified provider claim, never
+    #: from the person editing their own profile (which would let a member
+    #: capture a colleague's first sign-in). The sign-in that links never
+    #: changes the account's role. Off by default: a provider that lets
+    #: people edit their email, or asserts ``email_verified`` for any
+    #: address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified on either side, the person gets an
+    #: account of their own.
     link_verified_email: bool = False
     request_timeout_s: float = Field(default=10.0, gt=0, le=60)
 
@@ -2867,6 +2945,9 @@ class ApiConfig(_ConfigModel):
     """
 
     enabled: bool = False
+    #: Permit human password login and registration. Machine clients remain
+    #: available; disabling this also refuses existing non-OIDC human tokens.
+    local_auth_enabled: bool = True
     # Loopback by default: a broader bind is an explicit choice, and local
     # binding alone never establishes identity — every request authenticates.
     bind: str = "127.0.0.1"
@@ -2936,8 +3017,9 @@ class AgentTeamConfig(_ConfigModel):
     refused, and how much work one agent may start in a day.
 
     ``max_chain_depth = 0`` stops agent-started work entirely without
-    editing every agent; ``max_agent_runs_per_day`` is the default an
-    ``[[agents]]`` entry overrides with its own ``max_runs_per_day``.
+    editing every agent; ``max_agent_runs_per_day`` is the ceiling on every
+    agent's daily starts, which an ``[[agents]]`` entry's own
+    ``max_runs_per_day`` may lower but never raise.
 
     ``chronicle = "normal"`` posts the plan, progress, verdicts, steering
     replies, the delivery and any notice; ``"quiet"`` posts only what ends
@@ -2949,7 +3031,8 @@ class AgentTeamConfig(_ConfigModel):
     # Work a person asked for is depth 0; the run an agent starts from it
     # is depth 1. An agent working at this depth may start nothing.
     max_chain_depth: int = Field(default=2, ge=0)
-    # The daily cap for an agent whose spec names none.
+    # The ceiling on every agent's daily starts; a spec's own cap may
+    # lower it, never raise it.
     max_agent_runs_per_day: int = Field(default=4, ge=0)
     # What a run posts in the channel that asked for it.
     chronicle: Literal["normal", "quiet", "off"] = "normal"
@@ -2990,7 +3073,8 @@ class CollaborationConfig(_ConfigModel):
     # A cheap one belongs here: it runs once per ambient participant per
     # message that gets past the interest prefilter.
     ambient_model: str | None = None
-    # How many recent messages the prefilter and the classifier read.
+    # How many recent messages the relevance classifier reads. The
+    # interest prefilter reads only the message that just arrived.
     ambient_window_messages: int = Field(default=5, ge=1, le=50)
     # How often one ambient agent may speak in a channel, per hour.
     ambient_max_per_hour: int = Field(default=6, ge=0)
@@ -3006,6 +3090,9 @@ class Config(_ConfigModel):
     model_source_dir: Path | None = None
     # Environment values (including secrets) never enter the snapshot.
     _model_env: dict[str, str] | None = PrivateAttr(default=None)
+    # The file's own `[[vcs.repos]]` entries, kept from the first time the
+    # daemon's registry replaced the declared list (see `replace_repos`).
+    _declared_repos: tuple[RepoConfig, ...] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
@@ -3032,7 +3119,7 @@ class Config(_ConfigModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     # Private package registries every run's agent sandbox reaches and is
-    # configured for (#680); a `[[github.repos]]` entry may replace the list.
+    # configured for (#680); a `[[vcs.repos]]` entry may replace the list.
     registries: list[RegistryConfig] = Field(default_factory=list)
     # The credentials a run may be granted (#765): held by a per-run service
     # sandbox and used through host-driven ops; never in the agent sandbox.
@@ -3079,6 +3166,50 @@ class Config(_ConfigModel):
     collaboration: CollaborationConfig = Field(default_factory=CollaborationConfig)
 
     @model_validator(mode="after")
+    def _fold_repos(self) -> Config:
+        """One repository list, declared under ``[[vcs.repos]]`` (#2255).
+
+        The legacy spelling — ``[[github.repos]]``, or the single
+        ``[github] repo`` the GitHub section has already normalised into
+        its list — folds into ``vcs.repos`` when that is empty. When both
+        carry entries they must be the same repositories in the same
+        order, which is what a dump-and-validate round trip of a loaded
+        config produces; anything else is two declarations and is refused
+        by name. Either way the GitHub section is then rebuilt as a view
+        of the declared list, so ``github.repo``, ``github.repos`` and the
+        accessors on the section answer for exactly what ``[vcs]``
+        declares."""
+        declared = self.vcs.repos
+        legacy = self.github.repos
+        if declared and legacy:
+            if [r.repo.casefold() for r in declared] != [r.repo.casefold() for r in legacy]:
+                raise ValueError(
+                    "[[vcs.repos]] and [[github.repos]] both declare repositories, and not "
+                    "the same ones: declare each repository once, under [[vcs.repos]] "
+                    "(the [[github.repos]] spelling is the legacy form and still loads "
+                    "on its own)"
+                )
+        elif legacy:
+            declared = list(legacy)
+        return self._with_repos(declared)
+
+    def _with_repos(self, repos: list[RepoConfig]) -> Config:
+        """``repos`` as the declared list, with the GitHub section's view
+        rebuilt from it — in place, for the validators; a copy for callers."""
+        github = GithubConfig.model_validate(
+            {
+                **self.github.model_dump(exclude={"repo", "repos"}),
+                "repo": None,
+                "repos": [entry.model_dump() for entry in repos],
+            }
+        )
+        # The two lists hold the same entry objects: a consumer reading
+        # either sees one repository, not a copy that could drift.
+        self.vcs.repos = list(github.repos)
+        self.github = github
+        return self
+
+    @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:
         """``[vcs] api_url`` and ``[github] api_url`` are one setting for
         the GitHub backend: a ``[vcs]`` value fills the ``[github]`` one
@@ -3097,17 +3228,90 @@ class Config(_ConfigModel):
             )
         return self
 
+    # -- the repositories, forge-neutral (#2255) ------------------------------
+    # The declared list is `vcs.repos`; the GitHub section's copies of these
+    # answer the same, because `_fold_repos` keeps its view in step. New code
+    # reads these; the section's own stay for the callers that predate them.
+
+    def repo_list(self) -> list[RepoConfig]:
+        """Every declared repository, enabled or not."""
+        return list(self.vcs.repos)
+
+    def enabled_repos(self) -> list[RepoConfig]:
+        return [r for r in self.vcs.repos if r.enabled]
+
+    def find_repo(self, selector: str | None) -> RepoConfig | None:
+        """Match a repository by full ``owner/name`` or by bare name when
+        that name is unambiguous. ``None`` selects the default repository."""
+        return self.github.find_repo(selector)
+
+    def default_repo(self) -> RepoConfig | None:
+        """The sole enabled repository, or ``None`` when it is ambiguous."""
+        return self.github.default_repo()
+
+    def effective_repo(self, repo: str | None = None) -> RepoConfig | None:
+        """The repository a run acts on, with the forge's daemon-wide
+        defaults folded in; see :meth:`GithubConfig.effective_repo`."""
+        return self.github.effective_repo(repo)
+
+    def declared_repos(self) -> list[RepoConfig]:
+        """The file's own entries: what ``[[vcs.repos]]`` declared, before
+        the daemon's registry (:mod:`sbxloop.daemon.repositories`) was
+        applied over it — the same as :meth:`repo_list` until then."""
+        if self._declared_repos is None:
+            return self.repo_list()
+        return list(self._declared_repos)
+
+    def replace_repos(self, repos: Sequence[RepoConfig]) -> None:
+        """``repos`` as the declared list from now on, live, for every
+        consumer of this configuration: what the daemon's registry
+        applies. The file's own entries are kept (:meth:`declared_repos`)
+        the first time, so a later application can fold over them again."""
+        if self._declared_repos is None:
+            self._declared_repos = tuple(self.repo_list())
+        self._with_repos(list(repos))
+
+    @property
+    def primary_repo(self) -> str | None:
+        """The first enabled repository's ``owner/name`` — what the
+        single-repo surfaces act on — or ``None`` with nothing declared."""
+        return self.github.repo
+
+    @property
+    def multi_repo(self) -> bool:
+        """Whether the deployment this config came from has several enabled
+        repositories — preserved across :meth:`for_repo` narrowing."""
+        return self.github.multi_repo
+
+    def for_repo(self, repo: str | None, *, workspace: Path | _Unset | None = _UNSET) -> Config:
+        """This config narrowed to the one repository a run targets, both
+        the declared list and the GitHub section's view of it, so a
+        persisted run config round-trips (see
+        :meth:`GithubConfig.for_repo` for ``workspace``)."""
+        return self.with_github(self.github.for_repo(repo, workspace=workspace))
+
+    def with_github(self, github: GithubConfig) -> Config:
+        """A copy carrying ``github`` as its GitHub section, with the
+        declared repository list set to the section's — the one way to
+        replace the section, so the two never disagree."""
+        return self.model_copy(
+            update={
+                "github": github,
+                "vcs": self.vcs.model_copy(update={"repos": list(github.repos)}),
+            }
+        )
+
     def vcs_kind_for(self, repo: str | None = None) -> VcsKind:
         """Which forge holds ``repo`` (#1009): the entry's own ``kind``,
         else ``[vcs] kind``. ``None`` is the default repository."""
-        entry = self.github.find_repo(repo)
+        entry = self.find_repo(repo)
         if entry is not None and entry.kind is not None:
             return entry.kind
         return self.vcs.kind
 
     @model_validator(mode="after")
     def _check_repo_paths_for_forge(self) -> Config:
-        for entry in self.github.repos:
+        for entry in self.vcs.repos:
             kind = entry.kind or self.vcs.kind
             if not _valid_repo(entry.repo, kind):
                 raise ValueError(f"{kind} repository must be owner/name, got {entry.repo!r}")
@@ -3119,7 +3323,7 @@ class Config(_ConfigModel):
         forge's default (:data:`FORGE_TOKEN_ENVS`). ``None`` for a GitHub
         repository with no explicit name — its credential is the ambient
         ``GH_TOKEN``/``GITHUB_TOKEN`` pair or the App installation."""
-        entry = self.github.find_repo(repo)
+        entry = self.find_repo(repo)
         if entry is not None and entry.token_env:
             return entry.token_env
         kind = self.vcs_kind_for(repo)
@@ -3140,7 +3344,7 @@ class Config(_ConfigModel):
         """Every forge an enabled repository lives on, in first-seen order
         — ``[vcs] kind`` alone when no repository is configured."""
         kinds: list[VcsKind] = []
-        for entry in self.github.enabled_repos():
+        for entry in self.enabled_repos():
             kind = entry.kind or self.vcs.kind
             if kind not in kinds:
                 kinds.append(kind)
@@ -3358,7 +3562,7 @@ class Config(_ConfigModel):
         return list(self.landing.review_notify)
 
     def labels_for(self, repo: str | None = None) -> LabelSet:
-        """The lifecycle labels for ``repo`` (its ``[[github.repos]]``
+        """The lifecycle labels for ``repo`` (its ``[[vcs.repos]]``
         overrides over the ``[daemon]`` defaults, #630); ``None`` resolves
         the default repository, and a repository with no entry gets the
         daemon-wide set."""
@@ -3389,7 +3593,7 @@ class Config(_ConfigModel):
 
     def openai_for(self, repo: str | None = None) -> OpenAIBackendConfig:
         """The effective `[agent.openai]` settings for ``repo``: the
-        entry's `[github.repos.openai]` overrides over the global block."""
+        entry's `[vcs.repos.openai]` overrides over the global block."""
         entry = self.github.effective_repo(repo)
         if entry is None:
             return self.agent.openai
@@ -3408,7 +3612,7 @@ class Config(_ConfigModel):
         selected = self.agent.backend == "openai"
         settings: list[tuple[str, OpenAIBackendConfig]] = [("[agent.openai]", self.agent.openai)]
         settings += [
-            (f"[github.repos.openai] ({entry.repo})", self.openai_for(entry.repo))
+            (f"[vcs.repos.openai] ({entry.repo})", self.openai_for(entry.repo))
             for entry in self.github.repos
         ]
         if selected and self.agent.openai.base_url is None:
@@ -3697,19 +3901,18 @@ class Config(_ConfigModel):
         """
         from sbxloop import hostgit
 
-        entry = self.github.find_repo(repo)
+        entry = self.find_repo(repo)
         if entry is not None and entry.workspace is not None:
             return entry.workspace.expanduser()
         legacy = self.sandbox.workspace
         if legacy is not None:
             legacy = legacy.expanduser()
             if entry is None:
-                # No repo entries at all (GitHub off, or the legacy [github]
-                # repo spelling): the single daemon-wide workspace is all
-                # there is.
-                if not self.github.enabled_repos():
+                # No repo entries at all (the forge off): the single
+                # daemon-wide workspace is all there is.
+                if not self.enabled_repos():
                     return legacy
-            elif (not self.github.multi_repo and entry.enabled) or hostgit.origin_matches_repo(
+            elif (not self.multi_repo and entry.enabled) or hostgit.origin_matches_repo(
                 legacy, entry.repo
             ):
                 return legacy
@@ -3726,7 +3929,7 @@ class Config(_ConfigModel):
         has not pointed it at one: ``workspaces/<owner>/<name>`` under the
         home, including nested GitLab namespaces. None for no repository
         or an invalid path."""
-        target = repo or self.github.repo
+        target = repo or self.primary_repo
         if not target:
             return None
         try:
@@ -3747,7 +3950,7 @@ class Config(_ConfigModel):
         if self.workspace_for_repo(repo) is not None:
             return "configured"
         if self.sandbox.workspace is not None or any(
-            entry.workspace is not None for entry in self.github.repos
+            entry.workspace is not None for entry in self.vcs.repos
         ):
             return "remote"
         return "none"
@@ -4029,6 +4232,20 @@ def load_config_with_sources(
         log.info(
             "config.vcs_defaulted",
             hint='[github] is read as [vcs] kind = "github"; add a [vcs] section to name the forge',
+        )
+    github_layer = merged.get("github")
+    if (
+        isinstance(github_layer, dict)
+        and (github_layer.get("repos") or github_layer.get("repo"))
+        and not (merged.get("vcs") or {}).get("repos")
+    ):
+        # The same kind of notice for where the repositories are declared
+        # (#2255): the legacy spelling loads unchanged, and reads as the
+        # forge-neutral one.
+        log.info(
+            "config.repos_legacy",
+            hint="[[github.repos]] (or [github] repo) is read as [[vcs.repos]]; "
+            "declare the repositories under [[vcs.repos]]",
         )
 
     gh_host = (env.get("GH_HOST") or "").strip()

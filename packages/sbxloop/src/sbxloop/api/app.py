@@ -9,6 +9,7 @@ are off — a remote client reads the contract, not a page.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -28,7 +29,9 @@ from sbxloop.api.routes import (
     artifacts,
     auth,
     catalog,
+    channel_files,
     collaboration,
+    connections,
     control,
     diagnostics,
     events,
@@ -44,6 +47,9 @@ from sbxloop.api.routes import (
 from sbxloop.config import ApiConfig
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_FILE_CONTENT_PATH = re.compile(
+    r"^/v1/channels/[^/]+/files/fin_[0-9abcdefghjkmnpqrstvwxyz]{24}/content$"
+)
 log = structlog.get_logger(__name__)
 
 #: The version the committed contract snapshot carries: the document is
@@ -114,6 +120,10 @@ def create_app(ctx: ApiContext) -> FastAPI:
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         if request.method in _BODY_METHODS:
+            # The file route streams and counts actual bytes itself. Keep the
+            # small JSON-body limit for every other endpoint.
+            if request.method == "PUT" and _FILE_CONTENT_PATH.fullmatch(request.url.path):
+                return await call_next(request)
             length = request.headers.get("content-length")
             if length is None:
                 if request.headers.get("transfer-encoding", "").lower() == "chunked":
@@ -170,5 +180,7 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(agents.router)
     app.include_router(collaboration.router)
+    app.include_router(channel_files.router)
+    app.include_router(connections.router)
     app.include_router(workspace.router)
     return app

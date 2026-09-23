@@ -113,9 +113,9 @@ class AgentWorkService:
 
     def repository(self, repo: str | None) -> str:
         config: Config = self.loop.config
-        entry = config.github.find_repo(repo)
+        entry = config.find_repo(repo)
         if entry is None:
-            known = ", ".join(sorted(r.repo for r in config.github.repos)) or "none"
+            known = ", ".join(sorted(r.repo for r in config.vcs.repos)) or "none"
             named = repr(repo) if repo else "a default"
             raise ToolRejectedError(
                 f"{named} repository is not configured here (configured: {known})"

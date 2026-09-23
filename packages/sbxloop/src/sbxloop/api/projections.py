@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
+
+from sbxloop.api.channel_access import ChannelAccess
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import (
@@ -32,6 +35,8 @@ from sbxloop.api.models import (
     Recipe,
     RepoHealth,
     Repository,
+    RepositoryLabel,
+    RepositoryLabels,
     Rounds,
     Run,
     Schedule,
@@ -51,10 +56,16 @@ from sbxloop.daemon.model import (
     requested_roles,
 )
 from sbxloop.daemon.store import MergeGate, dispatch_eligible_at
+from sbxloop.db.collaboration_models import ChannelRow
+from sbxloop.db.event_scope import channel_for_item
 from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.errors import SbxloopError
 from sbxloop.ghids import is_api_id, is_chat_id, is_schedule_id, try_parse_gh_id
 from sbxloop.recipes import RECIPES
+from sbxloop.vcs.github.labels import lifecycle_specs
+
+if TYPE_CHECKING:
+    from sbxloop.api.collaboration import Member
 
 ITEM_ACTIONS: tuple[str, ...] = ("retry", "requeue", "abandon")
 RUN_ACTIONS: tuple[str, ...] = (
@@ -150,7 +161,7 @@ class Views:
         resolved = self.ids.resolve(public_id)
         if resolved is None or resolved.kind != "repository":
             raise not_found()
-        entry = self.config.github.find_repo(resolved.key)
+        entry = self.config.find_repo(resolved.key)
         if entry is None:
             raise not_found()
         return entry
@@ -216,6 +227,28 @@ class Views:
 
     def item(self, item: WorkItem) -> Item:
         return self.items([item])[0]
+
+    def visible_item_channels(
+        self, items: Sequence[WorkItem], member: Member | None
+    ) -> dict[str, str]:
+        """Resolve a page's conversation links without leaking private chats."""
+        if not items:
+            return {}
+        with self.dstore.read() as session:
+            linked = {item.item_id: channel_for_item(session, item.item_id) for item in items}
+            query = select(ChannelRow.id).where(
+                ChannelRow.id.in_({channel for channel in linked.values() if channel}),
+                ChannelRow.deleted_at.is_(None),
+            )
+            visible = ChannelAccess.visible_condition(member)
+            if visible is not None:
+                query = query.where(visible)
+            allowed = set(session.scalars(query))
+            return {
+                item_id: channel
+                for item_id, channel in linked.items()
+                if channel is not None and channel in allowed
+            }
 
     def _item(self, item: WorkItem, public_id: str, repo_ids: dict[str, str]) -> Item:
         run = self.run_record(item.run_id) if item.run_id else None
@@ -457,29 +490,43 @@ class Views:
     # -- the catalog ---------------------------------------------------------------
 
     def repositories(self) -> list[Repository]:
-        entries = list(self.config.github.repo_list())
+        entries = list(self.config.repo_list())
         ids = self.ids.repository_ids([e.repo for e in entries], self.now) if entries else {}
         health = {
             str(h["repo"]): h
             for h in self.status().get("repos") or []
             if isinstance(h, dict) and "repo" in h and "state" in h
         }
+        # The registration behind each entry: its provenance, and whether
+        # what this process polls has moved on from it.
+        registered = {row.repo.casefold(): row for row in self.dstore.repositories()}
+        polled: frozenset[str] = getattr(self.loop, "polled_repos", frozenset())
         daemon = self.config.daemon
-        return [
-            Repository(
-                id=ids[entry.repo],
-                repository=entry.repo,
-                forge=str(self.config.vcs_kind_for(entry.repo)),
-                enabled=entry.enabled,
-                deliver_base=entry.deliver_base,
-                trigger_label=entry.trigger_label or daemon.trigger_label,
-                workload_label=entry.workload_label or daemon.workload_label,
-                health=(
-                    RepoHealth.model_validate(health[entry.repo]) if entry.repo in health else None
-                ),
+        out: list[Repository] = []
+        for entry in entries:
+            row = registered.get(entry.repo.casefold())
+            out.append(
+                Repository(
+                    id=ids[entry.repo],
+                    repository=entry.repo,
+                    forge=str(self.config.vcs_kind_for(entry.repo)),
+                    enabled=entry.enabled,
+                    deliver_base=entry.deliver_base,
+                    trigger_label=entry.trigger_label or daemon.trigger_label,
+                    workload_label=entry.workload_label or daemon.workload_label,
+                    health=(
+                        RepoHealth.model_validate(health[entry.repo])
+                        if entry.repo in health
+                        else None
+                    ),
+                    source=row.source if row is not None else None,
+                    created_by=row.created_by if row is not None else None,
+                    created_at=rfc3339(row.created_at) if row is not None else None,
+                    restart_required=(entry.repo.casefold() in polled) != entry.enabled,
+                    labels=repository_labels(self.config, entry.repo, row),
+                )
             )
-            for entry in entries
-        ]
+        return out
 
     def profiles(self) -> list[Profile]:
         default = self.config.workload.default
@@ -510,6 +557,50 @@ class Views:
 
 
 # -- administration (#1040) -----------------------------------------------------------
+
+
+def repository_labels(config: Any, repo: str, row: Any | None) -> RepositoryLabels:
+    """Whether ``repo`` carries the labels the loop applies, from the last
+    reading the daemon recorded (``[daemon] label_check_interval_s``, or a
+    label sync).
+
+    Fails closed. A repository nobody has been able to look at is
+    ``unknown``, and so is one whose reading was taken for other names
+    than the ones configured now — a renamed label makes the old answer an
+    answer to another question. Neither is reported as compliant.
+    """
+    specs = lifecycle_specs(config.labels_for(repo), config.landing.followup_label)
+    expected = [spec.name for spec in specs]
+    checked_at = getattr(row, "labels_checked_at", None) if row is not None else None
+    read_for = list(getattr(row, "labels_expected", ()) or ()) if row is not None else []
+    if checked_at is None or read_for != expected:
+        return RepositoryLabels(
+            state="unknown",
+            expected=expected,
+            labels=[
+                RepositoryLabel(
+                    name=spec.name, kind=spec.kind, description=spec.description, color=spec.color
+                )
+                for spec in specs
+            ],
+        )
+    missing = [name for name in getattr(row, "labels_missing", ()) or () if name in expected]
+    return RepositoryLabels(
+        state="incomplete" if missing else "compliant",
+        expected=expected,
+        missing=missing,
+        labels=[
+            RepositoryLabel(
+                name=spec.name,
+                kind=spec.kind,
+                description=spec.description,
+                color=spec.color,
+                present=spec.name not in missing,
+            )
+            for spec in specs
+        ],
+        checked_at=rfc3339(checked_at),
+    )
 
 
 def hold_view(hold: Any) -> Hold:

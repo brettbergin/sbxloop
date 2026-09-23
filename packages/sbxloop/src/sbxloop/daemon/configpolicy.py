@@ -56,8 +56,8 @@ def never_from_chat(dotted: str) -> str | None:
 
 def _pattern_matches(pattern: str, key: str) -> bool:
     """``pattern``'s segments against a prefix of ``key``'s; ``*`` is one
-    whole segment. Indices are not segments (``github.repos[1].token_env``
-    is ``github.repos.token_env`` here)."""
+    whole segment. Indices are not segments (``vcs.repos[1].token_env``
+    is ``vcs.repos.token_env`` here)."""
     wanted = pattern.split(".")
     have = _bare(key).split(".")
     if len(wanted) > len(have):

@@ -13,11 +13,13 @@ authorization code for the same token pair a local login returns.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from urllib.parse import parse_qs
+
+from fastapi import APIRouter, Depends, Request, Response
 
 from sbxloop.api.auth.deps import Authenticated, current, get_ctx
 from sbxloop.api.auth.oidc import OidcError, OidcProvider, role_for_groups
-from sbxloop.api.auth.store import AuthError, Client
+from sbxloop.api.auth.store import AuthError, Client, OidcSession
 from sbxloop.api.auth.tokens import mint_access, scope_from
 from sbxloop.api.collaboration import CollaborationError
 from sbxloop.api.context import ApiContext
@@ -59,24 +61,36 @@ def _failed(ctx: ApiContext, keys: list[str]) -> None:
         ctx.limiter.record_failure(key, now)
 
 
-def grant_tokens(ctx: ApiContext, client: Client, *, family_id: str | None) -> TokenResponse:
+def grant_tokens(
+    ctx: ApiContext,
+    client: Client,
+    *,
+    family_id: str | None,
+    session: OidcSession | None = None,
+) -> TokenResponse:
     now = ctx.clock()
     api = ctx.api
+    access_ttl = api.access_token_ttl_s
+    refresh_ttl = api.refresh_token_ttl_s
+    if session is not None:
+        remaining = max(1, int(session.expires_at - now))
+        access_ttl = min(access_ttl, remaining)
+        refresh_ttl = min(refresh_ttl, remaining)
+        family_id = session.id
     access, claims = mint_access(
         ctx.keys,
         client_id=client.id,
         capabilities=client.capabilities,
-        ttl_s=api.access_token_ttl_s,
+        ttl_s=access_ttl,
         now=now,
+        session_id=None if session is None else session.id,
     )
-    refresh = ctx.auth.issue_refresh(
-        client.id, family_id=family_id, now=now, ttl_s=api.refresh_token_ttl_s
-    )
+    refresh = ctx.auth.issue_refresh(client.id, family_id=family_id, now=now, ttl_s=refresh_ttl)
     return TokenResponse(
         access_token=access,
-        expires_in=api.access_token_ttl_s,
+        expires_in=access_ttl,
         refresh_token=refresh,
-        refresh_expires_in=api.refresh_token_ttl_s,
+        refresh_expires_in=refresh_ttl,
         scope=scope_from(claims.scope),
         client_id=client.id,
     )
@@ -87,6 +101,11 @@ def _client_credentials(ctx: ApiContext, body: TokenRequest, address: str) -> To
         raise Problem(422, "invalid_request", "client_id and client_secret are required")
     keys = [f"client:{body.client_id}", f"addr:{address}"]
     _limited(ctx, keys)
+    if (
+        not ctx.api.local_auth_enabled
+        and ctx.collaboration.user_by_client(body.client_id) is not None
+    ):
+        raise Problem(403, "local_auth_disabled", "sign in through the identity provider")
     try:
         client = ctx.auth.authenticate(body.client_id, body.client_secret, ctx.clock())
     except AuthError as exc:
@@ -106,25 +125,39 @@ def _refresh(ctx: ApiContext, body: TokenRequest, address: str) -> TokenResponse
     api = ctx.api
     try:
         client, fresh = ctx.auth.rotate_refresh(
-            body.refresh_token, now=ctx.clock(), ttl_s=api.refresh_token_ttl_s
+            body.refresh_token,
+            now=ctx.clock(),
+            ttl_s=api.refresh_token_ttl_s,
+            local_auth_enabled=api.local_auth_enabled,
+            oidc_issuer=api.oidc.issuer if api.oidc.enabled else "",
+        )
+        session = ctx.auth.refresh_session(
+            fresh,
+            now=ctx.clock(),
+            oidc_issuer=api.oidc.issuer if api.oidc.enabled else "",
         )
     except AuthError as exc:
         _failed(ctx, keys)
         log.warning("api.refresh_failed", reason=exc.code)
         raise Problem(401, exc.code, exc.message) from exc
     now = ctx.clock()
+    access_ttl, refresh_ttl = api.access_token_ttl_s, api.refresh_token_ttl_s
+    if session is not None:
+        remaining = max(1, int(session.expires_at - now))
+        access_ttl, refresh_ttl = min(access_ttl, remaining), min(refresh_ttl, remaining)
     access, claims = mint_access(
         ctx.keys,
         client_id=client.id,
         capabilities=client.capabilities,
-        ttl_s=api.access_token_ttl_s,
+        ttl_s=access_ttl,
         now=now,
+        session_id=None if session is None else session.id,
     )
     return TokenResponse(
         access_token=access,
-        expires_in=api.access_token_ttl_s,
+        expires_in=access_ttl,
         refresh_token=fresh,
-        refresh_expires_in=api.refresh_token_ttl_s,
+        refresh_expires_in=refresh_ttl,
         scope=scope_from(claims.scope),
         client_id=client.id,
     )
@@ -163,7 +196,11 @@ def _providers(ctx: ApiContext) -> AuthProviders:
                 scopes=list(settings.scopes),
                 end_session_url=discovery.end_session_endpoint,
             )
-    return AuthProviders(local=True, oidc=oidc)
+    return AuthProviders(
+        local=ctx.api.local_auth_enabled,
+        oidc=oidc,
+        oidc_session_max_age_s=None if provider is None else provider.config.session_max_age_s,
+    )
 
 
 @router.get("/providers", response_model=AuthProviders)
@@ -221,7 +258,19 @@ def _oidc_sign_in(
     for key in keys:
         ctx.limiter.reset(key)
     log.info("api.oidc_login", user_id=user.id)
-    return grant_tokens(ctx, client, family_id=None)
+    try:
+        session = ctx.auth.create_oidc_session(
+            client.id,
+            issuer=identity.issuer,
+            subject=identity.subject,
+            provider_sid=identity.sid,
+            identity_issued_at=identity.issued_at,
+            now=ctx.clock(),
+            ttl_s=settings.session_max_age_s,
+        )
+    except AuthError as exc:
+        raise Problem(401, exc.code, exc.message) from exc
+    return grant_tokens(ctx, client, family_id=None, session=session)
 
 
 @router.post("/oidc/token", response_model=TokenResponse)
@@ -253,20 +302,93 @@ async def oidc_token(
     return tokens
 
 
+@router.post(
+    "/oidc/backchannel-logout",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/x-www-form-urlencoded": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["logout_token"],
+                        "properties": {"logout_token": {"type": "string", "maxLength": 16384}},
+                    }
+                }
+            },
+        }
+    },
+)
+async def backchannel_logout(
+    request: Request,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+) -> Response:
+    """An authenticated, signed provider event; no browser or bearer session needed."""
+    if (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        != "application/x-www-form-urlencoded"
+    ):
+        raise Problem(400, "invalid_logout_token", "a signed logout token is required")
+    try:
+        form = parse_qs((await request.body()).decode("utf-8"), max_num_fields=32)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise Problem(400, "invalid_logout_token", "a signed logout token is required") from exc
+    values = form.get("logout_token", [])
+    if len(values) != 1 or len(values[0]) > 16384:
+        raise Problem(400, "invalid_logout_token", "a signed logout token is required")
+    provider = ctx.oidc
+    if provider is None:
+        raise Problem(400, "invalid_logout_token", "the sign-in provider is not configured")
+
+    def apply() -> None:
+        try:
+            logout = provider.validate_logout_token(values[0])
+        except OidcError as exc:
+            status = 503 if exc.status == 503 else 400
+            raise Problem(
+                status, "invalid_logout_token", "the logout token could not be verified"
+            ) from exc
+        ctx.auth.provider_logout(
+            issuer=logout.issuer,
+            jti=logout.jti,
+            subject=logout.subject,
+            provider_sid=logout.sid,
+            issued_at=logout.issued_at,
+            now=ctx.clock(),
+            replay_until=max(logout.replay_until, ctx.clock() + provider.config.session_max_age_s),
+        )
+
+    await ctx.call(apply)
+    ctx.hub.notify()
+    return Response(status_code=200, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/revoke", status_code=204)
 async def revoke(
+    request: Request,
     body: RevokeRequest | None = None,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    auth: Authenticated = Depends(current),  # noqa: B008
 ) -> None:
     """End this access token now (it would otherwise run to its expiry),
     and a refresh token's whole family when one is named."""
     now = ctx.clock()
-    claims = auth.claims
+    refresh = None if body is None else body.refresh_token
+    if refresh:
+        # Possession authorizes ending only this token's family. A browser
+        # must be able to log out after its access token has expired. Unknown
+        # tokens receive the same empty response, as OAuth revocation requires.
+        await ctx.call(ctx.auth.revoke_refresh, refresh, now)
+    auth: Authenticated | None = None
+    try:
+        auth = await current(request, ctx)
+    except Problem:
+        if not refresh:
+            raise
 
     def apply() -> None:
-        ctx.auth.revoke_access(claims.jti, claims.client_id, claims.expires_at, now)
-        if body is not None and body.refresh_token:
-            ctx.auth.revoke_refresh(body.refresh_token, now)
+        if auth is not None:
+            claims = auth.claims
+            ctx.auth.revoke_access(claims.jti, claims.client_id, claims.expires_at, now)
 
     await ctx.call(apply)
+    ctx.hub.notify()

@@ -18,6 +18,7 @@ import pytest
 from sbxloop.engine.model import TOOL_STAGES, TaskNeeds, TaskSpec
 from sbxloop.errors import ConfigError
 from sbxloop.events import HostEventTypes
+from sbxloop.sbx.naming import run_name
 from tests.conftest import FakeSbx
 from tests.unit.test_engine import Harness
 
@@ -74,7 +75,7 @@ class TestToolRun:
         assert harness.run_states() == TOOL_STATES
         assert harness.consumed() == 0
         # One sandbox, and every job it received was a shell job.
-        assert harness.sandboxes_left() == [f"sbxloop-{result.run_id}-agent"]
+        assert harness.sandboxes_left() == [run_name(harness.home, result.run_id, "agent")]
         kinds = {job["kind"] for job in harness.agent_jobs(result.run_id)}
         assert kinds == {"shell.batch"}
         # The task's output is what the command left, read by code.

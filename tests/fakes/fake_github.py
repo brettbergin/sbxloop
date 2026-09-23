@@ -245,6 +245,8 @@ class FakeGithub(GithubOps):
         # leaves the payload silent (the 410 alone then decides).
         self.has_issues: bool | None = True
         self.labels_created: list[str] = []
+        # One entry per repository-labels listing, in order.
+        self.label_lists: list[str] = []
         # The single-label reads and the creates a run asked for (#1014), by
         # name — the operations, whether or not the repository already had
         # the label.
@@ -702,6 +704,19 @@ class FakeGithub(GithubOps):
                 "github op raw.api failed: GithubOpError: gh api GET "
                 f"{path} failed (rc=1): Not Found (HTTP 404)",
             )
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/labels", path):
+            # Every repository label, as `labels_list` reads it (#630):
+            # the ones the repository started with plus the ones created
+            # here. Paged like every other listing, and the fake holds the
+            # whole list, so page one is all of it.
+            self.label_lists.append(path.split("/repos/", 1)[1].rsplit("/labels", 1)[0])
+            self._maybe_fail("labels_list")
+            if int(parse_qs(query).get("page", ["1"])[0]) > 1:
+                return []
+            names = sorted(self.labels_existing) + [
+                name for name in self.labels_created if name not in self.labels_existing
+            ]
+            return [{"name": name} for name in names]
         if method == "POST" and path.endswith("/labels"):
             # Repository label creation (#517): an existing one is a 422.
             assert body is not None

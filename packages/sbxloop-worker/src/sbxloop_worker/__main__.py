@@ -85,10 +85,40 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--disk-abort", type=float, default=0.0)
     run.add_argument("--mem-warn", type=float, default=0.0)
     run.add_argument("--mem-abort", type=float, default=0.0)
+    # The resident worker (sbxloop_worker.serve): jobs on stdin, events and
+    # results on stdout, one process for the sandbox's whole life.
+    serve = sub.add_parser("serve", help="run jobs from stdin until it closes")
+    serve.add_argument("--heartbeat", type=float, default=15.0)
+    serve.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
+    serve.add_argument("--disk-warn", type=float, default=0.0)
+    serve.add_argument("--disk-abort", type=float, default=0.0)
+    serve.add_argument("--mem-warn", type=float, default=0.0)
+    serve.add_argument("--mem-abort", type=float, default=0.0)
     args = parser.parse_args(argv)
 
-    apply_env_file(args.env_file)
-    apply_env_file(PERSISTENT_ENV_FILE)
+    def apply_env() -> None:
+        apply_env_file(args.env_file)
+        apply_env_file(PERSISTENT_ENV_FILE)
+
+    apply_env()
+
+    if args.command == "serve":
+        from sbxloop_worker.serve import ResidentServer
+
+        try:
+            return ResidentServer(
+                apply_env=apply_env,
+                heartbeat_s=args.heartbeat,
+                limits={
+                    "disk_warn": args.disk_warn,
+                    "disk_abort": args.disk_abort,
+                    "mem_warn": args.mem_warn,
+                    "mem_abort": args.mem_abort,
+                },
+            ).run()
+        except BaseException as exc:
+            print(f"sbxloop_worker: fatal: {exc}", file=sys.stderr)
+            return 70
 
     try:
         job = JobRequest.model_validate_json(args.job.read_text())

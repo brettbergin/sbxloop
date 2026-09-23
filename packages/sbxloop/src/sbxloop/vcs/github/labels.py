@@ -2,12 +2,19 @@
 them (#630).
 
 The daemon's seven lifecycle labels (`[daemon] *_label`, per-repo overrides
-on `[[github.repos]]`) and the follow-up label (`[landing] followup_label`)
+on `[[vcs.repos]]`) and the follow-up label (`[landing] followup_label`)
 are ordinary repository labels: GitHub attaches an unknown label name to an
 issue without creating it, so a repository that was never set up shows the
 loop's states as bare text. ``sbxloop init-repo`` creates them, idempotently
 and with colors and descriptions, through :func:`ensure_label`; the engine
 uses the same function for the follow-up label before filing.
+
+:func:`audit_labels` and :func:`sync_labels` are the same work for a
+caller that has a whole repository in front of it rather than one label:
+one listing says which of the set the repository is missing, and the sync
+creates exactly those. The daemon reads the first on a cadence so a
+registered repository can say whether it is set up, and runs the second
+when an operator asks it to.
 """
 
 from __future__ import annotations
@@ -25,11 +32,18 @@ log = get_logger(__name__)
 
 @dataclass(frozen=True)
 class LabelSpec:
-    """One repository label as ``init-repo`` creates it."""
+    """One repository label as ``init-repo`` creates it.
+
+    ``kind`` is what the label is *for* — the lifecycle state it marks,
+    or the standing role of a label that marks none — so a surface can
+    explain a label it did not name itself. It never travels to the
+    forge; the name, the color and the description do.
+    """
 
     name: str
     color: str  # six hex digits, no ``#`` — what the REST API takes
     description: str
+    kind: str = "followup"
 
 
 # Colors and descriptions by lifecycle kind. The queue-in (trigger) and
@@ -52,7 +66,10 @@ EnsureResult = Literal["created", "present", "failed"]
 def lifecycle_specs(labels: LabelSet, followup: str | None = None) -> list[LabelSpec]:
     """The labels ``init-repo`` creates for one repository: the seven
     lifecycle labels and, when given, the follow-up label."""
-    specs = [LabelSpec(getattr(labels, kind), *LIFECYCLE_DESCRIPTORS[kind]) for kind in LABEL_KINDS]
+    specs = [
+        LabelSpec(getattr(labels, kind), *LIFECYCLE_DESCRIPTORS[kind], kind=kind)
+        for kind in LABEL_KINDS
+    ]
     if followup:
         specs.append(LabelSpec(followup, *FOLLOWUP_DESCRIPTOR))
     return specs
@@ -107,3 +124,67 @@ def missing_labels(ops: IssueOps, repo: str, specs: list[LabelSpec]) -> list[str
         if isinstance(label, dict)
     }
     return [spec.name for spec in specs if spec.name.casefold() not in present]
+
+
+@dataclass(frozen=True)
+class LabelReport:
+    """What one repository's sbxloop labels look like after a look, and —
+    for a sync — what the look changed.
+
+    ``missing`` is what the repository still does not carry when the call
+    returns: after :func:`audit_labels` the drift, after :func:`sync_labels`
+    the labels it could not create. A repository whose ``missing`` is empty
+    is set up: every label the loop applies exists, with its color and its
+    description.
+    """
+
+    expected: tuple[str, ...]
+    missing: tuple[str, ...]
+    created: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+    @property
+    def compliant(self) -> bool:
+        return not self.missing
+
+
+def audit_labels(ops: IssueOps, repo: str, specs: list[LabelSpec]) -> LabelReport:
+    """Which of ``specs`` ``repo`` carries, in one listing call.
+
+    Read-only, and it fails closed: a listing the forge refused raises
+    :class:`~sbxloop.errors.GithubOpsError` rather than reading as a
+    repository with no labels at all — "could not tell" is not "nothing
+    is there", and a caller that recorded the second would show a
+    repository as needing every label it already has.
+    """
+    return LabelReport(
+        expected=tuple(spec.name for spec in specs),
+        missing=tuple(missing_labels(ops, repo, specs)),
+    )
+
+
+def sync_labels(ops: IssueOps, repo: str, specs: list[LabelSpec]) -> LabelReport:
+    """Give ``repo`` every label in ``specs``; say what was already there,
+    what this call created, and what the forge would not create.
+
+    One listing, then one creation per missing label — a repository that
+    is already set up costs a single call and writes nothing. Idempotent:
+    an existing label keeps its color and description (the operator's to
+    change), as ``sbxloop init-repo`` leaves them.
+    """
+    audit = audit_labels(ops, repo, specs)
+    by_name = {spec.name: spec for spec in specs}
+    created: list[str] = []
+    failed: list[str] = []
+    for name in audit.missing:
+        result = ensure_label(ops, repo, by_name[name])
+        if result == "created":
+            created.append(name)
+        elif result == "failed":
+            failed.append(name)
+    return LabelReport(
+        expected=audit.expected,
+        missing=tuple(failed),
+        created=tuple(created),
+        failed=tuple(failed),
+    )

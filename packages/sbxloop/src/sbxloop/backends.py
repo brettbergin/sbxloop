@@ -19,7 +19,7 @@ accessors that take the loaded :class:`~sbxloop.config.Config` (and the
 repository a run acts for, where one narrows it), never off a constant.
 The three SDK-vendor backends bind to a fixed host and answer every config
 the same way; the ``openai`` backend answers from ``[agent.openai]`` (and a
-repository's own ``[github.repos.openai]`` override), so no consumer can
+repository's own ``[vcs.repos.openai]`` override), so no consumer can
 ask for its host before one is knowable.
 
 This module imports nothing from the config package at runtime (only the
@@ -105,7 +105,7 @@ class AgentBackend:
     config-taking accessors below are the only way to read it, so a caller
     without a loaded config cannot name a host that may not be knowable
     without one. ``repo`` is the repository a run acts for: a backend whose
-    endpoint a ``[[github.repos]]`` entry may override answers for that
+    endpoint a ``[[vcs.repos]]`` entry may override answers for that
     repository; the fixed-host backends ignore it.
     """
 
@@ -237,7 +237,7 @@ CODEX = AgentBackend(
 def _openai_binding(config: Config, repo: str | None) -> CredentialBinding:
     """The ``openai`` backend's credential path: the env var
     ``[agent.openai] api_key_env`` names, bound to the host of the endpoint
-    ``base_url`` names — ``repo``'s ``[github.repos.openai]`` override
+    ``base_url`` names — ``repo``'s ``[vcs.repos.openai]`` override
     first, then the global block. Config validation has already required
     and parsed the URL under ``backend = "openai"``; a config that selects
     another backend has no endpoint to answer with, and says so."""

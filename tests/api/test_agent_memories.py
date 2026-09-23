@@ -239,7 +239,7 @@ def _set_visibility(api: Any, channel_id: str, visibility: str) -> None:
 
 def _invite(api: Any, role: str, username: str) -> dict[str, str]:
     store = api.ctx.collaboration
-    owner = store.list_members()[0]
+    owner = next(m for m in store.list_members() if m.role == "owner")
     _, raw = store.create_invite(role, None, created_by=owner.user.id, ttl_s=60, now=api.clock())
     response = api.client.post(
         "/v1/auth/local/register",
@@ -325,3 +325,78 @@ def test_a_member_never_sees_private_channels_they_cannot_read(api: Any) -> None
     assert listed(admin, include_private="true") == everything
     assert listed(owner, include_private="true") == everything
     assert listed(api.bearer(), include_private="true") == everything
+
+
+def test_a_member_cannot_edit_or_delete_a_memory_they_cannot_read(api: Any) -> None:
+    owner = bearer(register(api))
+    outsider = _invite(api, "member", "outsider")
+    insider = _invite(api, "member", "insider")
+    insider_id = api.client.get("/v1/users/me", headers=insider).json()["id"]
+
+    private = _channel(api, owner, "owner private")
+    with api.harness.dstore.transaction() as session:
+        session.add(
+            ChannelMemberRow(channel_id=private, user_id=insider_id, role="member", joined_at=1.0)
+        )
+    created = api.client.post(
+        memories_url(),
+        headers=owner,
+        json={"content": "the launch date is a secret", "channel_id": private},
+    )
+    assert created.status_code == 201, created.text
+    memory_id = str(created.json()["id"])
+
+    def live() -> list[tuple[str, str, bool, int]]:
+        response = api.client.get(memories_url(), headers=owner, params={"include_private": "true"})
+        assert response.status_code == 200, response.text
+        return [
+            (item["id"], item["content"], item["pinned"], item["revision"])
+            for item in response.json()
+        ]
+
+    # The id leaked to a member the channel never let in; the memory did not.
+    assert (
+        api.client.get(memories_url(), headers=outsider, params={"include_private": "true"}).json()
+        == []
+    )
+
+    patched = api.client.patch(
+        f"{memories_url()}/{memory_id}",
+        headers=outsider,
+        json={"content": "moved to friday", "pinned": True, "expected_revision": 1},
+    )
+    assert patched.status_code == 404, patched.text
+    assert patched.json()["code"] == "memory_not_found"
+    assert "launch date" not in patched.text
+
+    deleted = api.client.delete(f"{memories_url()}/{memory_id}", headers=outsider)
+    assert deleted.status_code == 404, deleted.text
+    assert deleted.json()["code"] == "memory_not_found"
+
+    # The refusal an unknown id gets, so neither answer confirms the memory.
+    unknown = api.client.delete(f"{memories_url()}/mem_0000000000000000", headers=outsider)
+    assert unknown.status_code == 404
+    assert unknown.json()["code"] == deleted.json()["code"]
+    assert (
+        api.client.patch(
+            f"{memories_url()}/mem_0000000000000000",
+            headers=outsider,
+            json={"content": "moved to friday", "pinned": True, "expected_revision": 1},
+        ).json()["code"]
+        == patched.json()["code"]
+    )
+
+    assert live() == [(memory_id, "the launch date is a secret", False, 1)]
+
+    # The channel's own members still edit and forget it.
+    ok = api.client.patch(
+        f"{memories_url()}/{memory_id}",
+        headers=insider,
+        json={"content": "the launch date moved", "expected_revision": 1},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["content"] == "the launch date moved"
+    assert live() == [(memory_id, "the launch date moved", False, 2)]
+    gone = api.client.delete(f"{memories_url()}/{memory_id}", headers=insider)
+    assert gone.status_code == 204, gone.text
+    assert live() == []

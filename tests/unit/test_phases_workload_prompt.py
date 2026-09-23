@@ -83,6 +83,24 @@ def test_the_profile_bounds_reach_the_planner() -> None:
     assert "WEATHER_API_KEY" not in text and "KEYED_TOKEN" not in text
 
 
+def test_an_any_host_bound_tells_the_planner_how_to_ask() -> None:
+    config = _config(workloads=[{"name": "open", "egress": ["*"]}], workload={"default": "open"})
+    text = _plan_prompt(config)
+    assert "- hosts: any — declare `*` for a task that cannot know its hosts" in text
+    assert "a bare suffix such as `*.com` is refused" in text
+
+
+def test_an_any_host_bound_under_a_deny_tells_the_planner_to_name_hosts() -> None:
+    config = _config(
+        workloads=[{"name": "open", "egress": ["*"]}],
+        workload={"default": "open"},
+        policy={"deny": ["bad.example.com"]},
+    )
+    text = _plan_prompt(config)
+    assert "- hosts: any named domain" in text
+    assert "`*` is refused while `[policy] deny` is set" in text
+
+
 def test_an_empty_profile_says_so_line_by_line() -> None:
     config = _config(workloads=[{"name": "bare"}], workload={"default": "bare"})
     text = _plan_prompt(config)
@@ -99,3 +117,19 @@ def test_without_a_profile_the_planner_is_told_to_declare_no_needs() -> None:
     assert "This run has no workload profile" in text
     assert "Declare no needs" in text
     assert "Profile `" not in text
+
+
+def test_a_profile_that_runs_tasks_at_once_tells_the_planner_to_keep_files_apart() -> None:
+    """`[budgets] max_parallel_tasks` above 1 shares one workspace between
+    tasks running at the same time; `depends_on` is the planner's own word
+    and certifies nothing about files, so the planner is told."""
+    config = _config(
+        workloads=[{"name": "research", "budgets": {"max_parallel_tasks": 3}}],
+        workload={"default": "research"},
+    )
+    text = _plan_prompt(config)
+    assert "up to 3 tasks run at the same time" in text
+    assert "its own output files" in text
+    assert "never have two tasks edit the same file" in text
+    serial = _config(workloads=[{"name": "research"}], workload={"default": "research"})
+    assert "run at the same time" not in _plan_prompt(serial)

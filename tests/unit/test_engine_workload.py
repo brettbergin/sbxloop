@@ -28,6 +28,7 @@ from sbxloop.engine.phases import (
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import WorkerError
 from sbxloop.events import HostEventTypes
+from sbxloop.sbx.naming import run_name
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.rawdb import exec_raw
@@ -112,7 +113,7 @@ class TestWorkloadRun:
         assert result.state == "completed" and result.kind == "workload"
         assert result.succeeded
         assert harness.run_states() == WORKLOAD_STATES
-        assert harness.sandboxes_left() == [f"sbxloop-{result.run_id}-agent"]
+        assert harness.sandboxes_left() == [run_name(harness.home, result.run_id, "agent")]
         run = engine.store.get_run(result.run_id)
         assert run.kind == "workload" and run.state == "completed"
         assert run.stage == "publishing", "the last non-terminal stage, for a resume"
@@ -155,7 +156,7 @@ class TestWorkloadRun:
 
         assert result.state == "completed"
         assert harness.run_states() == WORKLOAD_STATES
-        assert harness.sandboxes_left() == [f"sbxloop-{result.run_id}-agent"]
+        assert harness.sandboxes_left() == [run_name(harness.home, result.run_id, "agent")]
         assert result.pr_number is None and fake.pr_create_calls == 0
         assert not any(e.type.startswith("run.deliver") for e in harness.events)
         assert not any(e.type.startswith("sandbox.workspace_clone") for e in harness.events)
@@ -839,7 +840,7 @@ class TestNeeds:
         harness.script([plan(needing("t1", hosts=["data.example.com"])), BUILD, PASS])
         result = harness.engine(**profiled).start("read the data", kind="workload")
         assert result.state == "completed"
-        agent = f"sbxloop-{result.run_id}-agent"
+        agent = run_name(harness.home, result.run_id, "agent")
         assert ["allow", "network", "data.example.com", "--sandbox", agent] in (
             harness.fake_sbx.policies()
         )
@@ -881,6 +882,50 @@ class TestNeeds:
         assert all(t.state == "pending" for t in engine.store.get_tasks(result.run_id))
         phases = [r.phase for r in engine.store.phase_attempts(result.run_id)]
         assert phases == ["plan"], "no task ran"
+
+    def test_any_host_is_granted_under_a_profile_that_bounds_nothing(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """A task that cannot know its hosts in advance asks for `*`, and a
+        profile whose egress is `*` grants it: the plan is valid, the run
+        completes, and the agent box is opened to every host."""
+        profiled["workloads"] = [{**RESEARCH, "egress": ["*"]}]
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled).start("follow the news", kind="workload")
+        assert result.state == "completed", result.reason
+        agent = run_name(harness.home, result.run_id, "agent")
+        assert ["allow", "network", "**", "--sandbox", agent] in harness.fake_sbx.policies()
+        (grant,) = self.granted(harness)
+        assert grant["hosts"] == ["*"]
+        assert self.refused(harness) == []
+
+    def test_any_host_is_refused_under_a_profile_that_names_its_hosts(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled).start("follow the news", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert (refusal["need"], refusal["value"]) == ("host", "*")
+        assert refusal["key"] == "workloads.research.egress"
+        assert [e for e in harness.events if e.type == "policy.allow"] == []
+
+    def test_any_host_is_refused_when_policy_denies_anything(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        profiled["workloads"] = [{**RESEARCH, "egress": ["*"]}]
+        harness.script([plan(needing("t1", hosts=["*"])), BUILD, PASS])
+        result = harness.engine(**profiled, policy={"deny": ["bad.example.com"]}).start(
+            "follow the news", kind="workload"
+        )
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None
+        assert refusal["message"] == (
+            "task t1 needs host `*` — a sandbox granted every host cannot keep out "
+            "[policy] deny pattern 'bad.example.com'; name the hosts instead"
+        )
+        assert [e for e in harness.events if e.type == "policy.allow"] == []
 
     def test_a_denied_host_is_refused_even_inside_the_profile(
         self, harness: Harness, profiled: dict[str, Any]
@@ -991,17 +1036,17 @@ class TestNeeds:
             for arg in argv
             if arg.startswith("--name=")
         ]
-        assert names.count(f"sbxloop-{run_id}-agent") == 2
-        assert names.count(f"sbxloop-{run_id}-service") == 1
+        assert names.count(run_name(harness.home, run_id, "agent")) == 2
+        assert names.count(run_name(harness.home, run_id, "service")) == 1
         assert harness.sandboxes_left() == [
-            f"sbxloop-{run_id}-agent",
-            f"sbxloop-{run_id}-service",
+            run_name(harness.home, run_id, "agent"),
+            run_name(harness.home, run_id, "service"),
         ]
         # The value went to the service box alone.
         (announce,) = [e for e in harness.events if e.type == "sandbox.service_credentials"]
-        assert announce.data["name"] == f"sbxloop-{run_id}-service"
+        assert announce.data["name"] == run_name(harness.home, run_id, "service")
         assert announce.data["envs"] == ["WEATHER_API_KEY"]
-        agent_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        agent_fs = harness.fake_sbx.sandbox_fs(run_name(harness.home, run_id, "agent"))
         for path in agent_fs.rglob("*"):
             if path.is_file():
                 assert "wx-secret-value" not in path.read_bytes().decode("utf-8", "replace"), path
@@ -1012,7 +1057,7 @@ class TestNeeds:
         assert "## Services you may call" in execute["prompt"]
         # (the plan job's file went with the first agent box)
         # The service box answered the one call.
-        service_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+        service_fs = harness.fake_sbx.sandbox_fs(run_name(harness.home, run_id, "service"))
         kinds = {
             json.loads(p.read_text())["kind"]
             for p in (service_fs / "home/agent/.sbxloop/jobs").iterdir()
@@ -1244,8 +1289,8 @@ class TestSinks:
         assert result.state == "completed", result.reason
         # the profile's sinks need GitHub, so the run got its github box
         assert harness.sandboxes_left() == [
-            f"sbxloop-{result.run_id}-agent",
-            f"sbxloop-{result.run_id}-github",
+            run_name(harness.home, result.run_id, "agent"),
+            run_name(harness.home, result.run_id, "github"),
         ]
         ((title, body, labels),) = fake.issues_created
         assert title == "Digest"

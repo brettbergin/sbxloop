@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sbxloop.api.channel_access import ChannelAccess
 from sbxloop.api.collaboration import CollaborationError, Member
 from sbxloop.db.api_models import ApiEventRow
-from sbxloop.db.collaboration_models import ChannelRow
+from sbxloop.db.collaboration_models import ChannelMemberRow, ChannelRow
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
 
@@ -480,3 +480,146 @@ def test_capabilities_advertise_members_and_participants(api: Any) -> None:
     features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
     assert "collaboration.participants" in features
     assert "collaboration.channel_members" in features
+
+
+def _login(api: Any, username: str) -> dict[str, str]:
+    response = api.client.post(
+        "/v1/auth/local/login",
+        json={"username": username, "password": "another long password"},
+    )
+    assert response.status_code == 200, response.text
+    return bearer(dict(response.json()))
+
+
+def test_leaving_the_workspace_ends_every_channel_membership(api: Any) -> None:
+    """A removed member is out of their channels, and a later invite lets
+    them back into the workspace only: the private channels they were in
+    stay hidden until someone adds them again."""
+    owner, guest, _ = _people(api)
+    guest_id = _user_id(api, guest)
+    channel_id = _channel(api, owner)
+    members = f"/v1/channels/{channel_id}/members"
+    assert api.client.post(members, headers=owner, json={"user_id": guest_id}).status_code == 201
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=guest).status_code == 200
+
+    removed = api.client.delete(f"/v1/workspace/members/{guest_id}", headers=owner)
+    assert removed.status_code == 204, removed.text
+    listed = api.client.get(members, headers=owner).json()["data"]
+    assert [m["user_id"] for m in listed] == [_user_id(api, owner)]
+
+    store = api.ctx.collaboration
+    _, raw = store.create_invite(
+        "member", None, created_by=_user_id(api, owner), ttl_s=3600, now=api.clock()
+    )
+    assert store.accept_invite(raw, guest_id, now=api.clock()).role == "member"
+    again = _login(api, "guest")
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=again).status_code == 404
+    assert api.client.get("/v1/channels", headers=again).json()["items"] == []
+    assert api.client.get(members, headers=again).status_code == 404
+
+    assert _events(api, "collaboration.member.") == [
+        ("collaboration.member.added", {"channel_id": channel_id, "user_id": guest_id}),
+        ("collaboration.member.removed", {"channel_id": channel_id, "user_id": guest_id}),
+    ]
+
+
+def test_deactivation_ends_every_channel_membership(api: Any) -> None:
+    owner, guest, _ = _people(api)
+    guest_id = _user_id(api, guest)
+    channel_id = _channel(api, owner)
+    members = f"/v1/channels/{channel_id}/members"
+    assert api.client.post(members, headers=owner, json={"user_id": guest_id}).status_code == 201
+
+    paused = api.client.patch(
+        f"/v1/workspace/members/{guest_id}", json={"is_active": False}, headers=owner
+    )
+    assert paused.status_code == 200, paused.text
+    assert [m["user_id"] for m in api.client.get(members, headers=owner).json()["data"]] == [
+        _user_id(api, owner)
+    ]
+
+    restored = api.client.patch(
+        f"/v1/workspace/members/{guest_id}", json={"is_active": True}, headers=owner
+    )
+    assert restored.status_code == 200, restored.text
+    again = _login(api, "guest")
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=again).status_code == 404
+    assert api.client.get("/v1/channels", headers=again).json()["items"] == []
+
+
+def test_a_removed_last_owner_hands_the_channel_to_its_longest_standing_member(api: Any) -> None:
+    owner, guest, admin = _people(api)
+    owner_id, guest_id, admin_id = (_user_id(api, h) for h in (owner, guest, admin))
+    channel_id = _channel(api, admin)
+    members = f"/v1/channels/{channel_id}/members"
+    assert api.client.post(members, headers=admin, json={"user_id": guest_id}).status_code == 201
+    api.clock.t += 1
+    assert api.client.post(members, headers=admin, json={"user_id": owner_id}).status_code == 201
+    # A channel the admin alone was in is left without a member.
+    alone = _channel(api, admin)
+
+    removed = api.client.delete(f"/v1/workspace/members/{admin_id}", headers=owner)
+    assert removed.status_code == 204, removed.text
+
+    roles = {m["user_id"]: m["role"] for m in api.client.get(members, headers=owner).json()["data"]}
+    assert roles == {guest_id: "owner", owner_id: "member"}
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=guest).json()["my_role"] == "owner"
+    # The new owner is the last one: the rule that keeps an owner still holds.
+    step_down = api.client.post(
+        members, headers=guest, json={"user_id": guest_id, "role": "member"}
+    )
+    assert step_down.status_code == 409
+    assert step_down.json()["code"] == "last_channel_owner"
+    assert api.ctx.collaboration.list_channel_members(None, alone) == []
+
+    assert _events(api, "collaboration.member.") == [
+        ("collaboration.member.added", {"channel_id": channel_id, "user_id": guest_id}),
+        ("collaboration.member.added", {"channel_id": channel_id, "user_id": owner_id}),
+        ("collaboration.member.removed", {"channel_id": channel_id, "user_id": admin_id}),
+        ("collaboration.member.updated", {"channel_id": channel_id, "user_id": guest_id}),
+        ("collaboration.member.removed", {"channel_id": alone, "user_id": admin_id}),
+    ]
+
+
+def test_a_stale_owner_does_not_satisfy_the_last_owner_check(api: Any) -> None:
+    """Only an active workspace member counts as another owner, whether
+    their membership was ended by this release or is a row left behind
+    before it."""
+    owner, guest, admin = _people(api)
+    guest_id, admin_id = (_user_id(api, h) for h in (guest, admin))
+    cal = bearer(_invite(api, "member", "cal"))
+    cal_id = _user_id(api, cal)
+    channel_id = _channel(api, admin)
+    members = f"/v1/channels/{channel_id}/members"
+    for body in ({"user_id": cal_id, "role": "owner"}, {"user_id": guest_id}):
+        assert api.client.post(members, headers=admin, json=body).status_code == 201
+
+    # cal, the other owner, is deactivated: the admin is the last owner again.
+    paused = api.client.patch(
+        f"/v1/workspace/members/{cal_id}", json={"is_active": False}, headers=owner
+    )
+    assert paused.status_code == 200, paused.text
+    for attempt in (
+        api.client.delete(f"{members}/{admin_id}", headers=admin),
+        api.client.post(members, headers=admin, json={"user_id": admin_id, "role": "member"}),
+    ):
+        assert attempt.status_code == 409, attempt.text
+        assert attempt.json()["code"] == "last_channel_owner"
+
+    # A row left behind for someone no longer in the workspace counts for nothing.
+    with api.harness.dstore.transaction() as session:
+        session.add(
+            ChannelMemberRow(
+                channel_id=channel_id,
+                user_id="usr_gone",
+                role="owner",
+                added_by=None,
+                joined_at=0.0,
+            )
+        )
+    for attempt in (
+        api.client.delete(f"{members}/{admin_id}", headers=admin),
+        api.client.post(members, headers=admin, json={"user_id": admin_id, "role": "member"}),
+    ):
+        assert attempt.status_code == 409, attempt.text
+        assert attempt.json()["code"] == "last_channel_owner"

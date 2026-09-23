@@ -21,6 +21,7 @@ FEATURES: tuple[str, ...] = (
     "operations",
     "auth.client_credentials",
     "auth.refresh",
+    "auth.sso_policy",
     "items",
     "queue",
     "runs",
@@ -51,8 +52,10 @@ FEATURES: tuple[str, ...] = (
     "collaboration.preferences",
     "collaboration.workflows",
     "collaboration.connections.read",
+    "collaboration.connections.manage",
     "collaboration.message_artifacts",
     "collaboration.channel_artifacts",
+    "collaboration.file_inputs_generic",
     "collaboration.message_authors",
     "agents.registry",
     "agents.memory",
@@ -69,6 +72,10 @@ FEATURES: tuple[str, ...] = (
     "collaboration.silence",
     "collaboration.read_state",
     "collaboration.mention_steering",
+    "collaboration.external_work",
+    "repositories.discover",
+    "repositories.manage",
+    "repositories.labels",
 )
 
 
@@ -78,6 +85,7 @@ def features(config: Config) -> list[str]:
     served = list(FEATURES)
     if config.api.oidc.enabled:
         served.append("auth.oidc")
+        served.append("auth.oidc.backchannel_logout")
     return served
 
 

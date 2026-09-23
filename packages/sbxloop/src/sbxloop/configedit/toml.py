@@ -7,7 +7,7 @@ value must keep every one of them, so the draft is round-tripped with
 is touched: the file that comes back differs from the file that went in by
 that assignment alone.
 
-Paths are :mod:`sbxloop.configedit.keys`', so ``github.repos[1].repo``
+Paths are :mod:`sbxloop.configedit.keys`', so ``vcs.repos[1].repo``
 reaches into the second array-of-tables entry. Containers on the way are
 created when missing — a table, or one new array entry appended at the
 end — and anything else that does not fit (an index past the end, a key
@@ -157,9 +157,84 @@ def file_value(text: str, parts: tuple[PathPart, ...]) -> tuple[Any, bool]:
     return node, True
 
 
+#: The delivery settings a legacy ``[github] repo`` carried beside it; they
+#: move into the entry it becomes, where the same keys mean the same.
+_LEGACY_REPO_KEYS = ("deliver_base", "create_repo", "create_public")
+
+
+def migrate_repos(text: str) -> tuple[str, list[str]]:
+    """``text`` with its repositories declared under ``[[vcs.repos]]``, and
+    the repositories that moved (#2255).
+
+    ``[[github.repos]]`` entries move as they are, sub-tables and comments
+    included; a single ``[github] repo`` becomes one entry carrying the
+    ``deliver_base`` / ``create_repo`` / ``create_public`` beside it. The
+    rest of ``[github]`` stays. A file already on the current spelling comes
+    back byte-identical with nothing moved. A file that declares
+    repositories under both is refused by name: the loader refuses it too,
+    and merging two lists is not something to guess at.
+    """
+    doc = parse(text)
+    github: Any = doc.get("github")
+    if not _mapping(github):
+        return text, []
+    has_entries = "repos" in github
+    has_single = "repo" in github
+    if not has_entries and not has_single:
+        return text, []
+    vcs: Any = doc.get("vcs")
+    if _mapping(vcs) and vcs.get("repos"):
+        raise ConfigWriteError(
+            "[[vcs.repos]] and [[github.repos]] (or [github] repo) both declare "
+            "repositories: declare each repository once, under [[vcs.repos]], then "
+            "run this again"
+        )
+    if not _mapping(vcs):
+        vcs = tomlkit.table()
+        doc["vcs"] = vcs
+    moved: list[str] = []
+    if has_entries:
+        entries = github.pop("repos")
+        if not _sequence(entries):
+            raise ConfigWriteError("github.repos is not an array of tables")
+        moved.extend(str(entry.get("repo", "")) for entry in entries)
+        vcs["repos"] = entries
+    else:
+        entry = tomlkit.table()
+        entry["repo"] = github.pop("repo")
+        for key in _LEGACY_REPO_KEYS:
+            if key in github:
+                entry[key] = github.pop(key)
+        entries = tomlkit.aot()
+        entries.append(entry)
+        vcs["repos"] = entries
+        moved.append(str(entry["repo"]))
+    return tomlkit.dumps(doc), moved
+
+
+def current_spelling(text: str, parts: tuple[PathPart, ...]) -> tuple[str, list[str]]:
+    """``text`` ready for a write at ``parts``, and the repositories moved.
+
+    A key under ``vcs.repos`` on a file still spelt ``[[github.repos]]``
+    would otherwise open an empty second list beside the old one, so the
+    file is migrated first (:func:`migrate_repos`), every entry moved with
+    its comments; every surface that writes a key (the editor, the console)
+    goes through this. Any other key, a file already on the current
+    spelling, or a file the migration refuses is returned untouched — the
+    write then fails or succeeds on its own terms."""
+    if tuple(parts[:2]) != ("vcs", "repos"):
+        return text, []
+    try:
+        return migrate_repos(text)
+    except ConfigWriteError:
+        return text, []
+
+
 __all__ = [
     "ConfigWriteError",
+    "current_spelling",
     "file_value",
+    "migrate_repos",
     "parse",
     "set_value",
     "unset_value",

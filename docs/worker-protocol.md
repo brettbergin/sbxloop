@@ -186,6 +186,20 @@ mediation between the sandboxes before anything else.
 - **stream** (default): one blocking `sbx exec` per job; the host parses
   stdout line-by-line onto its EventBus. Unparseable lines become
   `worker.stdout` events, never crashes.
+- **resident** (`worker_transport = "resident"`): one `sbx exec` per sandbox
+  runs `python -m sbxloop_worker serve`; the host writes each job to its
+  stdin and reads the job's events and result back on its stdout, and a
+  host-tool response rides the same stdin (`sbxloop_worker.serve` documents
+  the line protocol). Every `sbx` invocation costs about a second of
+  backend round trip whatever it runs (field, db 2026-09-19), and stream
+  pays three per job plus one per tool response; resident pays one per
+  sandbox. Each job still runs in a forked child of its own with the same
+  runner, events file and result file. It needs per-job stdin delivery
+  (the `exec-stdin-env` verdict), which is how credentials reach the server
+  too: once before the first job, again when they change. A client without
+  it, or whose server never reports ready, streams as before. The host
+  still initiates everything; the server reads the pipe the host opened
+  and listens on nothing.
 - **poll** (`worker_transport = "poll"`): the worker is launched detached
   (`nohup … &`); the host tails `events/<id>.jsonl` by byte offset. Fallback
   for environments where long exec streams are unreliable.

@@ -271,7 +271,7 @@ def _tool_item(
         (target,) = resolve_targets(config, repo=repo, url=url)
     except (ConfigError, ValueError) as exc:
         raise ControlError("invalid_argument", str(exc)) from exc
-    entry = config.github.find_repo(target)
+    entry = config.find_repo(target)
     return WorkItem(
         item_id=item_id,
         source_key=item_id.partition(":")[2],
@@ -293,7 +293,7 @@ def admit_issue(loop: Any, request: IssueAdmission) -> WorkItem:
     """The item the GitHub source builds for the issue, labelled for
     ``run_kind``; refusals as :class:`ControlError`."""
     config: Config = loop.config
-    entry = config.github.find_repo(request.repository)
+    entry = config.find_repo(request.repository)
     if entry is None:
         raise ControlError("unknown_target", f"{request.repository} is not a configured repository")
     if not entry.enabled:
@@ -355,4 +355,7 @@ def upsert(loop: Any, item: WorkItem, *, by: str | None) -> tuple[WorkItem, bool
         fresh=fresh,
         title=stored.title[:80],
     )
+    if fresh:
+        # The row is in; the loop need not sit out its poll interval.
+        loop.wake()
     return stored, fresh

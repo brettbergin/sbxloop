@@ -225,6 +225,11 @@ class FakeLoop:
         # restart (#969): supervised unless a test says otherwise
         self.supervisor_kind: str | None = "systemd"
         self.restarts: list[dict[str, Any]] = []
+        # `wake()` calls: work queued from outside the tick.
+        self.wakes = 0
+
+    def wake(self) -> None:
+        self.wakes += 1
 
     @property
     def paused(self) -> bool:
@@ -366,6 +371,7 @@ class FakeConcierge:
         on_tool: Any = None,
         via: str | None = None,
         message_id: str | None = None,
+        principal: Any = None,
     ) -> Any:
         import concurrent.futures
 
@@ -375,6 +381,7 @@ class FakeConcierge:
         self.author_ids = [*getattr(self, "author_ids", []), author_id]
         self.vias = [*getattr(self, "vias", []), via]
         self.message_ids = [*getattr(self, "message_ids", []), message_id]
+        self.principals = [*getattr(self, "principals", []), principal]
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
         def run() -> None:
@@ -800,6 +807,12 @@ class TestBridge:
             assert msg.reactions == ["⏳", "✅"]
             # the mention token was stripped; attribution names the user
             assert concierge.turns == [("what's running?", "Discord user `brett`")]
+            # The channel is the operator's: the bridge says so explicitly,
+            # with a principal holding every capability (#1274), rather than
+            # leaving the turn to be trusted by default.
+            from sbxloop.daemon.controls.principal import Principal
+
+            assert concierge.principals == [Principal.trusted("Discord user `brett`", "discord")]
             # tool-note audit line, then the reply threaded under the question
             assert any(s.startswith("🛠 concierge: sbx_control(status)") for s in control.sent)
             idx = control.sent.index("two runs today; `r1` is live")

@@ -90,7 +90,7 @@ def tracked_custom_secrets(config: Config) -> list[tuple[str, str]]:
     """
     backend = backend_for(config)
     secrets: list[tuple[str, str]] = []
-    for repo in (None, *(entry.repo for entry in config.github.repos)):
+    for repo in (None, *(entry.repo for entry in config.vcs.repos)):
         secret = backend.secret(config, repo)
         if secret not in secrets:
             secrets.append(secret)

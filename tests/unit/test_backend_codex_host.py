@@ -16,6 +16,7 @@ from sbxloop.daemon.discord_format import agent_model_label
 from sbxloop.errors import ProvisionError
 from sbxloop.log import redact_text
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.naming import run_name
 from sbxloop.sbx.provision import Provisioner, agent_policy_allows
 from sbxloop.sbx.secretstate import tracked_custom_secrets
 from tests.conftest import FakeSbx
@@ -168,7 +169,10 @@ def test_codex_key_and_selector_reach_the_worker_without_credentials_in_argv(
         assert exports["OPENAI_API_KEY"] == token
         assert exports["SBXLOOP_WORKER_BACKEND"] == "codex"
     else:
-        env_file = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        env_file = (
+            fake_sbx.sandbox_fs(run_name(config.paths, "r1", "agent"))
+            / "home/agent/.sbxloop/env.sh"
+        )
         content = env_file.read_text()
         assert f"OPENAI_API_KEY={token}" in content
         assert "SBXLOOP_WORKER_BACKEND=codex" in content
