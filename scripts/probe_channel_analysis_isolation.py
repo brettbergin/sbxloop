@@ -37,8 +37,10 @@ def main() -> None:
         "ANTHROPIC_API_KEY",
         "COPILOT_GITHUB_TOKEN",
     ):
-        if os.environ.get(name):
-            _fail(f"host credential/environment variable leaked into sandbox: {name}")
+        value = os.environ.get(name)
+        if value:
+            kind = "proxy placeholder" if value.startswith("sbx-cs-") else "non-placeholder"
+            _fail(f"host credential/environment variable leaked into sandbox: {name} ({kind})")
 
     try:
         original.write_bytes(b"changed")
