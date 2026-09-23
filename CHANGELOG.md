@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+**`doctor --deep --fail-on-drift` stops failing on a verdict change it
+already reported, and on one that came from an older probe.** A verdict that
+changed between sbx versions was reported on every run for as long as the
+new version stayed installed, so one reviewed change (sbx 0.45's template
+now ships `python3-venv`) failed the gate every time with no way to accept
+it. The first deep run under the new version reports the change and records
+the new verdict, and later runs take it as the baseline. A probe that
+reports a verdict the build depends on still fails on every run. Cached
+verdicts also record which probe revision produced them.
+`api-host-unreachable` is now revision 2, so a "reachable" recorded before
+the probe learned that sbx accepts connections its policy then drops is no
+longer compared with today's answer. It was a false positive, not an sbx
+change, and it had failed the weekly `sbx-conformance` job since sbx 0.43.
+`sbxloop init` now installs sbx 0.43.0 by default (was 0.38.0), and doctor's
+tested series is 0.43: the newest release on which the scheduled conformance
+job saw every probe answer as expected. 0.45 becomes the default once that
+job has verified it. (#2306)
+
 **The sandbox backend stays up under systemd on sbx 0.45.** From sbx 0.45.1
 (field-verified) `sbx daemon start` detaches even without `-d`, so the
 `Type=simple` unit `sbxloop init --systemd` rendered saw its main process exit
