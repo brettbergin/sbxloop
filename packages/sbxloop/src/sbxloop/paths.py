@@ -191,6 +191,11 @@ class SbxloopHome:
         return self.root / "runs"
 
     @property
+    def channel_files(self) -> Path:
+        """Durable originals uploaded to channels, outside run cleanup."""
+        return self.root / "channel-files"
+
+    @property
     def workspaces(self) -> Path:
         return self.root / "workspaces"
 

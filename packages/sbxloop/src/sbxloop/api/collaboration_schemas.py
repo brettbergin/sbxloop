@@ -455,6 +455,15 @@ class ArtifactRefOut(ApiModel):
     size: int
 
 
+class InputFileRefOut(ApiModel):
+    """A user-supplied original stored privately for this channel."""
+
+    id: str
+    name: str
+    size: int
+    sha256: str
+
+
 class ChannelWorkOut(ApiModel):
     item_id: str
     #: The turn the work hangs on; null for a run a channel asked for
@@ -593,6 +602,7 @@ PostKindName = Literal["plan", "progress", "review", "delivery", "reply", "notic
 
 class MessageOut(ApiModel):
     id: str
+    client_message_id: str | None = None
     channel_id: str
     turn_id: str | None
     sequence: int
@@ -607,6 +617,7 @@ class MessageOut(ApiModel):
     #: Files this message carries, readable by anyone who can read the
     #: channel (feature ``collaboration.message_artifacts``).
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
+    input_files: list[InputFileRefOut] = Field(default_factory=list)
     #: Where the message arrived from, when it came over a bridge.
     origin: MessageOriginOut | None = None
     #: Set on the ``agent_update`` messages a run posts; null otherwise.
@@ -625,7 +636,8 @@ class ReactionSet(ApiModel):
 
 
 class TurnCreate(ApiModel):
-    content: str = Field(min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
+    file_ids: list[str] = Field(default_factory=list, max_length=16)
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)

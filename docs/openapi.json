@@ -1117,6 +1117,105 @@
         "title": "ChannelCreate",
         "type": "object"
       },
+      "ChannelFileOut": {
+        "additionalProperties": false,
+        "properties": {
+          "channel_id": {
+            "title": "Channel Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "uploaded_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uploaded At"
+          }
+        },
+        "required": [
+          "id",
+          "channel_id",
+          "name",
+          "size",
+          "sha256",
+          "status",
+          "message_id",
+          "created_at",
+          "uploaded_at"
+        ],
+        "title": "ChannelFileOut",
+        "type": "object"
+      },
+      "ChannelFilePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelFileOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelFilePage",
+        "type": "object"
+      },
       "ChannelJobOut": {
         "additionalProperties": false,
         "description": "Additive all-jobs view, including real runs without a work item.",
@@ -2739,6 +2838,41 @@
         "title": "ExternalWorkSourceOut",
         "type": "object"
       },
+      "FileReserve": {
+        "additionalProperties": false,
+        "properties": {
+          "client_upload_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Upload Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          }
+        },
+        "required": [
+          "client_upload_id",
+          "name"
+        ],
+        "title": "FileReserve",
+        "type": "object"
+      },
       "Gate": {
         "additionalProperties": false,
         "properties": {
@@ -3067,6 +3201,36 @@
           "operation"
         ],
         "title": "HoldResult",
+        "type": "object"
+      },
+      "InputFileRefOut": {
+        "additionalProperties": false,
+        "description": "A user-supplied original stored privately for this channel.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "size",
+          "sha256"
+        ],
+        "title": "InputFileRefOut",
         "type": "object"
       },
       "IssueIntake": {
@@ -4266,6 +4430,17 @@
             "title": "Channel Id",
             "type": "string"
           },
+          "client_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Message Id"
+          },
           "content": {
             "title": "Content",
             "type": "string"
@@ -4282,6 +4457,13 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "input_files": {
+            "items": {
+              "$ref": "#/components/schemas/InputFileRefOut"
+            },
+            "title": "Input Files",
+            "type": "array"
           },
           "kind": {
             "title": "Kind",
@@ -7547,10 +7729,18 @@
             "title": "Client Turn Id"
           },
           "content": {
+            "default": "",
             "maxLength": 100000,
-            "minLength": 1,
             "title": "Content",
             "type": "string"
+          },
+          "file_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "File Ids",
+            "type": "array"
           },
           "intent": {
             "default": "conversation",
@@ -7573,9 +7763,6 @@
             "type": "array"
           }
         },
-        "required": [
-          "content"
-        ],
         "title": "TurnCreate",
         "type": "object"
       },
@@ -9804,6 +9991,289 @@
           }
         },
         "summary": "Download Channel Artifact",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files": {
+      "get": {
+        "operationId": "list_files_v1_channels__channel_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFilePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Files",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "operationId": "reserve_file_v1_channels__channel_id__files_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve File",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files/{file_id}": {
+      "delete": {
+        "operationId": "cancel_file_v1_channels__channel_id__files__file_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel File",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "get": {
+        "operationId": "get_file_v1_channels__channel_id__files__file_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get File",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/files/{file_id}/content": {
+      "get": {
+        "operationId": "download_file_v1_channels__channel_id__files__file_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download File",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "put": {
+        "operationId": "upload_file_v1_channels__channel_id__files__file_id__content_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelFileOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload File",
         "tags": [
           "collaboration"
         ]

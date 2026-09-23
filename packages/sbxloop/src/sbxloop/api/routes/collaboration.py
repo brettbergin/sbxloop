@@ -67,6 +67,7 @@ from sbxloop.api.collaboration_schemas import (
     ExternalIdentityOut,
     ExternalIdentityPage,
     ExternalWorkOut,
+    InputFileRefOut,
     LinkCodeOut,
     LocalLoginRequest,
     LocalRegisterRequest,
@@ -282,6 +283,7 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
     source_work_id = origin.get("source_work_id")
     return MessageOut(
         id=message.id,
+        client_message_id=message.client_message_id,
         channel_id=message.channel_id,
         turn_id=message.turn_id,
         sequence=message.sequence,
@@ -295,6 +297,10 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         author=_author_out(message.author, ctx),
         post_kind=message.post_kind,
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
+        input_files=[
+            InputFileRefOut(id=ref.id, name=ref.name, size=ref.size, sha256=ref.sha256)
+            for ref in message.input_files
+        ],
         origin=_origin_out(message.origin),
         source_run_id=source_run_id if isinstance(source_run_id, str) else None,
         source_work_id=source_work_id if isinstance(source_work_id, str) else None,
@@ -1006,6 +1012,10 @@ async def create_turn(
     # The member is checked after availability, so a stopped concierge is
     # reported as such whoever asks.
     user = member_of(auth).user
+    if not body.content.strip() and not body.file_ids:
+        raise Problem(422, "empty_turn", "a turn needs text or at least one file")
+    if not body.content.strip() and body.intent != "conversation":
+        raise Problem(422, "file_only_intent", "file-only turns must use conversation intent")
     runner_selected = body.intent in {"code", "workload"}
     if runner_selected and body.target_slugs:
         raise Problem(
@@ -1032,6 +1042,7 @@ async def create_turn(
             targets=targets,
             client_turn_id=body.client_turn_id,
             client_message_id=body.client_message_id,
+            file_ids=tuple(body.file_ids),
             actor=auth.principal.audit(),
             intent=intent,
             participants=participants,

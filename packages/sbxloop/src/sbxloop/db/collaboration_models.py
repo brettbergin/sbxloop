@@ -400,6 +400,39 @@ class MessageArtifactRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
 
+class ChannelInputFileRow(Base):
+    """An immutable user upload, independent of generated run artifacts.
+
+    The original lives under ``SbxloopHome.channel_files`` at a path derived
+    only from this opaque id. ``reserved`` rows have no committed bytes yet;
+    only the uploader may see them. A later message association will make an
+    ``uploaded`` file visible to the rest of its channel.
+    """
+
+    __tablename__ = "collaboration_input_files"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "uploader_id", "client_upload_id"),
+        Index("idx_collaboration_input_files_channel", "channel_id", "created_at"),
+        Index("idx_collaboration_input_files_workspace", "workspace_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    uploader_id: Mapped[str] = mapped_column(Text, nullable=False)
+    client_upload_id: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    declared_size: Mapped[int | None] = mapped_column(Integer)
+    size: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str | None] = mapped_column(Text)
+    position: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    uploaded_at: Mapped[float | None] = mapped_column(REAL)
+    deleted_at: Mapped[float | None] = mapped_column(REAL)
+
+
 class ChannelSummaryRow(Base):
     """What a channel said before its history window (revision 0028).
 
