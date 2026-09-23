@@ -106,6 +106,10 @@ class Probe:
     # The dependent behavior, named in drift alarms.
     depends: str
     run: Callable[[ProbeContext], tuple[str, str]]  # -> (verdict, detail)
+    # Bumped when a fix changes what the probe measures: a cached verdict
+    # from another revision answered a different question, so it is never
+    # compared across sbx versions.
+    revision: int = 1
 
 
 class ProbeRecord(BaseModel):
@@ -115,6 +119,9 @@ class ProbeRecord(BaseModel):
     detail: str = ""
     checked_at: float
     source: VerdictSource = "probe"
+    # The probe revision that produced the verdict; caches written before
+    # revisions existed read as 1.
+    revision: int = 1
 
 
 # -- probe implementations ---------------------------------------------------
@@ -577,7 +584,7 @@ CATALOG: tuple[Probe, ...] = (
         tier="sandbox",
         expected=None,  # the install ladder handles both answers
         depends="the worker install ladder (venv -> apt python3-venv -> user-site) exists "
-        "because the default template lacks python3-venv",
+        "because a template may lack python3-venv (sbx's default did through 0.43)",
         run=_probe_python3_venv,
     ),
     Probe(
@@ -642,6 +649,9 @@ CATALOG: tuple[Probe, ...] = (
         "names the host) — a reachable or policy-allows verdict means an agent could "
         "steer its own daemon",
         run=_probe_api_host_unreachable,
+        # 2: reachable only when the API itself answers; revision 1 counted
+        # a connection sbx accepts and its policy then drops.
+        revision=2,
     ),
 )
 
@@ -700,9 +710,14 @@ def record_field_verdict(
 
     Best-effort by contract: a cache write must never fail the caller.
     """
+    probe = next((p for p in CATALOG if p.id == probe_id), None)
     try:
         record = ProbeRecord(
-            verdict=verdict, detail=detail, checked_at=time.time(), source="provision"
+            verdict=verdict,
+            detail=detail,
+            checked_at=time.time(),
+            source="provision",
+            revision=probe.revision if probe else 1,
         )
         save_verdicts(home, version, {probe_id: record})
     except OSError:
@@ -797,18 +812,34 @@ def _apply_drift(
     outcome: ProbeOutcome,
     previous_version: str | None,
     previous: dict[str, ProbeRecord],
+    seen: ProbeRecord | None,
 ) -> None:
-    """Attach drift alarms: expected-verdict mismatches and cross-version flips."""
+    """Attach drift alarms: expected-verdict mismatches and cross-version flips.
+
+    A mismatch alarms on every run. A flip alarms until this sbx version has
+    a live-probed record of the new verdict (``seen``): the run that reported
+    it wrote that record, so the new verdict becomes the baseline instead of
+    failing ``--fail-on-drift`` for as long as the version stays installed.
+    A prior verdict from another probe revision is not comparable.
+    """
     if outcome.is_error or outcome.source == "unprobed":
         return
     probe = outcome.probe
     if probe.expected is not None and outcome.verdict != probe.expected:
         outcome.drifts.append(f"this sbxloop build depends on {probe.expected!r}: {probe.depends}")
     prior = previous.get(probe.id)
+    reported = (
+        seen is not None
+        and seen.source == "probe"
+        and seen.verdict == outcome.verdict
+        and seen.revision == probe.revision
+    )
     if (
         previous_version is not None
         and prior is not None
+        and prior.revision == probe.revision
         and prior.verdict not in (VERDICT_ERROR, outcome.verdict)
+        and not reported
     ):
         outcome.drifts.append(
             f"changed from {prior.verdict!r} under sbx {previous_version} — {probe.depends}"
@@ -869,7 +900,10 @@ def run_conformance(
         if outcome.source == "probe" and not outcome.is_error:
             assert outcome.checked_at is not None
             fresh[outcome.probe.id] = ProbeRecord(
-                verdict=outcome.verdict, detail=outcome.detail, checked_at=outcome.checked_at
+                verdict=outcome.verdict,
+                detail=outcome.detail,
+                checked_at=outcome.checked_at,
+                revision=outcome.probe.revision,
             )
 
     for probe in (p for p in CATALOG if p.tier == "cheap"):
@@ -915,7 +949,7 @@ def run_conformance(
                 )
 
     for outcome in outcomes:
-        _apply_drift(outcome, previous_version, previous)
+        _apply_drift(outcome, previous_version, previous, cached.get(outcome.probe.id))
 
     if fresh:
         try:

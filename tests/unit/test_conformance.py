@@ -525,6 +525,62 @@ class TestDrift:
         report = run_conformance(make_cli(fake_sbx), state, deep=True)
         assert report.drifted == []
 
+    def test_a_flip_alarms_once_then_is_the_new_baseline(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # The first deep run under the new version reports the flip; once
+        # this version has recorded the new verdict, re-running doctor must
+        # not fail on the same, already-reported change forever.
+        state = SbxloopHome(tmp_path / "state")
+        self.seed_old_version(state, PROBE_SECRET_ENV_VISIBILITY, "visible-under-exec")
+        first = run_conformance(make_cli(fake_sbx), state, deep=True)
+        assert by_id(first)[PROBE_SECRET_ENV_VISIBILITY].drifts
+        again = run_conformance(make_cli(fake_sbx), state, deep=True)
+        assert again.previous_version == "0.34.0"
+        assert again.drifted == []
+        assert again.unverified == []
+
+    def test_a_verdict_from_an_older_probe_revision_is_not_a_flip(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # A cache written before the API probe learned that sbx accepts
+        # connections its policy drops holds a "reachable" nothing reached.
+        # That record answers a different question, so the fixed probe's
+        # "unreachable" is not a change in sbx.
+        state = SbxloopHome(tmp_path / "state")
+        path = cache_path(state, "0.34.0")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = {"verdict": "reachable", "detail": "connected to the API", "checked_at": 1.0}
+        path.write_text(
+            json.dumps({"sbx_version": "0.34.0", "records": {PROBE_API_HOST_UNREACHABLE: legacy}})
+        )
+        report = run_conformance(make_cli(fake_sbx), state, deep=True)
+        outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
+        assert outcome.verdict == "unreachable"
+        assert outcome.drifts == []
+
+    def test_a_flip_under_the_same_probe_revision_still_alarms(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        state = SbxloopHome(tmp_path / "state")
+        revision = by_id_catalog()[PROBE_API_HOST_UNREACHABLE].revision
+        save_verdicts(
+            state,
+            "0.34.0",
+            {
+                PROBE_API_HOST_UNREACHABLE: ProbeRecord(
+                    verdict="policy-allows", checked_at=time.time() - 100, revision=revision
+                )
+            },
+        )
+        report = run_conformance(make_cli(fake_sbx), state, deep=True)
+        outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
+        assert any("'policy-allows' under sbx 0.34.0" in drift for drift in outcome.drifts)
+
+
+def by_id_catalog() -> dict[str, conformance.Probe]:
+    return {probe.id: probe for probe in CATALOG}
+
 
 class TestCache:
     def test_save_merges_instead_of_replacing(self, tmp_path: Path) -> None:

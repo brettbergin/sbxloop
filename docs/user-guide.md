@@ -3322,7 +3322,13 @@ behavior. Ordinary runs feed the same cache, so verdicts stay fresh for free.
 `sbxloop doctor --fail-on-drift` turns that warning into an exit code (any
 drifted, errored, or unprobed probe fails) — the CI e2e lane uses it, and the
 scheduled `sbx-conformance` workflow runs it against the newest sbx release
-ahead of adoption. Under the copilot backend doctor also checks the
+ahead of adoption. A verdict that differs from the one it had under the
+previously probed sbx version is reported by the first `doctor --deep` that
+sees it under the new version; that run records it, so later runs take it as
+the new baseline. A verdict the build depends on keeps failing on every run
+until it is back. `sbxloop init` installs sbx 0.43.0 by default;
+`--sbx-version` picks another release, and doctor notes any sbx outside the
+0.43 series. Under the copilot backend doctor also checks the
 installed Copilot SDK's permission-kind vocabulary against the
 field-verified snapshot backing the read-only critic barrier.
 
