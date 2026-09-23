@@ -287,3 +287,73 @@ def test_a_close_that_cannot_remove_the_box_starts_a_new_generation_next_time(
     assert github.name == f"{base}-g1"
     assert [c for c in fake_sbx.invocations("rm") if c[-1] == base] == [["rm", "--force", base]]
     assert any("github_sandbox.remove_failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stale_box_still_being_reaped_is_slow_not_wedged(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`sbx rm` succeeded but the backend was still reaping the box when the
+    settle wait ran out. That is a slow teardown, not a box the backend cannot
+    remove: it is a warning, the name is not retired, nothing is created over
+    the box still listed, and the next cleanup retries the removal."""
+    monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_TIMEOUT_S", 0.05)
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    base = github.name
+    github.sbx.create(SandboxSpec(name=base, role="github", workspace=tmp_path))
+    fake_sbx.linger_removals(10_000)
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.ops()
+
+    assert not any("github_sandbox.wedged" in r.getMessage() for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    settling = [r for r in caplog.records if "github_sandbox.stale_settling" in r.getMessage()]
+    assert len(settling) == 1 and settling[0].levelno == logging.WARNING
+    # The provision did not create over a teardown still in flight (the first
+    # create is this test planting the stale box).
+    assert [c[1] for c in fake_sbx.invocations("create")] == [
+        f"--name={base}",
+        f"--name={base}-g1",
+    ]
+
+    # The backend catches up; the next cleanup retries the removal and the
+    # base name is still this daemon's to use.
+    fake_sbx.linger_removals(0)
+    github.close()
+    github.ops()
+    assert github.name == base
+    assert len([c for c in fake_sbx.invocations("rm") if c[-1] == base]) == 2
+
+
+def test_a_close_whose_teardown_is_still_settling_does_not_retire_the_name(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped box whose removal outlasts the settle wait is reported as a
+    warning, not as a wedged box, and the next provision retries it under the
+    same name."""
+    monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_TIMEOUT_S", 0.05)
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.ops()
+    base = github.name
+    fake_sbx.linger_removals(10_000)
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.close()
+
+    assert not any("github_sandbox.wedged" in r.getMessage() for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    settling = [r for r in caplog.records if "github_sandbox.remove_settling" in r.getMessage()]
+    assert len(settling) == 1 and settling[0].levelno == logging.WARNING
+
+    fake_sbx.linger_removals(0)
+    github.ops()
+    assert github.name == base
+    assert len([c for c in fake_sbx.invocations("rm") if c[-1] == base]) == 2

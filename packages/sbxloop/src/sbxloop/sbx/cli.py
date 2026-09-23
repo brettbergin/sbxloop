@@ -12,7 +12,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 
-from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError
+from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError, SbxSettleTimeoutError
 from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult, SandboxInfo, SandboxSpec
 from sbxloop.sbx.parse import parse_ls, parse_version
@@ -363,13 +363,15 @@ class SbxCLI:
         Fails closed on "could not tell": a name still listed at the deadline
         raises rather than letting the caller create over a teardown that is
         still in flight. Inventory, not a not-found exception, proves absence
-        — the same reasoning as ``DaemonGithub.remove_stale``.
+        — the same reasoning as ``DaemonGithub.remove_stale``. The raise is a
+        :class:`SbxSettleTimeoutError`, so a caller can tell a slow teardown
+        from a removal sbx refused.
         """
         timeout = RM_SETTLE_TIMEOUT_S if timeout is None else timeout
         deadline = time.monotonic() + timeout
         while any(info.name == name for info in self.ls()):
             if time.monotonic() >= deadline:
-                raise SbxError(
+                raise SbxSettleTimeoutError(
                     f"sandbox {name!r} was removed but sbx still lists it "
                     f"{timeout:.0f}s later; its teardown has not finished",
                     argv=redacted_argv(self.argv("ls")),

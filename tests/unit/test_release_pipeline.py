@@ -305,6 +305,30 @@ def test_incomplete_published_release_fails_closed(api):
         client.latest()
 
 
+def test_release_uses_dedicated_assets_when_summary_omits_them(api):
+    client, fake = api
+    item = fake.release_payloads[0]
+    complete_assets = item["assets"]
+    item["assets"] = []
+    fake.release_asset_payloads[item["id"]] = complete_assets
+
+    assert client.latest()["assets"] == complete_assets
+    assert pipeline.release_plan(client, "b" * 40) == {
+        "action": "new",
+        "version": "1.0.2",
+        "sha": "b" * 40,
+    }
+
+
+def test_dedicated_assets_remain_authoritative_when_summary_looks_complete(api):
+    client, fake = api
+    item = fake.release_payloads[0]
+    fake.release_asset_payloads[item["id"]] = item["assets"][:-1]
+
+    with pytest.raises(ValueError, match="assets"):
+        client.latest()
+
+
 @pytest.mark.parametrize("bad", ["../1.0.2", "1.0.2\nchanged=true", "1.0.2rc1", "01.0.2"])
 def test_rejects_invalid_versions(bad):
     with pytest.raises(ValueError):
