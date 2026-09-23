@@ -585,9 +585,10 @@ class MattermostBridge(ChatBridge):
     # -- inbound --------------------------------------------------------------------
 
     def _handle_ws_event(self, payload: dict[str, Any]) -> None:
-        """Every websocket frame lands here (client thread). A human's
-        ``posted`` in the control channel goes on to routing; a
-        ``reaction_added`` is this service's click (#932)."""
+        """Every websocket frame lands here (client thread). A ``posted`` in
+        the control channel or a linked one (a thread reply by the channel
+        it lives in) goes on to routing; a ``reaction_added`` is this
+        service's click (#932)."""
         event = str(payload.get("event") or "")
         if event == "reaction_added":
             self._schedule(self._route_reaction(payload.get("data") or {}))
@@ -598,10 +599,10 @@ class MattermostBridge(ChatBridge):
         post = _decode_post(data.get("post"))
         if post is None:
             return
-        if str(post.get("channel_id") or "") != (self.mattermost.channel_id or ""):
-            return
         # A non-empty type is a system message (joins, header changes).
         if str(post.get("type") or ""):
+            return
+        if not self._hears_channel(str(post.get("channel_id") or "")):
             return
         self._schedule(self._route_post(post, data))
 
