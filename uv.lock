@@ -645,7 +645,7 @@ wheels = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "1.0.8"
+version = "1.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -653,7 +653,7 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/d2/517ae4be0dbbb02d5546f48e4be59f0ac2d83752cd608da739c5c580942f/github_copilot_sdk-1.0.8-py3-none-any.whl", hash = "sha256:7c3d868b73daa3a154ae6c1c5a2bd9301c47349c6b080f1ed77ba9027da3e0fa", size = 429721, upload-time = "2026-07-22T23:14:47.571Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/6d/4f2e3dddc576ff49739317adba6f9b8c35e93b835ece923e46f1b7fa6028/github_copilot_sdk-1.0.13-py3-none-any.whl", hash = "sha256:941dd5b55cf32ba55c73c651052a4a52b259b470c68bf6a6ac3d240c235402c9", size = 588198, upload-time = "2026-09-04T21:31:02.063Z" },
 ]
 
 [[package]]
@@ -1895,7 +1895,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
-    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.13" },
     { name = "gitpython", specifier = ">=3.1.62" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.154.0" },
@@ -1913,7 +1913,7 @@ requires-dist = [
     { name = "textual", specifier = ">=8.2" },
     { name = "textual-plotext", specifier = ">=1.0.1" },
     { name = "tomlkit", specifier = ">=0.13" },
-    { name = "typer", specifier = ">=0.12" },
+    { name = "typer", specifier = ">=0.27.2" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'api'", specifier = ">=0.30" },
 ]
@@ -1944,7 +1944,7 @@ openai = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.152" },
-    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.13" },
     { name = "gitpython", specifier = ">=3.1.62" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.99" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.154.0" },
@@ -2131,7 +2131,7 @@ wheels = [
 
 [[package]]
 name = "typer"
-version = "0.27.0"
+version = "0.27.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -2139,9 +2139,9 @@ dependencies = [
     { name = "rich" },
     { name = "shellingham" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/78/fda3361b56efc27944f24225f6ecd13d96d6fcfe37bd0eb34e2f4c63f9fc/typer-0.27.0.tar.gz", hash = "sha256:629bd12ea5d13a17148125d9a264f949eb171fb3f120f9b04d85873cab054fa5", size = 203430, upload-time = "2026-07-15T19:21:07.007Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/f7/57713ba479fd405eb76de31404b2c744c289e336b2d999511ebf51e496f7/typer-0.27.2.tar.gz", hash = "sha256:269b7eb9d3c202ca84b4bc9618cb04ebb43d3d4d1e567e4c768607232c05f945", size = 204045, upload-time = "2026-08-28T10:26:55.046Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/40/03/26a383c9e58c213199d1aad1c3d353cfc22d4444ec6d2c0bf8ad02523843/typer-0.27.0-py3-none-any.whl", hash = "sha256:6f4b27631e47f077871b7dc30e933ec0131c1390fbe0e387ea5574b5bac9ccf1", size = 122716, upload-time = "2026-07-15T19:21:05.553Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/bf/205d0004930ede8f542fb58f601526fccf4ae7626075ca1e6c4de5d3d652/typer-0.27.2-py3-none-any.whl", hash = "sha256:b3a5fc4342d5fc8fda8fc3010b1cf117e9249aab7fae800c2eff62fd3842d97d", size = 123130, upload-time = "2026-08-28T10:26:53.752Z" },
 ]
 
 [[package]]

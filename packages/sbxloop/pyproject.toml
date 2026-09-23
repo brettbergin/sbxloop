@@ -22,7 +22,7 @@ dependencies = [
     "python-dotenv>=1.2.3",
     # The Connections API probes providers with httpx and is imported at daemon startup.
     "httpx>=0.27",
-    "typer>=0.12",
+    "typer>=0.27.2",
     "rich>=13.7",
     # Unpinned here because the version is dynamic; the build hook
     # (hatch_build.py) adds the exact lockstep pin `sbxloop-worker==X.Y.Z`
@@ -63,7 +63,7 @@ dependencies = [
 [project.optional-dependencies]
 # Host-side SDK access for `sbxloop list-models` (agent sessions get the SDK
 # inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
-copilot = ["github-copilot-sdk>=1.0.8"]
+copilot = ["github-copilot-sdk>=1.0.13"]
 # Host-side model listing; agent sessions install the worker's matching extra.
 codex = ["openai-codex==0.154.0"]
 # `sbxloop daemon`'s chat bridge (chronology + steering), one extra per
