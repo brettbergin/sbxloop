@@ -3151,7 +3151,11 @@ class TestStartEntrygraph:
             config=self.REPOS if config is None else config,
         )
         concierge.submit_turn(
-            "run entrygraph", author="ana", author_id="777", message_id="9001"
+            "run entrygraph",
+            author="ana",
+            author_id="777",
+            message_id="9001",
+            principal=Principal.trusted("ana", "discord"),
         ).result(timeout=10)
         (response,) = client.responses
         assert response.ok
@@ -3213,7 +3217,12 @@ class TestStartEntrygraph:
             config=self.REPOS,
         )
         for attempt in range(3):
-            concierge.submit_turn("scan", author="ana", message_id="9").result(timeout=10)
+            concierge.submit_turn(
+                "scan",
+                author="ana",
+                message_id="9",
+                principal=Principal.trusted("ana", "discord"),
+            ).result(timeout=10)
             if attempt == 1:
                 (item,) = dstore.items()
                 dstore.mark_running(item.item_id, "r1", now=2.0)
@@ -3341,7 +3350,11 @@ class TestStartWorkload:
             config=self.PROFILES if config is None else config,
         )
         future = concierge.submit_turn(
-            "please", author="Discord user `ana`", author_id="777", message_id="9001"
+            "please",
+            author="Discord user `ana`",
+            author_id="777",
+            message_id="9001",
+            principal=Principal.trusted("Discord user `ana`", "discord"),
         )
         future.result(timeout=10)
         (response,) = client.responses
@@ -3412,9 +3425,14 @@ class TestStartWorkload:
             ],
             config=self.PROFILES,
         )
-        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        trusted = Principal.trusted("a", "discord")
+        concierge.submit_turn("once", author="a", message_id="5", principal=trusted).result(
+            timeout=10
+        )
         dstore.set_state("chat:5", "done", 10)
-        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        concierge.submit_turn("once", author="a", message_id="5", principal=trusted).result(
+            timeout=10
+        )
         first, second = client.responses
         assert first.text and first.text.startswith("queued workload `chat:5`")
         assert second.text == "`chat:5` already exists (done; profile `research`)."
@@ -3487,9 +3505,12 @@ class TestSchedules:
             loop.add_schedule = add  # type: ignore[attr-defined]
         if remove is not None:
             loop.remove_schedule = remove  # type: ignore[attr-defined]
-        concierge.submit_turn("please", author="Discord user `ana`", author_id="7").result(
-            timeout=10
-        )
+        concierge.submit_turn(
+            "please",
+            author="Discord user `ana`",
+            author_id="7",
+            principal=Principal.trusted("Discord user `ana`", "discord"),
+        ).result(timeout=10)
         (response,) = client.responses
         assert response.ok
         return response.text or "", loop
@@ -3605,6 +3626,194 @@ class TestSchedules:
     def test_the_tools_are_offered(self, tmp_path: Path) -> None:
         concierge, _, _, _, _ = make(tmp_path, [], config=self.PROFILES)
         assert {"create_schedule", "delete_schedule"} <= set(concierge.tool_names)
+
+
+class TestWorkAndScheduleToolsAnswerToTheTurnsPrincipal:
+    """#2291: the tools that start work or change schedules are authorized
+    as the person the turn belongs to, exactly as the equivalent API route
+    authorizes them -- ``items:create`` for admitting work (``POST
+    /v1/items``), ``daemon:manage`` for creating or deleting a schedule
+    (``POST``/``DELETE /v1/schedules``) -- never with the daemon's own
+    authority. A refusal names the missing capability and writes nothing."""
+
+    CONFIG: ClassVar[dict[str, Any]] = {
+        "github": {"repos": [{"repo": "acme/one"}]},
+        "workloads": [{"name": "research"}],
+        "workload": {"default": "research"},
+    }
+
+    @staticmethod
+    def _person(role: str, user_id: str, name: str) -> Principal:
+        return Principal(
+            kind="client",
+            id=user_id,
+            display=name,
+            via="collaboration",
+            capabilities=ROLE_CAPABILITIES[role],  # type: ignore[index]
+        )
+
+    def _turn(
+        self,
+        tmp_path: Path,
+        tool: str,
+        args: dict[str, Any],
+        principal: Principal | None,
+        channel_id: str | None = None,
+    ) -> tuple[str, DaemonStore, dict[str, str]]:
+        concierge, client, _, loop, dstore = make(
+            tmp_path, [{"calls": [(tool, args)], "text": "done"}], config=self.CONFIG
+        )
+        # The operator's own schedule, there before the turn.
+        schedules: dict[str, str] = {"nightly": "operator"}
+
+        def add(spec: Any, by: str, *, source: str) -> str:
+            schedules[spec.name] = by
+            return f"schedule {spec.name} created"
+
+        def remove(name: str, by: str) -> str:
+            if name not in schedules:
+                raise ValueError(f"no schedule called {name!r}")
+            del schedules[name]
+            return f"schedule {name} removed"
+
+        loop.add_schedule = add  # type: ignore[attr-defined]
+        loop.remove_schedule = remove  # type: ignore[attr-defined]
+        concierge.submit_turn(
+            "please",
+            author="Guest",
+            author_id="u-guest",
+            message_id="m-1",
+            principal=principal,
+            channel_id=channel_id,
+        ).result(timeout=10)
+        (response,) = client.responses
+        concierge.close()
+        return response.text or "", dstore, schedules
+
+    # -- create_schedule / delete_schedule: daemon:manage ----------------------------
+
+    def test_a_member_cannot_create_a_schedule(self, tmp_path: Path) -> None:
+        text, _, schedules = self._turn(
+            tmp_path,
+            "create_schedule",
+            {"name": "hourly", "ask": "check", "every": "1h"},
+            self._person("member", "u-guest", "Guest"),
+        )
+        assert "u-guest (via concierge) lacks daemon:manage" in text, text
+        assert "Nothing was written" in text
+        assert schedules == {"nightly": "operator"}
+
+    def test_a_member_cannot_delete_the_operators_schedule(self, tmp_path: Path) -> None:
+        text, _, schedules = self._turn(
+            tmp_path,
+            "delete_schedule",
+            {"name": "nightly"},
+            self._person("member", "u-guest", "Guest"),
+        )
+        assert "u-guest (via concierge) lacks daemon:manage" in text, text
+        assert "Nothing was written" in text
+        assert schedules == {"nightly": "operator"}
+
+    def test_an_admin_creates_and_deletes_schedules(self, tmp_path: Path) -> None:
+        admin = self._person("admin", "u-ada", "Ada")
+        text, _, schedules = self._turn(
+            tmp_path,
+            "create_schedule",
+            {"name": "hourly", "ask": "check", "every": "1h"},
+            admin,
+        )
+        assert text.startswith("schedule hourly created"), text
+        assert schedules == {"nightly": "operator", "hourly": "Guest (via concierge)"}
+        text, _, schedules = self._turn(
+            tmp_path / "b", "delete_schedule", {"name": "nightly"}, admin
+        )
+        assert text == "schedule nightly removed"
+        assert schedules == {}
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            ("create_schedule", {"name": "hourly", "ask": "check", "every": "1h"}),
+            ("delete_schedule", {"name": "nightly"}),
+        ],
+    )
+    def test_a_turn_without_a_principal_changes_no_schedule(
+        self, tmp_path: Path, tool: str, args: dict[str, Any]
+    ) -> None:
+        text, _, schedules = self._turn(tmp_path, tool, args, None)
+        assert "lacks daemon:manage" in text, text
+        assert schedules == {"nightly": "operator"}
+
+    # -- start_workload / start_entrygraph: items:create -----------------------------
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [("start_workload", {"ask": "count to ten"}), ("start_entrygraph", {"repo": "acme/one"})],
+    )
+    def test_a_member_may_start_work_as_the_api_lets_them(
+        self, tmp_path: Path, tool: str, args: dict[str, Any]
+    ) -> None:
+        """A member holds ``items:create``, as ``POST /v1/items`` requires:
+        chat and the API agree that they may ask for work."""
+        text, dstore, _ = self._turn(
+            tmp_path, tool, args, self._person("member", "u-guest", "Guest")
+        )
+        assert "queued" in text and "lacks" not in text, text
+        (item,) = dstore.items()
+        assert item.state == "queued"
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [("start_workload", {"ask": "count to ten"}), ("start_entrygraph", {"repo": "acme/one"})],
+    )
+    @pytest.mark.parametrize(
+        "principal",
+        [
+            None,
+            Principal(
+                kind="client",
+                id="u-reader",
+                display="Reader",
+                via="collaboration",
+                capabilities=frozenset({"runs:read"}),
+            ),
+        ],
+        ids=["no-principal", "reader"],
+    )
+    def test_a_turn_without_items_create_starts_nothing(
+        self, tmp_path: Path, tool: str, args: dict[str, Any], principal: Principal | None
+    ) -> None:
+        text, dstore, _ = self._turn(tmp_path, tool, args, principal)
+        who = "unvouched" if principal is None else "u-reader"
+        assert f"{who} (via concierge) lacks items:create" in text, text
+        assert "Nothing was queued" in text
+        assert dstore.items() == []
+
+    def test_a_workload_for_a_channel_takes_what_a_channel_write_does(self, tmp_path: Path) -> None:
+        """``POST /v1/items`` admits work for a channel only for someone who
+        may read and write it; so does a channel's turn."""
+        intake_only = Principal(
+            kind="client",
+            id="u-intake",
+            display="Intake",
+            via="collaboration",
+            capabilities=frozenset({"items:create"}),
+        )
+        text, dstore, _ = self._turn(
+            tmp_path, "start_workload", {"ask": "x"}, intake_only, channel_id="chn_kitchen"
+        )
+        assert "u-intake (via concierge) lacks collaboration:read" in text, text
+        assert dstore.items() == []
+        text, dstore, _ = self._turn(
+            tmp_path / "b",
+            "start_workload",
+            {"ask": "x"},
+            self._person("member", "u-guest", "Guest"),
+            channel_id="chn_kitchen",
+        )
+        assert text.startswith("queued workload"), text
+        (item,) = dstore.items()
+        assert item.channel_id == "chn_kitchen"
 
 
 class TestConfigKeys:
