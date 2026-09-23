@@ -208,6 +208,29 @@ jobs:
           # the package back. Detect it before changing the running install.
           "${SBXLOOP}" doctor
 
+      - name: Prepare isolated PDF analyzer
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A separate sbx app has no agent credentials or shared policy.
+          # Complete this before taking the hold or changing the install.
+          test -n "${DOCKERHUB_USERNAME}"
+          test -n "${DOCKERHUB_TOKEN}"
+          ANALYSIS_SBX="${SBXLOOP_HOME}/bin/sbx"
+          printf '%s' "${DOCKERHUB_TOKEN}" | "${ANALYSIS_SBX}" --app-name sbxloop-analysis login \
+            --username "${DOCKERHUB_USERNAME}" --password-stdin
+          marker="${SBXLOOP_HOME}/state/channel-pdf-policy-v2"
+          if [ ! -e "${marker}" ]; then
+            "${ANALYSIS_SBX}" --app-name sbxloop-analysis policy init deny-all
+            "${ANALYSIS_SBX}" --app-name sbxloop-analysis policy deny network '**'
+            umask 077
+            : > "${marker}"
+          fi
+          "${ANALYSIS_SBX}" --app-name sbxloop-analysis version
+
       - name: Take the deploy hold
         id: hold
         if: steps.installed.outputs.changed == 'true'

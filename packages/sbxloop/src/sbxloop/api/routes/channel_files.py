@@ -150,6 +150,8 @@ async def upload_file(
             )
         except CollaborationError as exc:
             raise _problem(exc) from exc
+        if file.analysis_status == "queued":
+            ctx.pdf_analysis.submit(file.id)
         return _out(file)
     finally:
         if fd >= 0:

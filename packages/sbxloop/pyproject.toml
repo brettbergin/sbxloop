@@ -58,6 +58,7 @@ dependencies = [
     # fails with "must be a valid IANA timezone, got 'UTC'". The marker keeps
     # it off the hosts that already have a database of their own.
     "tzdata; sys_platform == 'win32'",
+    "pypdf==6.19.0",
 ]
 
 [project.optional-dependencies]
