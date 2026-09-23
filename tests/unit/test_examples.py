@@ -117,6 +117,19 @@ def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
 
 
+def test_the_label_reading_cadence_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[daemon] label_check_interval_s`."""
+    assert Config.model_validate({}).daemon.label_check_interval_s == 3600.0
+    (line,) = [
+        line
+        for line in DEFAULT_CONFIG_TOML.splitlines()
+        if line.startswith("# label_check_interval_s = ")
+    ]
+    assert tomllib.loads(line.removeprefix("# ")) == {"label_check_interval_s": 3600.0}
+    guide = " ".join((REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8").split())
+    assert "| `[daemon] label_check_interval_s` | `3600.0`" in guide
+
+
 def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:
     """The three places every knob lands, for `[api.oidc]`, plus the secrets
     template that carries the client secret."""

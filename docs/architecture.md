@@ -2510,7 +2510,11 @@ The split is deliberate and worth stating plainly:
 - **Per repository** — base branch (`deliver_base`), repo creation
   (`create_repo`, `create_public`), every lifecycle label
   (`trigger_label` … `workload_label`; `Config.labels_for(repo)` folds the
-  `[daemon]` defaults in and `sbxloop init-repo` creates them, #630),
+  `[daemon]` defaults in, and `sbxloop init-repo` — or the API's
+  `POST /v1/repositories/{id}/labels/sync`, which does the same work
+  through the daemon's own forge sandbox — creates them, #630; the daemon
+  reads one repository's labels back per tick, so every registered
+  repository says whether it carries the set),
   extra `labels`, the `enabled` switch, the token
   environment variable (`token_env`), and the **workspace** the repo's
   runs clone from (`workspace`).

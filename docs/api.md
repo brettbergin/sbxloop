@@ -651,6 +651,27 @@ forge, or an unknown forge is `422 invalid_argument`; an unknown id is `404`.
 Every entry of `GET /v1/repositories` now carries `source` (`config` for an
 imported entry, `api`), `created_by`, `created_at` and `restart_required`.
 
+Every entry also carries `labels`: whether the repository carries the labels
+the loop applies — the seven lifecycle labels under this repository's own
+names and the follow-up label. `state` is `compliant` (it carries every one
+of them, as of `checked_at`), `incomplete` (`missing` names the ones it does
+not), or `unknown` — nobody has been able to look yet, the forge would not
+answer, or the configured names have changed since the last look. `unknown`
+is never reported as compliant, and each entry of `labels.labels` carries
+`present: null` under it rather than a guess. The daemon reads one
+repository's labels back per tick, at most one reading per repository per
+`[daemon] label_check_interval_s`, so the answer is current without a client
+asking the forge anything.
+
+`POST /v1/repositories/{id}/labels/sync` (`daemon:manage`) creates the ones
+the repository is missing and answers `200 {repository, labels, created, message, operation}` with `repo.labels_sync` recorded — the same work
+`sbxloop init-repo` does from the host, through the daemon's own forge
+sandbox. It reads the repository first, so a repository that already carries
+every label is left untouched and reports itself compliant with `created: []`. A daemon with no forge sandbox refuses with `409 not_eligible` naming
+the command that works from the host; a forge that would not answer is `503 source_unavailable`, and the last reading stands, dated, rather than being
+overwritten with a guess. The socket takes it as `repository.labels_sync`
+(target `repo_…`).
+
 A registration takes effect in what the daemon *admits* at once: intake,
 the engine's narrowing, the concierge and this catalog all answer for it.
 What the daemon *polls* was built at start, so a registration that changes
@@ -1093,6 +1114,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
 | `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
 | `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `POST`   | `/v1/repositories/{id}/labels/sync`          | `daemon:manage`        | Create the labels the loop applies that the repository is missing     |
 | `GET`    | `/v1/repositories/available`                 | owner role             | What the host's forge credential can see, to pick one to register     |
 | `POST`   | `/v1/repositories`                           | `daemon:manage`        | Register a repository; polled from the next start                     |
 | `PATCH`  | `/v1/repositories/{id}`                      | `daemon:manage`        | Enable, disable or re-base a registered repository                    |

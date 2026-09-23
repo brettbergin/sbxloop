@@ -43,7 +43,8 @@ class FakeIssueRef:
 
 
 class FakeGithub:
-    """The daemon's github handle, narrowed to what filing needs."""
+    """The daemon's github handle, narrowed to what filing needs — and to
+    the ``ops``/``note_failure`` pair the tick's label reading uses."""
 
     def __init__(self) -> None:
         self.created: list[tuple[str, str, str, list[str]]] = []
@@ -51,6 +52,15 @@ class FakeGithub:
 
     def call(self, fn: Any) -> Any:
         return fn(self)
+
+    def ops(self) -> FakeGithub:
+        return self
+
+    def note_failure(self, exc: BaseException) -> bool:
+        return False
+
+    def labels_list(self, repo: str) -> list[Any]:
+        return []
 
     def issue_create(
         self, repo: str, title: str, body: str, labels: list[str] | None = None

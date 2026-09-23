@@ -1893,6 +1893,14 @@ class DaemonConfig(_ConfigModel):
     # a comment on the issue. An issue carrying both this and
     # `trigger_label` is refused, named.
     workload_label: str = "sbxloop:workload"
+    # How often a registered repository's labels are read back, so a
+    # console can say whether the repository carries the set the loop
+    # applies (`sbxloop init-repo`, or the API's label sync, creates them).
+    # One listing call per repository per interval, one repository per
+    # tick, and never for a disabled one; 0 turns the reading off, and a
+    # repository then reports its labels as unread until a sync is asked
+    # for.
+    label_check_interval_s: float = Field(default=3600.0, ge=0)
     max_runs_per_day: int = 12
     # How many runs execute at once. One (the default) is the serial loop:
     # a tick dispatches a run and settles it before the next. Above one, a

@@ -821,6 +821,10 @@ service_memory = "2g"
 #                                        # carrying trigger_label too is refused)
 # `sbxloop init-repo owner/name` creates all seven (plus [landing] followup_label)
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
+# label_check_interval_s = 3600.0  # how often a registered repository's labels are read
+#                                  # back, so a console can show whether it carries the
+#                                  # set (one listing per repo per interval, one repo per
+#                                  # tick, enabled repos only); 0 turns the reading off
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # warm_pairs = 0                  # sandbox sets kept booted and installed ahead of dispatch (0-4)

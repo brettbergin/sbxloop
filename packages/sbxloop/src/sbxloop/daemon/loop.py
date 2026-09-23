@@ -124,11 +124,13 @@ from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
+    GithubOpsError,
     ProvisionError,
     RunCancelledError,
     SbxError,
     SbxloopError,
     StateError,
+    WorkerError,
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
@@ -150,6 +152,13 @@ from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 from sbxloop.sbx.warm import Warmer
+from sbxloop.vcs.github.labels import (
+    LabelReport,
+    LabelSpec,
+    audit_labels,
+    lifecycle_specs,
+    sync_labels,
+)
 
 log = get_logger(__name__)
 
@@ -475,6 +484,12 @@ class DaemonLoop:
         self._source_failures = 0
         self._source_next_poll = 0.0
         self._last_gc: float | None = None
+        # The label reading (#630) visits one repository per tick at most,
+        # round-robin from where the last one left off; a forge that would
+        # not answer holds the whole reading off for one interval rather
+        # than costing a failed call every tick.
+        self._labels_cursor = 0
+        self._labels_retry_at = 0.0
         # Warm sandbox sets (#47): kept ready by a thread of their own when
         # `[daemon] warm_pairs` asks for them; a fresh dispatch takes one.
         self._warmer: Warmer | None = (
@@ -1864,6 +1879,10 @@ class DaemonLoop:
         # even while paused or with the breaker open.
         self._deliver_pending_reports()
         self._maybe_gc(now)
+        # One repository's labels read back per tick at most (#630): a
+        # console shows a repository as set up (or not) without a forge
+        # call of its own, and a paused daemon keeps that answer current.
+        self._maybe_check_labels(now)
         # Liveness safety net for phantom active runs (#374); sweeps even while
         # paused, the very state the field report was filed from.
         self._reconcile_stale_runs(now)
@@ -2656,6 +2675,143 @@ class DaemonLoop:
             f"repository {row.repo} removed; work already queued or running for it is "
             f"untouched{stops}.",
         )
+
+    # -- the labels a repository carries (#630) --------------------------------------
+
+    def _label_specs(self, repo: str) -> list[LabelSpec]:
+        """The labels ``repo``'s issues need: its lifecycle set (the
+        repository's own ``[[vcs.repos]]`` renames over ``[daemon]``) and
+        the follow-up label."""
+        return lifecycle_specs(self.config.labels_for(repo), self.config.landing.followup_label)
+
+    def _record_labels(self, repo: str, report: LabelReport, now: float) -> None:
+        self.dstore.record_repository_labels(
+            repo, expected=report.expected, missing=report.missing, now=now
+        )
+
+    def sync_repo_labels(self, repo: str, *, by: str | None = None) -> dict[str, Any]:
+        """Operator: give a registered repository every label the loop
+        applies, and record what it carries now.
+
+        The repository is read first and only the labels it does not carry
+        are created, so a repository that is already set up costs one
+        listing and changes nothing — the same work ``sbxloop init-repo``
+        does from the host, through the daemon's own forge sandbox.
+        ``KeyError`` names an unknown repository, ``ValueError`` says why
+        the forge could not be asked; a forge that refused the listing
+        raises, and nothing is recorded.
+        """
+        entry = self.config.find_repo(repo)
+        if entry is None:
+            raise KeyError(repo)
+        name = entry.repo
+        if self.github is None:
+            raise ValueError(
+                "this daemon has no forge sandbox to create labels through; "
+                f"`sbxloop init-repo {name}` creates them from the host"
+            )
+        specs = self._label_specs(name)
+        try:
+            report = sync_labels(self.github.ops(), name, specs)
+        except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+            # The forge would not answer. Drop the sandbox so the next ask
+            # re-provisions (the sources' own error handling, #1165), and
+            # let the caller say so: nothing is recorded on a guess.
+            self.github.note_failure(exc)
+            raise
+        now = self.clock()
+        self._record_labels(name, report, now)
+        who = by or "operator"
+        if report.created and not report.missing:
+            text = f"🏷️ labels on {name}: created {', '.join(report.created)} for {who}"
+        elif report.missing:
+            text = (
+                f"🏷️ labels on {name}: could not create {', '.join(report.missing)} "
+                f"for {who} — the forge refused; the repository is not set up"
+            )
+        else:
+            text = f"🏷️ labels on {name}: already complete, nothing created for {who}"
+        self._notice(
+            "daemon.repository_labels_synced",
+            text,
+            level="warning" if report.missing else "info",
+            repo=name,
+            by=who,
+            created=list(report.created),
+            missing=list(report.missing),
+        )
+        return self._labels_json(name, report, now)
+
+    def _labels_json(self, repo: str, report: LabelReport, now: float) -> dict[str, Any]:
+        missing = set(report.missing)
+        return {
+            "repo": repo,
+            "state": "incomplete" if missing else "compliant",
+            "expected": list(report.expected),
+            "present": [name for name in report.expected if name not in missing],
+            "missing": list(report.missing),
+            "created": list(report.created),
+            "checked_at": now,
+        }
+
+    def _maybe_check_labels(self, now: float) -> None:
+        """Read one registered repository's labels back, so a console can
+        say whether it carries the set the loop applies.
+
+        At most one repository per tick and one reading per repository per
+        ``[daemon] label_check_interval_s``, round-robin, enabled
+        repositories only: a daemon with a handful of repositories spends
+        one listing call each per interval. Never raises — a forge that
+        would not answer leaves the last record standing, dated, and holds
+        the reading off for one interval rather than failing every tick.
+        """
+        interval = self.config.daemon.label_check_interval_s
+        if interval <= 0 or self.github is None or now < self._labels_retry_at:
+            return
+        if not getattr(self.github, "provisioned", True):
+            # Nothing has needed the forge yet this process. A reading is
+            # never what boots the sandbox: the poll's boot is, and the
+            # next tick reads through the box it left behind.
+            return
+        entry = self._labels_due(now, interval)
+        if entry is None:
+            return
+        specs = self._label_specs(entry.repo)
+        try:
+            report = audit_labels(self.github.ops(), entry.repo, specs)
+        except (GithubOpsError, WorkerError, SbxError, ProvisionError) as exc:
+            self.github.note_failure(exc)
+            self._labels_retry_at = now + interval
+            log.warning("daemon.labels_unread", repo=entry.repo, error=str(exc))
+            return
+        self._record_labels(entry.repo, report, now)
+        log.debug("daemon.labels_read", repo=entry.repo, missing=list(report.missing))
+
+    def _labels_due(self, now: float, interval: float) -> RepoConfig | None:
+        """The next enabled repository whose labels have not been read
+        within ``interval`` — or whose names have changed since the last
+        reading, which makes what was recorded an answer to another
+        question. ``None`` when every one of them is fresh."""
+        entries = [entry for entry in self.config.repo_list() if entry.enabled]
+        if not entries:
+            return None
+        rows = {row.repo.casefold(): row for row in self.dstore.repositories()}
+        start = self._labels_cursor % len(entries)
+        for offset in range(len(entries)):
+            index = (start + offset) % len(entries)
+            entry = entries[index]
+            row = rows.get(entry.repo.casefold())
+            expected = tuple(spec.name for spec in self._label_specs(entry.repo))
+            if (
+                row is not None
+                and row.labels_checked_at is not None
+                and row.labels_expected == expected
+                and now - row.labels_checked_at < interval
+            ):
+                continue
+            self._labels_cursor = index + 1
+            return entry
+        return None
 
     def _fire_schedules(self, now: float) -> int:
         """Queue every schedule tick that has come due since the last one
