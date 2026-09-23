@@ -392,9 +392,11 @@ An agent answering in a channel gets one more host tool,
 `read_channel_artifact(artifact_id, offset=0, limit=64000)`. It is offered to
 every participant, read-only roles included, so a critic can read the file it
 is reviewing. It resolves an id only when a message in *this* channel carries
-it, or when a run this channel admitted produced it; it takes no path, returns
-UTF-8 text with a `[truncated ... call again with offset=N]` marker past the
-window, and answers one metadata line for anything that is not text.
+it, or when a workload or tool run this channel admitted delivered it (so it
+can read a result before the message lands). A code run's checkout is refused
+here exactly as the download route refuses it. It takes no path, returns UTF-8
+text with a `[truncated ... call again with offset=N]` marker past the window,
+and answers one metadata line for anything that is not text.
 
 ### Channel history and its summary
 

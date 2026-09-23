@@ -7,7 +7,8 @@ conversation knows, so anyone -- and any agent -- who can read the channel
 can read it, and nothing else.
 
 The tool resolves an artifact id only when it is attached to a message in
-the turn's own channel, or produced by a run that channel admitted. It never
+the turn's own channel, or delivered by a workload or tool run that channel
+admitted. It never
 takes a path, so no traversal is possible; the bytes are opened through the
 same directory-relative reader the download route uses, relative to the
 run's own directory and never following a link out of it. Text comes back
@@ -99,20 +100,27 @@ def resolve(ctx: ApiContext, channel_id: str, artifact_id: str) -> Artifact | No
     """The catalogued file, when this channel is allowed to see it.
 
     Wider than :func:`attached` by one case, and only for the in-turn tool:
-    a run the channel itself admitted is part of its shared context before
-    its result message lands, so an agent answering there can read what it
-    produced. The file still has to be named by an id the conversation
-    already carries.
+    a delivering run (a workload or tool run) the channel itself admitted is
+    part of its shared context before its result message lands, so an agent
+    answering there can read what it delivered. Any other run's catalogue is
+    not the channel's: a code run delivers a pull request, and its checkout
+    is the target's source, which the channel's download route refuses too.
     """
+    from sbxloop.api.projections import Views
+    from sbxloop.api.work_delivery import DELIVERING_KINDS
+
     artifact = ctx.artifacts.get(artifact_id)
     if artifact is None:
         return None
     store = ctx.collaboration
     if store.artifact_attached(channel_id, artifact.id):
         return artifact
-    if store.channel_owns_run(channel_id, artifact.run_id):
-        return artifact
-    return None
+    if not store.channel_owns_run(channel_id, artifact.run_id):
+        return None
+    record = Views(ctx).run_record(artifact.run_id)
+    if record is None or record.kind not in DELIVERING_KINDS:
+        return None
+    return artifact
 
 
 def read_channel_artifact(ctx: ApiContext, channel_id: str, args: Mapping[str, Any]) -> str:
