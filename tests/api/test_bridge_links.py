@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+from sbxloop.db.collaboration_models import ChannelLinkRow, ChannelRow
 from tests.api.test_channel_access import _channel, _people, _user_id
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 from tests.api.test_collaboration_recovery import settled
@@ -75,6 +78,97 @@ def test_one_surface_carries_one_link(api: Any) -> None:
     )
     assert clash.status_code == 409, clash.text
     assert clash.json()["code"] == "link_exists"
+
+
+def test_deleting_a_channel_retires_its_links_and_frees_the_surfaces(api: Any) -> None:
+    owner = bearer(register(api))
+    deleted_channel = _channel(api, owner)
+    next_channel = _channel(api, owner)
+    discord = _link(api, owner, deleted_channel, backend="discord", surface_id="C1")
+    slack = _link(api, owner, deleted_channel, backend="slack", surface_id="C2", thread_id="T9")
+    store = api.ctx.collaboration
+    assert store.linked_surfaces("discord") == frozenset({"C1"})
+    assert store.linked_surfaces("slack") == frozenset({"C2"})
+
+    deleted = api.client.delete(f"/v1/channels/{deleted_channel}", headers=owner)
+    assert deleted.status_code == 204, deleted.text
+    assert store.link_for_surface("discord", "C1") is None
+    assert store.link_for_surface("slack", "C2", "T9") is None
+    assert store.linked_surfaces("discord") == frozenset()
+    assert store.linked_surfaces("slack") == frozenset()
+    with api.harness.dstore.read() as session:
+        assert session.get(ChannelLinkRow, discord["id"]).active == 0
+        assert session.get(ChannelLinkRow, slack["id"]).active == 0
+
+    _link(api, owner, next_channel, backend="discord", surface_id="C1")
+    _link(api, owner, next_channel, backend="slack", surface_id="C2", thread_id="T9")
+
+
+def _legacy_deleted_channel(api: Any, owner: dict[str, str], **link_body: Any) -> dict[str, Any]:
+    """A channel tombstoned before link retirement existed in the store."""
+    channel_id = _channel(api, owner)
+    link = _link(api, owner, channel_id, **link_body)
+    with api.harness.dstore.transaction() as session:
+        session.get(ChannelRow, channel_id).state = "deleted"
+    return link
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"backend": "mattermost", "surface_id": "M1"},
+        {"backend": "slack", "surface_id": "C1", "thread_id": "T9"},
+    ],
+)
+def test_a_legacy_stale_link_can_be_relinked_without_editing_the_database(
+    api: Any, body: dict[str, str]
+) -> None:
+    owner = bearer(register(api))
+    stale = _legacy_deleted_channel(api, owner, **body)
+    store = api.ctx.collaboration
+    assert (
+        store.link_for_surface(body["backend"], body["surface_id"], body.get("thread_id")) is None
+    )
+    assert store.linked_surfaces(body["backend"]) == frozenset()
+
+    replacement = _channel(api, owner)
+    fresh = _link(api, owner, replacement, **body)
+    assert fresh["id"] != stale["id"]
+    assert (
+        store.link_for_surface(body["backend"], body["surface_id"], body.get("thread_id")).id
+        == fresh["id"]
+    )
+    assert store.linked_surfaces(body["backend"]) == frozenset({body["surface_id"]})
+    with api.harness.dstore.read() as session:
+        old = session.get(ChannelLinkRow, stale["id"])
+        if body.get("thread_id"):
+            assert old is None
+        else:
+            assert old is not None and old.active == 0
+
+
+def test_a_legacy_stale_link_can_be_unlinked_through_the_api(api: Any) -> None:
+    owner = bearer(register(api))
+    stale = _legacy_deleted_channel(api, owner, backend="mattermost", surface_id="M1")
+    removed = api.client.delete(
+        f"/v1/channels/{stale['channel_id']}/links/{stale['id']}", headers=owner
+    )
+    assert removed.status_code == 204, removed.text
+    with api.harness.dstore.read() as session:
+        assert session.get(ChannelLinkRow, stale["id"]).active == 0
+
+
+def test_a_non_member_cannot_retire_a_deleted_private_channels_link(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    owner, guest, _admin = _people(api)
+    stale = _legacy_deleted_channel(api, owner, backend="mattermost", surface_id="M1")
+
+    refused = api.client.delete(
+        f"/v1/channels/{stale['channel_id']}/links/{stale['id']}", headers=guest
+    )
+    assert refused.status_code == 404, refused.text
+    with api.harness.dstore.read() as session:
+        assert session.get(ChannelLinkRow, stale["id"]).active == 1
 
 
 def test_managing_links_takes_managing_the_channel(api: Any) -> None:
