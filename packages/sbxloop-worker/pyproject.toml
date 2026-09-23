@@ -25,7 +25,7 @@ copilot = ["github-copilot-sdk>=1.0.13"]
 claude = ["claude-agent-sdk>=0.2.152"]
 # The Python Codex SDK includes its matching CLI runtime. Pin the pair:
 # tool registration and environment suppression use the experimental API.
-codex = ["openai-codex==0.147.0"]
+codex = ["openai-codex==0.154.0"]
 # The openai backend: the official client, driven against the endpoint
 # [agent.openai] names. The extra is named after the backend because
 # provisioning installs `sbxloop-worker[<backend>]` verbatim. Only the
