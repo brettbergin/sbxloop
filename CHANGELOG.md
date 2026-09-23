@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+**`doctor --deep --fail-on-drift` stops failing on a verdict change it
+already reported, and on one that came from an older probe.** A verdict that
+changed between sbx versions was reported on every run for as long as the
+new version stayed installed, so one reviewed change (sbx 0.45's template
+now ships `python3-venv`) failed the gate every time with no way to accept
+it. The first deep run under the new version reports the change and records
+the new verdict, and later runs take it as the baseline. A probe that
+reports a verdict the build depends on still fails on every run. Cached
+verdicts also record which probe revision produced them.
+`api-host-unreachable` is now revision 2, so a "reachable" recorded before
+the probe learned that sbx accepts connections its policy then drops is no
+longer compared with today's answer. It was a false positive, not an sbx
+change, and it had failed the weekly `sbx-conformance` job since sbx 0.43.
+`sbxloop init` now installs sbx 0.43.0 by default (was 0.38.0), and doctor's
+tested series is 0.43: the newest release on which the scheduled conformance
+job saw every probe answer as expected. 0.45 becomes the default once that
+job has verified it. (#2306)
+
 **The sandbox backend stays up under systemd on sbx 0.45.** From sbx 0.45.1
 (field-verified) `sbx daemon start` detaches even without `-d`, so the
 `Type=simple` unit `sbxloop init --systemd` rendered saw its main process exit
@@ -65,6 +83,18 @@ route already refuses with 404. The tool now falls back to a run the
 channel owns only for runs that deliver files into the conversation
 (workload and tool runs); a code run's checkout is refused, and delivered
 files read as before. (#1265)
+
+**A run posts only into the channel that asked for it, and its dedupe key
+is its own.** The run-post store took the channel a post named on trust and
+looked its dedupe key up across every run and channel, so a post naming
+another channel landed there, and a key another run or channel had already
+used returned that post's message id and wrote nothing. A post is now
+refused, and nothing is written, unless it names the channel that asked for
+its run (the attempt's bound channel once the run is recorded, the item's
+channel before that). A key another run or channel already holds no longer
+suppresses the post: it is stored under a key scoped to its run and channel,
+and a replay of it finds that post. No caller does either today; this is
+defence in depth. (#1262)
 
 **A Slack or Mattermost channel linked to a collaboration channel is heard,
 not only posted to.** Both bridges dropped every inbound message that did

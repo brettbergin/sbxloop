@@ -91,6 +91,36 @@ LINK_CODE_TTL_S = 600.0
 LINKED_SURFACES_TTL_S = 30.0
 
 
+#: Starts the ledger key of a run post whose own key another run or channel
+#: already holds. No caller's key may start with it, so a scoped key never
+#: meets one a caller named.
+#: Written as an escape, never a raw byte: an invisible character is easy to
+#: strip by accident, and an empty prefix would reserve every key.
+SCOPED_POST_KEY_PREFIX = "\x1f"
+
+
+def scoped_run_post_key(run_id: str, channel_id: str, dedupe_key: str) -> str:
+    """The ledger key ``run_id`` posts ``dedupe_key`` under in ``channel_id``
+    when the key alone is already another run's or another channel's."""
+    return SCOPED_POST_KEY_PREFIX + json.dumps([run_id, channel_id, dedupe_key])
+
+
+def run_post_key_name(stored: str) -> str:
+    """The dedupe key a run named, for a ledger key stored either way."""
+    if stored.startswith(SCOPED_POST_KEY_PREFIX):
+        return str(json.loads(stored[len(SCOPED_POST_KEY_PREFIX) :])[2])
+    return stored
+
+
+def _posted_by(session: Any, posted: ChannelRunPostRow, run_id: str, channel_id: str) -> bool:
+    """Whether ``posted`` is ``run_id``'s own post in ``channel_id``. A post
+    whose message is gone is judged by its run alone."""
+    if str(posted.run_id) != run_id:
+        return False
+    message = session.get(MessageRow, posted.message_id)
+    return message is None or str(message.channel_id) == channel_id
+
+
 class CollaborationError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -2494,20 +2524,39 @@ class CollaborationStore:
     def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
         """Tombstone a channel so a late agent result cannot recreate it.
         ``False`` when the viewer cannot see it; ``channel_forbidden`` when
-        they may not manage it."""
-        with self.dstore.transaction() as session:
+        they may not manage it. Retire its bridge links in the same write."""
+        with self.dstore.immediate_transaction() as session:
             try:
                 row, _ = _access(session, channel_id, viewer, "manage", now=now)
             except CollaborationError as exc:
                 if exc.code == "channel_not_found":
                     return False
                 raise
+            links = session.scalars(
+                select(ChannelLinkRow).where(
+                    ChannelLinkRow.channel_id == channel_id, ChannelLinkRow.active == 1
+                )
+            ).all()
+            for link in links:
+                link.active = 0
+                _event(
+                    session,
+                    "collaboration.link.removed",
+                    now,
+                    data={
+                        "channel_id": channel_id,
+                        "link_id": str(link.id),
+                        "backend": str(link.backend),
+                    },
+                )
             row.state = "deleted"
             row.deleted_at = now
             row.updated_at = now
             row.revision += 1
             _event(session, "collaboration.channel.deleted", now, data={"channel_id": channel_id})
-            return True
+        if links:
+            self._forget_linked_surfaces()
+        return True
 
     # -- channel members -----------------------------------------------------------
 
@@ -2774,9 +2823,25 @@ class CollaborationStore:
                 raise CollaborationError(
                     "link_run_thread", "that surface is a run's thread and cannot be linked"
                 )
-            if _active_link(session, backend, surface_id, thread_id) is not None:
-                raise CollaborationError(
-                    "link_exists", "that surface is already linked to a channel"
+            existing = _active_link(session, backend, surface_id, thread_id)
+            if existing is not None:
+                linked_channel = session.get(ChannelRow, existing.channel_id)
+                if linked_channel is not None and linked_channel.state == "active":
+                    raise CollaborationError(
+                        "link_exists", "that surface is already linked to a channel"
+                    )
+                # A deletion before link retirement existed left this surface
+                # stranded. The authorized new link replaces it in this write.
+                existing.active = 0
+                _event(
+                    session,
+                    "collaboration.link.removed",
+                    now,
+                    data={
+                        "channel_id": str(existing.channel_id),
+                        "link_id": str(existing.id),
+                        "backend": str(existing.backend),
+                    },
                 )
             if thread_id is not None:
                 # A retired link to this thread would trip the unique index
@@ -2822,7 +2887,9 @@ class CollaborationStore:
         """Retire a link. The row stays, inactive, so the messages that named
         the surface keep an origin that can still be read back."""
         with self.dstore.immediate_transaction() as session:
-            _access(session, channel_id, viewer, "manage", now=now)
+            # An old deletion may have left an active link on this tombstone;
+            # its former managers must still be able to retire that link.
+            _access(session, channel_id, viewer, "manage", now=now, include_deleted=True)
             row = session.get(ChannelLinkRow, link_id)
             if row is None or str(row.channel_id) != channel_id or not row.active:
                 raise CollaborationError("link_not_found", "link not found")
@@ -2841,7 +2908,10 @@ class CollaborationStore:
         """The active link for a surface, or None when it is not linked."""
         with self.dstore.read() as session:
             row = _active_link(session, backend, surface_id, thread_id)
-            return None if row is None else _channel_link(row)
+            if row is None:
+                return None
+            channel = session.get(ChannelRow, row.channel_id)
+            return None if channel is None or channel.state != "active" else _channel_link(row)
 
     def linked_surfaces(self, backend: str) -> frozenset[str]:
         """The surfaces (service channel ids) with an active link on
@@ -2864,7 +2934,12 @@ class CollaborationStore:
                 str(surface)
                 for surface in session.scalars(
                     select(ChannelLinkRow.surface_id)
-                    .where(ChannelLinkRow.backend == backend, ChannelLinkRow.active == 1)
+                    .join(ChannelRow, ChannelRow.id == ChannelLinkRow.channel_id)
+                    .where(
+                        ChannelLinkRow.backend == backend,
+                        ChannelLinkRow.active == 1,
+                        ChannelRow.state == "active",
+                    )
                     .distinct()
                 )
             )
@@ -4005,6 +4080,11 @@ class CollaborationStore:
         once the write has committed, so the surfaces linked to the channel
         mirror it. A replay under a key already posted returns the message
         it posted before and tells nobody: the run said it once.
+
+        A key is the run's own, in its own channel: one another run or
+        another channel already posted under neither suppresses this post
+        nor answers for it. The post is stored under a key scoped to this
+        run and channel instead.
         """
         if kind not in POST_KINDS:
             # ``PostKind`` is a type, not a check: a caller naming a kind
@@ -4014,8 +4094,17 @@ class CollaborationStore:
                 "api.channel_post_unknown_kind", channel=channel_id, key=dedupe_key, kind=kind
             )
             return None
+        if dedupe_key.startswith(SCOPED_POST_KEY_PREFIX):
+            # Scoped keys are the ledger's own; a caller naming one could
+            # take the place of another run's post.
+            log.warning("api.channel_post_reserved_key", channel=channel_id, run=run_id)
+            return None
         with self.dstore.immediate_transaction() as session:
+            stored_key = dedupe_key
             posted = session.get(ChannelRunPostRow, dedupe_key)
+            if posted is not None and not _posted_by(session, posted, run_id, channel_id):
+                stored_key = scoped_run_post_key(run_id, channel_id, dedupe_key)
+                posted = session.get(ChannelRunPostRow, stored_key)
             if posted is not None:
                 return str(posted.message_id)
             channel = session.get(ChannelRow, channel_id)
@@ -4052,7 +4141,7 @@ class CollaborationStore:
             )
             session.execute(
                 insert(ChannelRunPostRow).values(
-                    dedupe_key=dedupe_key,
+                    dedupe_key=stored_key,
                     run_id=run_id,
                     message_id=message_id,
                     kind=kind,

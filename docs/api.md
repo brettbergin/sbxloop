@@ -441,8 +441,12 @@ the channel its message list.
 
 Each post names a dedupe key, which is what makes a replayed, resumed or
 re-observed run post a moment once: the same key returns the message
-already recorded rather than a second copy of it. A channel that was
-deleted receives nothing. A silenced channel drops the running commentary
+already recorded rather than a second copy of it. The key belongs to its
+run in its channel: one another run or another channel already used is
+neither an answer for the post nor a reason to drop it. A run posts only
+into the channel that asked for it; a post naming any other channel is
+dropped and nothing is written. A channel that was deleted receives
+nothing. A silenced channel drops the running commentary
 and still hears the posts that end a run: `delivery` and `notice`.
 
 Clients read posts with the message history they already poll, or

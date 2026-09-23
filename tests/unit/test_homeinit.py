@@ -305,7 +305,7 @@ class TestLayout:
         assert pip[-2:] == ["sbxloop[discord,slack]==1.2.3", "sbxloop-worker==1.2.3"]
         assert "--python" in pip and str(home.venv_python) in pip
         # sbx: the pinned release for this platform, through Docker's installer with PREFIX=home
-        assert any("releases/tags/v0.38.0" in u for u in fetch.urls)
+        assert any("releases/tags/v0.43.0" in u for u in fetch.urls)
         assert "u/linux" in fetch.urls
         assert home.sbx_binary.exists() and home.sbx_version_file.read_text().strip() == SBX_VERSION
         # config written once, secrets private
@@ -348,7 +348,7 @@ class TestLayout:
         assert home.config_toml.read_text() == "model = 'mine'\n"
         assert home.secrets_env.read_text() == "GH_TOKEN=x\n"
         assert any(s.startswith("venv") for s in report.skipped)
-        assert any(s.startswith("sbx 0.38.0") for s in report.skipped)
+        assert any(s.startswith("sbx 0.43.0") for s in report.skipped)
         assert any(s.startswith("config") for s in report.skipped)
         assert len(run.calls) == before  # nothing to run: no venv, no sbx, no systemd
 
@@ -429,6 +429,12 @@ class TestLayout:
 class TestSbxInstall:
     """A recorded sbx version has to mean an sbx that was installed: an
     executable left behind by an earlier release is not proof of one."""
+
+    def test_doctor_warns_against_the_series_init_installs(self) -> None:
+        # An `init` default must not draw doctor's "parsing may drift" note.
+        from sbxloop.cli.doctor import TESTED_SBX_SERIES
+
+        assert SBX_VERSION.startswith(TESTED_SBX_SERIES + ".")
 
     def test_a_failed_upgrade_never_advances_the_marker(self, tmp_path: Path) -> None:
         """The installer refuses before touching anything (Debian keeps

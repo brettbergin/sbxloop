@@ -6,8 +6,10 @@ files it delivered on the work snapshot beside it. Nothing here dispatches
 or replays anything; it records what a run reports.
 
 Every post is best-effort. A channel that is gone, silenced against this
-kind of post, or already holds this dedupe key gets nothing new, and the
-run carries on either way.
+kind of post, or already holds this run's post under this dedupe key gets
+nothing new, and the run carries on either way. A post that names a channel
+other than the one that asked for the run is refused: a run speaks only
+where it was asked.
 """
 
 from __future__ import annotations
@@ -20,10 +22,13 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from sbxloop.agents.posts import ArtifactRef, ChannelPost
+from sbxloop.api.collaboration import run_post_key_name
 from sbxloop.api.collaboration_schemas import ChannelWorkOut
 from sbxloop.api.publicids import run_public_id
 from sbxloop.db.collaboration_models import ChannelRow, ChannelRunPostRow
-from sbxloop.db.event_scope import channel_for_item
+from sbxloop.db.daemon_models import DaemonRunRow
+from sbxloop.db.event_scope import channel_for_item, channel_for_run
+from sbxloop.db.job_models import ExternalRunRow
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
@@ -33,6 +38,21 @@ log = get_logger(__name__)
 
 #: Files named on one post; the run's own catalog lists the rest.
 ARTIFACTS_MAX = 50
+
+
+def asking_channel(session: Any, run_id: str, item_id: str) -> str | None:
+    """The channel that asked for this attempt of the work.
+
+    A run the platform knows (the ledger opens its row before the engine
+    starts; external work binds its attempts) answers to the channel its
+    attempt is bound to, which a later label from another channel does not
+    move. Only a run not recorded anywhere yet falls back to the channel
+    that asked for the item it names.
+    """
+    known = session.get(DaemonRunRow, run_id) or session.get(ExternalRunRow, run_id)
+    if known is not None:
+        return channel_for_run(session, run_id)
+    return channel_for_item(session, item_id)
 
 
 def _artifacts(refs: Sequence[ArtifactRef]) -> list[dict[str, Any]]:
@@ -51,6 +71,18 @@ class ApiChannelPoster:
         can fail: a store that will not take the post costs the channel
         what it had to say, never the work it was saying it about."""
         try:
+            with self.ctx.loop.dstore.read() as session:
+                asked = asking_channel(session, post.run_id, post.item_id)
+            if asked != post.channel_id:
+                log.warning(
+                    "api.channel_post_refused",
+                    channel=post.channel_id,
+                    asked=asked,
+                    key=post.dedupe_key,
+                    run=post.run_id,
+                    item=post.item_id,
+                )
+                return None
             turn_id = self.ctx.collaboration.turn_for_post(
                 post.channel_id, post.reply_to_message_id, post.item_id
             )
@@ -91,10 +123,12 @@ class ApiChannelPoster:
         )[:ARTIFACTS_MAX]
 
     def run_post_keys(self, run_id: str) -> frozenset[str]:
-        """The dedupe keys ``run_id`` has posted under, in any segment."""
+        """The dedupe keys ``run_id`` has posted under, in any segment, as
+        the run named them."""
         with self.ctx.loop.dstore.read() as session:
             return frozenset(
-                session.scalars(
+                run_post_key_name(key)
+                for key in session.scalars(
                     select(ChannelRunPostRow.dedupe_key).where(ChannelRunPostRow.run_id == run_id)
                 )
             )
