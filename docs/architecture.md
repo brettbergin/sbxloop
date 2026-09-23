@@ -2185,7 +2185,13 @@ product channel's turn comes from a person with a workspace role. So a turn
 carries a principal (`submit_turn(principal=…)`, on the `TurnContext`), and
 `sbx_control` and `set_config` answer to it: the control service refuses an
 operator's verb the person's role does not grant, and the config write
-takes `daemon:manage`, as the admin routes do. The API hands over the same
+takes `daemon:manage`, as the admin routes do. The tools that start work or
+change schedules answer to it the same way: `start_workload` and
+`start_entrygraph` take `items:create`, as `POST /v1/items` does (a workload
+for a channel also takes what a write to that channel does), and
+`create_schedule` and `delete_schedule` take `daemon:manage`, as the schedule
+routes do; a refusal names the missing capability and writes nothing. The
+API hands over the same
 principal a stop or a steer from chat uses (`_chat_principal`); a chat
 bridge, whose control channel the operator restricted, hands over an
 explicit `Principal.trusted`; a turn with no principal (nobody vouched for

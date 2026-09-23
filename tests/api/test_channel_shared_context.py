@@ -94,6 +94,45 @@ def _deliver(
     return headers, channel, f"run_{run_id}"
 
 
+def _code_run_checkout(api: Any) -> tuple[dict[str, str], str, str, Any]:
+    """A code run the channel started, with one catalogued checkout file.
+
+    A code run delivers a pull request, so the file is never attached to a
+    message. Returns the owner's headers, the channel id, the run id and
+    the catalogued artifact.
+    """
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns", headers=headers, json={"content": "fix the bug"}
+    ).json()
+    assert api.ctx.turns.wait_idle(timeout=5)
+    key = accepted["turn"]["input_message_id"]
+    item = WorkItem(
+        item_id=chat_item_id(key),
+        source_key=key,
+        title="Fix",
+        body="fix the bug",
+        kind="code",
+        channel_id=channel,
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.harness.source.items = [item]
+    api.harness.outcomes = ["merged"]
+    api.clock.t += 10
+    api.loop.tick()
+    run_id = api.harness.runs[-1][0]
+    home = api.ctx.config.paths
+    api.harness.store.set_run_workspace(run_id, home.run_data(run_id), mounted=False)
+    root = home.run_artifacts(run_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "settings.py").write_text("DATABASE_URL = 'postgres://localhost/app'", encoding="utf-8")
+    assert api.ctx.artifacts.catalog_run(api.ctx.loop.store.get_run(run_id)) == 1
+    (checkout,) = api.ctx.artifacts.for_run(run_id)
+    return headers, channel, run_id, checkout
+
+
 def _work_result(api: Any, headers: dict[str, str], channel: str) -> dict[str, Any]:
     messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
     return next(message for message in messages if message["kind"] == "work_result")
@@ -619,6 +658,35 @@ class TestReadChannelArtifact:
         assert "PNG" not in answer.replace("logo.png", "")
         assert "\x89" not in answer
 
+    def test_a_code_run_s_checkout_is_refused_as_the_download_route_refuses_it(
+        self, api: Any
+    ) -> None:
+        # An agent in the channel reads exactly what a member of the
+        # channel can download. The checkout of a code run the channel
+        # started is not a channel file: the route answers 404, so the
+        # tool must refuse it too, whoever supplies the id.
+        headers, channel, run_id, checkout = _code_run_checkout(api)
+        assert api.ctx.collaboration.channel_owns_run(channel, run_id) is True
+        route = api.client.get(
+            f"/v1/channels/{channel}/artifacts/{checkout.id}/content", headers=headers
+        )
+        assert route.status_code == 404, route.text
+        with pytest.raises(ToolRejectedError):
+            self._tool(api, channel).impl({"artifact_id": checkout.id})
+
+    def test_a_delivered_workload_file_is_readable_by_the_tool_and_the_route(
+        self, api: Any
+    ) -> None:
+        headers, channel, _ = _deliver(api, text="Bread needs salt.\n")
+        artifact = _work_result(api, headers, channel)["artifacts"][0]
+        route = api.client.get(
+            f"/v1/channels/{channel}/artifacts/{artifact['id']}/content", headers=headers
+        )
+        assert route.status_code == 200, route.text
+        assert route.text == "Bread needs salt.\n"
+        answer = self._tool(api, channel).impl({"artifact_id": artifact["id"]})
+        assert "Bread needs salt." in answer
+
 
 class TestChannelArtifactRoutes:
     def test_a_member_without_artifacts_read_reads_the_channel_s_files(self, api: Any) -> None:
@@ -658,37 +726,7 @@ class TestChannelArtifactRoutes:
         # attached to a message and never listed. The content route must
         # not hand them out either: a channel reader holds no
         # ``artifacts:read``, and the checkout is the target's source.
-        api.ctx.concierge = FakeConcierge()
-        headers = bearer(register(api))
-        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
-        accepted = api.client.post(
-            f"/v1/channels/{channel}/turns", headers=headers, json={"content": "fix the bug"}
-        ).json()
-        assert api.ctx.turns.wait_idle(timeout=5)
-        key = accepted["turn"]["input_message_id"]
-        item = WorkItem(
-            item_id=chat_item_id(key),
-            source_key=key,
-            title="Fix",
-            body="fix the bug",
-            kind="code",
-            channel_id=channel,
-        )
-        api.harness.dstore.upsert_new(item, api.clock())
-        api.harness.source.items = [item]
-        api.harness.outcomes = ["merged"]
-        api.clock.t += 10
-        api.loop.tick()
-        run_id = api.harness.runs[-1][0]
-        home = api.ctx.config.paths
-        api.harness.store.set_run_workspace(run_id, home.run_data(run_id), mounted=False)
-        root = home.run_artifacts(run_id)
-        root.mkdir(parents=True, exist_ok=True)
-        (root / "settings.py").write_text(
-            "DATABASE_URL = 'postgres://localhost/app'", encoding="utf-8"
-        )
-        assert api.ctx.artifacts.catalog_run(api.ctx.loop.store.get_run(run_id)) == 1
-        (checkout,) = api.ctx.artifacts.for_run(run_id)
+        headers, channel, run_id, checkout = _code_run_checkout(api)
         # The run is the channel's own work, and it is still not a channel file.
         assert api.ctx.collaboration.channel_owns_run(channel, run_id) is True
         listed = api.client.get(f"/v1/channels/{channel}/artifacts", headers=headers)

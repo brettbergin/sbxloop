@@ -392,9 +392,11 @@ An agent answering in a channel gets one more host tool,
 `read_channel_artifact(artifact_id, offset=0, limit=64000)`. It is offered to
 every participant, read-only roles included, so a critic can read the file it
 is reviewing. It resolves an id only when a message in *this* channel carries
-it, or when a run this channel admitted produced it; it takes no path, returns
-UTF-8 text with a `[truncated ... call again with offset=N]` marker past the
-window, and answers one metadata line for anything that is not text.
+it, or when a workload or tool run this channel admitted delivered it (so it
+can read a result before the message lands). A code run's checkout is refused
+here exactly as the download route refuses it. It takes no path, returns UTF-8
+text with a `[truncated ... call again with offset=N]` marker past the window,
+and answers one metadata line for anything that is not text.
 
 ### Channel history and its summary
 
@@ -1242,14 +1244,20 @@ and `has_more` means what it always meant:
 
 - A plain API client (no workspace member behind it) sees every event.
 - Every workspace member sees events meant for everyone or for them alone.
-- A workspace owner or admin also sees every channel's and every run's
-  events.
-- A plain member sees the events of the channels they can open (their
-  channels and every workspace channel) and events with neither a channel
-  nor a run. A run's events are shown only when a channel they can open
-  asked for the run (a workload or tool run started from a chat message, or
-  a code run whose issue a chat turn filed); a run no channel asked for, and
-  run events recorded before this release, are not shown to them.
+- Every workspace member, owners and admins included, sees the events of
+  the channels they can open (their channels and every workspace channel).
+  A private channel's events reach its members only: a workspace owner or
+  admin who is not a member of it does not see them.
+- A run's or an item's events are shown only when a channel the member can
+  open asked for the work (a workload or tool run started from a chat
+  message, or a code run whose issue a chat turn filed).
+- Work no channel asked for (a run or an item with no channel, and run
+  events recorded before this release) is shown to workspace owners and
+  admins only. A plain member sees, beyond their channels, only events with
+  no channel, no run and no item.
+- A person's own team, preference, workflow and profile events recorded
+  before `events.scoped` are given that person as their audience on
+  upgrade; one whose person can no longer be told reaches no member.
 
 A live subscription moves its cursor past events its member may not see,
 so it does not scan them again. Membership changes apply from the next

@@ -15,9 +15,12 @@ from pathlib import Path
 from sqlalchemy import inspect
 
 from sbxloop.db import open_engine
-from tests.unit.test_channel_membership_migration import _head, _query, _stamp, _upgrade_to
+from tests.unit.test_channel_membership_migration import _query, _stamp, _upgrade_to
 
 BEFORE = "0025"
+#: Revision 0039 gives per-person events their audience; see
+#: test_event_audience_migration.
+REVISION = "0026"
 EVENTS = [
     # type, data_json
     ("collaboration.channel.created", '{"channel_id": "chn_one"}'),
@@ -53,7 +56,7 @@ def _migrated(tmp_path: Path) -> Path:
     path = tmp_path / "state.db"
     _upgrade_to(path, BEFORE)
     _seed(path)
-    _head(path)
+    _upgrade_to(path, REVISION)
     return path
 
 
@@ -94,5 +97,5 @@ def test_running_the_upgrade_again_changes_nothing(tmp_path: Path) -> None:
     path = _migrated(tmp_path)
     before = _query(path, "SELECT * FROM api_events ORDER BY seq")
     _stamp(path, BEFORE)
-    _head(path)
+    _upgrade_to(path, REVISION)
     assert _query(path, "SELECT * FROM api_events ORDER BY seq") == before
