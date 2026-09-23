@@ -1,0 +1,114 @@
+name: Channel analysis isolation
+
+# Complex uploaded-file parsers may only be introduced after this real-sbx
+# boundary passes. A normal read-only agent permission mode is insufficient:
+# this probe starts a separate shell VM with no credentials or shared skills.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/channel-analysis-isolation.yml
+      - scripts/probe_channel_analysis_isolation.py
+      - docs/channel-analysis-isolation.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/channel-analysis-isolation.yml
+      - scripts/probe_channel_analysis_isolation.py
+      - docs/channel-analysis-isolation.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  SBXLOOP_APP_NAME: sbxloop-analysis
+  SBX_PROBE_NAME: analysis-isolation-${{ github.run_id }}
+  XDG_STATE_HOME: /tmp/sbx-analysis-state
+  SBXLOOP_ANALYSIS_HOST_SENTINEL: host-only-probe
+
+jobs:
+  probe:
+    # Fork PRs do not receive Docker Hub credentials. They get the normal
+    # source gates; the isolation probe must run on a trusted branch before
+    # parser code is accepted.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM and user namespaces
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install sbx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url=$(gh api repos/docker/sbx-releases/releases/latest \
+            | python3 -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and ('amd64' in a['name'] or 'x86_64' in a['name']) and a['name'].endswith('.tar.gz')]; print(assets[0])")
+          curl -fsSL -o /tmp/sbx-analysis.tar.gz "$url"
+          mkdir -p /tmp/sbx-analysis-install
+          tar -xzf /tmp/sbx-analysis.tar.gz -C /tmp/sbx-analysis-install --strip-components=1
+          sudo PREFIX="$SBX_INSTALL_DIR" /tmp/sbx-analysis-install/install.sh
+          echo "$SBX_INSTALL_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Start keyring
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gnome-keyring dbus-x11
+          echo 'DBUS_SESSION_BUS_ADDRESS='$(dbus-daemon --session --fork --print-address) >> "$GITHUB_ENV"
+
+      - name: Login and initialize policy
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$DOCKERHUB_USERNAME"
+          test -n "$DOCKERHUB_TOKEN"
+          echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
+          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name "$SBXLOOP_APP_NAME" login --username "$DOCKERHUB_USERNAME" --password-stdin
+          sbx --app-name "$SBXLOOP_APP_NAME" policy init balanced
+          sbx --app-name "$SBXLOOP_APP_NAME" version
+
+      - name: Prove isolated parser profile
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d "$RUNNER_TEMP/channel-analysis.XXXXXX")
+          mkdir -p "$root/work" "$root/input" "$root/private"
+          cp tests/fixtures/channel_analysis/inert_keylogger_indicators.elf "$root/input/original.bin"
+          expected_sha256=$(sha256sum "$root/input/original.bin" | cut -d ' ' -f 1)
+          printf 'host-only neighbor\n' > "$root/private/neighbor.bin"
+          cp scripts/probe_channel_analysis_isolation.py "$root/input/probe.py"
+
+          # Fail closed if this runner cannot demonstrate that the host has
+          # network access; a blocked sandbox probe alone would be ambiguous.
+          python3 -c 'import socket; s=socket.create_connection(("example.com", 443), timeout=5); s.close()'
+          # Explicitly clear service credentials at creation and execution.
+          # Keep the host-only sentinel set to detect unintended inheritance.
+          clear_credentials=(
+            -e GH_TOKEN= -e GITHUB_TOKEN= -e DOCKERHUB_TOKEN=
+            -e OPENAI_API_KEY= -e ANTHROPIC_API_KEY= -e COPILOT_GITHUB_TOKEN=
+          )
+          timeout 600s sbx --app-name "$SBXLOOP_APP_NAME" create \
+            --name="$SBX_PROBE_NAME" --cpus 1 --memory 512m \
+            --deny-network '**' --skills off "${clear_credentials[@]}" \
+            shell "$root/work" "$root/input:ro"
+          timeout 30s sbx --app-name "$SBXLOOP_APP_NAME" exec \
+            "${clear_credentials[@]}" "$SBX_PROBE_NAME" \
+            python3 "$root/input/probe.py" "$root/input/original.bin" "$expected_sha256" \
+            "$root/private/neighbor.bin" "$root/private/host-output.bin"
+          cmp tests/fixtures/channel_analysis/inert_keylogger_indicators.elf "$root/input/original.bin"
+          test ! -e "$root/input/parser-output"
+          test ! -e "$root/private/host-output.bin"
+          test "$(cat "$root/private/neighbor.bin")" = 'host-only neighbor'
+
+      - name: Remove disposable sandbox
+        if: always()
+        run: |
+          sbx --app-name "$SBXLOOP_APP_NAME" rm --force "$SBX_PROBE_NAME" || true
+          sbx --app-name "$SBXLOOP_APP_NAME" logout --yes || true
