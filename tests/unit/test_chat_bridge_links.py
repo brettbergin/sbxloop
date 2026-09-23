@@ -419,15 +419,17 @@ MATTERMOST_ROOT = "r" * 26
 
 
 class LinkedSurface:
-    """A started Slack or Mattermost bridge whose control channel is linked
-    to a channel, with the one member mapped to the service account the
-    harness's messages come from."""
+    """A started Slack or Mattermost bridge with a channel linked to one of
+    its surfaces (the control channel unless ``surface`` names another), and
+    the one member mapped to the service account the harness's messages
+    come from."""
 
-    def __init__(self, tmp_path: Path, backend: str) -> None:
+    def __init__(self, tmp_path: Path, backend: str, *, surface: str | None = None) -> None:
         self.backend = backend
         self.concierge = FakeConcierge()
         harness = slack_tests if backend == "slack" else mattermost_tests
-        self.surface = harness.CHANNEL
+        self.control = harness.CHANNEL
+        self.surface = surface or harness.CHANNEL
         self.bridge, self.client, self.loop = harness.make_bridge(
             tmp_path, concierge=self.concierge
         )
@@ -455,6 +457,45 @@ class LinkedSurface:
 
     def messages(self) -> list[Any]:
         return self.store.list_messages(None, self.channel.id)
+
+    def deliver(
+        self, text: str, *, channel: str, mid: str, thread: str = "", mention: bool = True
+    ) -> None:
+        """One human message on ``channel`` (a reply in ``thread`` when it
+        names one), as the service's event stream hands it to the bridge."""
+        if self.backend == "slack":
+            body = f"<@{slack_tests.BOT}> {text}" if mention else text
+            event: dict[str, Any] = {
+                "type": "message",
+                "channel": channel,
+                "user": "U1",
+                "text": body,
+                "ts": mid,
+            }
+            if thread:
+                event["thread_ts"] = thread
+            self.client.deliver(event)
+        else:
+            body = f"@{mattermost_tests.BOT_NAME} {text}" if mention else text
+            self.client.deliver(
+                mattermost_tests.posted(body, post_id=mid, root_id=thread, channel=channel)
+            )
+
+    def posted_to(self, channel: str) -> list[str]:
+        """The text of every top-level or threaded post sent to ``channel``."""
+        if self.backend == "slack":
+            return [
+                str(p.get("text") or "")
+                for p in self.client.web.posted
+                if p.get("channel") == channel
+            ]
+        return [str(p["message"]) for p in self.client.posts if p.get("channel_id") == channel]
+
+    def reacted_to(self, mid: str) -> bool:
+        """Did the bridge put any reaction (an acknowledgement) on ``mid``?"""
+        if self.backend == "slack":
+            return any(r.get("timestamp") == mid for r in self.client.web.reactions)
+        return any(post_id == mid for _user, post_id, _emoji in self.client.reactions)
 
     def close(self) -> None:
         self.bridge.close()
@@ -608,3 +649,146 @@ def test_a_refused_linked_turn_still_says_why(linked: Any, monkeypatch: pytest.M
     linked.say("plan the bread")
     control = linked.client.channels[CONTROL]
     assert wait_for(lambda: any("channel not found" in sent for sent in control.sent))
+
+
+# -- Slack and Mattermost: a link on a channel that is not the control one --
+#
+# The link is what authorizes a surface: a channel linked to a collaboration
+# channel is heard both ways, as a Discord one is, and what is said there is
+# a turn in the linked channel, never the operator's word.
+
+#: An ordinary channel on each service, linked to the collaboration channel.
+OTHER = {"slack": "C0LINKEDXYZ", "mattermost": "l" * 26}
+#: A channel the bot sits in that nobody linked.
+UNLINKED = {"slack": "C0UNLINKEDQ", "mattermost": "n" * 26}
+#: A top-level post in ``OTHER`` that a thread hangs under.
+PARENT = {"slack": "1700000100.000100", "mattermost": "p" * 26}
+
+
+def mid(backend: str, n: int) -> str:
+    """A message id the service would hand out: a ts on Slack, a post id on
+    Mattermost."""
+    return f"1700000100.{n:06d}" if backend == "slack" else f"{n:026d}"
+
+
+@pytest.fixture(params=["slack", "mattermost"])
+def linked_elsewhere(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
+    backend = request.param
+    built = LinkedSurface(tmp_path, backend, surface=OTHER[backend])
+    yield built
+    built.close()
+
+
+def test_a_message_on_a_linked_non_control_channel_is_a_channel_turn(
+    linked_elsewhere: Any,
+) -> None:
+    s = linked_elsewhere
+    mirror = ChannelMirror(s.store, lambda backend: s.bridge)
+    s.store.add_message_observer(mirror.message_appended)
+
+    s.deliver("plan the bread", channel=s.surface, mid=mid(s.backend, 1))
+    assert wait_for(lambda: len(s.messages()) >= 1)
+    message = s.messages()[0]
+    assert message.content == "plan the bread"
+    assert message.author.id == s.user.id
+    assert message.origin == {
+        "backend": s.backend,
+        "surface_id": s.surface,
+        "external_message_id": mid(s.backend, 1),
+    }
+    # And the channel's answer goes back out to the surface it came from.
+    assert wait_for(lambda: any("reply from" in text for text in s.posted_to(s.surface)))
+    assert s.concierge.turns == []
+
+
+def test_a_thread_reply_under_a_linked_non_control_channel_is_a_channel_turn(
+    linked_elsewhere: Any,
+) -> None:
+    s = linked_elsewhere
+    s.deliver("plan the bread", channel=s.surface, mid=mid(s.backend, 2), thread=PARENT[s.backend])
+    assert wait_for(lambda: len(s.messages()) >= 1)
+    message = s.messages()[0]
+    assert message.content == "plan the bread"
+    assert message.origin.get("surface_id") == s.surface
+    assert s.concierge.turns == []
+
+
+def test_a_message_on_an_unlinked_non_control_channel_is_still_dropped(
+    linked_elsewhere: Any,
+) -> None:
+    s = linked_elsewhere
+    s.deliver("plan the bread", channel=UNLINKED[s.backend], mid=mid(s.backend, 3))
+    # The control channel is not linked here, so this one is the operator's:
+    # once the concierge has it, the message before it has been handled.
+    s.deliver("still there?", channel=s.control, mid=mid(s.backend, 4))
+    assert wait_for(lambda: len(s.concierge.turns) >= 1)
+    assert not wait_for(lambda: len(s.concierge.turns) > 1, timeout=0.3)
+    assert [text for text, _author in s.concierge.turns] == ["still there?"]
+    assert s.messages() == []
+    assert not s.reacted_to(mid(s.backend, 3))
+    assert s.posted_to(UNLINKED[s.backend]) == []
+
+
+def test_a_linked_non_control_channel_never_speaks_as_the_operator(
+    linked_elsewhere: Any,
+) -> None:
+    s = linked_elsewhere
+    s.deliver("!sbx pause", channel=s.surface, mid=mid(s.backend, 5), mention=False)
+    assert wait_for(
+        lambda: any("runs where I take operator commands" in t for t in s.posted_to(s.surface))
+    )
+    assert s.loop.paused is False
+    s.deliver("what is queued?", channel=s.surface, mid=mid(s.backend, 6))
+    assert wait_for(lambda: len(s.messages()) >= 1)
+    # Never a concierge turn, so never the trusted principal a control-channel
+    # message carries.
+    assert s.concierge.turns == []
+    assert getattr(s.concierge, "principals", []) == []
+
+
+def test_retiring_the_link_stops_the_channel_hearing_the_surface(
+    linked_elsewhere: Any,
+) -> None:
+    s = linked_elsewhere
+
+    def said() -> list[str]:
+        """What people typed into the channel, leaving out its agent's replies."""
+        return [m.content for m in s.messages() if m.author.kind == "human"]
+
+    s.deliver("plan the bread", channel=s.surface, mid=mid(s.backend, 7))
+    assert wait_for(lambda: said() == ["plan the bread"])
+    s.store.delete_channel_link(None, s.channel.id, s.link.id, time.time())
+
+    s.deliver("and the butter", channel=s.surface, mid=mid(s.backend, 8))
+    s.deliver("still there?", channel=s.control, mid=mid(s.backend, 9))
+    assert wait_for(lambda: len(s.concierge.turns) >= 1)
+    assert not wait_for(lambda: len(said()) > 1, timeout=0.3)
+    assert said() == ["plan the bread"]
+    assert [text for text, _author in s.concierge.turns] == ["still there?"]
+
+
+def test_a_channel_linked_while_the_bridge_runs_is_heard_at_once(
+    linked_elsewhere: Any,
+) -> None:
+    """The bridge does not read links once at start: a surface it has
+    already turned away is heard from the moment somebody links it."""
+    s = linked_elsewhere
+    unlinked = UNLINKED[s.backend]
+    s.deliver("anyone?", channel=unlinked, mid=mid(s.backend, 10))
+    s.deliver("still there?", channel=s.control, mid=mid(s.backend, 11))
+    assert wait_for(lambda: len(s.concierge.turns) >= 1)
+    assert s.messages() == []
+
+    s.store.create_channel_link(
+        None,
+        s.channel.id,
+        backend=s.backend,
+        surface_id=unlinked,
+        thread_id=None,
+        allow_guests=False,
+        created_by=s.user.id,
+        now=time.time(),
+    )
+    s.deliver("plan the bread", channel=unlinked, mid=mid(s.backend, 12))
+    assert wait_for(lambda: len(s.messages()) >= 1)
+    assert s.messages()[0].origin.get("surface_id") == unlinked
