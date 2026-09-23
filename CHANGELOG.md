@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+**A slow sandbox teardown is no longer reported as a wedged box.** After
+`sbx rm` succeeds the daemon waits up to 30s for sbx to stop listing the box;
+a backend still reaping it at that point used to be handled like one that
+cannot remove it at all: `github_sandbox.wedged` at ERROR with a "restart
+sbx-sandboxd" hint, and the name retired for the life of the process, so
+every slow teardown burned another generation. A settle timeout is now its
+own error: the daemon's forge box logs it as a warning
+(`github_sandbox.stale_settling` or `github_sandbox.remove_settling`), keeps
+the name, steps past it for that one provision rather than creating over a
+teardown still in flight, and retries the removal at the next cleanup. A
+removal `sbx rm` itself fails still retires the name as before. (#1228)
+
 **`doctor --deep --fail-on-drift` stops failing on a verdict change it
 already reported, and on one that came from an older probe.** A verdict that
 changed between sbx versions was reported on every run for as long as the

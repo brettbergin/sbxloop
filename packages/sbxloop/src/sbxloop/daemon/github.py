@@ -26,6 +26,7 @@ from sbxloop.errors import (
     SbxError,
     SbxloopError,
     SbxNotFoundError,
+    SbxSettleTimeoutError,
     WorkerError,
     caused_by_sbx_auth,
 )
@@ -112,6 +113,10 @@ class DaemonGithub:
         # create the backend refused. Never retried in this process; the
         # next daemon start tries the base name again.
         self._unusable: set[str] = set()
+        # Names whose removal this cleanup started but the backend had not
+        # finished reaping when the settle wait ran out: slow, not wedged, so
+        # skipped only until the next cleanup retries them.
+        self._settling: set[str] = set()
         # The same home's box under every other forge: what a `[vcs] kind`
         # switch (in any direction) or a pre-forge-naming upgrade leaves
         # behind. A caller-named box (doctor, init-repo) owns no such names.
@@ -154,7 +159,10 @@ class DaemonGithub:
         hung microVM whose ``sbx rm`` times out) is reported once and left
         to the backend, and the daemon carries on under the next generation
         of the name (#1165): the field failure was a poll that waited out
-        that timeout every half hour for a day. A previous forge's box has
+        that timeout every half hour for a day. A removal sbx accepted but
+        had not finished when the settle wait ran out is slow, not wedged: it
+        is a warning, the name is not retired, and only this provision steps
+        past it, so the next cleanup retries it. A previous forge's box has
         a different name and is cleared after the new box is ready
         (:meth:`_clear_previous_forges`).
         """
@@ -169,6 +177,7 @@ class DaemonGithub:
         ]
         if not listed:
             log.debug("github_sandbox.no_stale", sandbox=self._base_name)
+        self._settling = set()
         for name in listed:
             if name in self._unusable:
                 continue
@@ -186,6 +195,18 @@ class DaemonGithub:
                 # Nobody is signed in: every name fails alike, nothing is
                 # wedged, and the next poll retries once someone is.
                 raise
+            except SbxSettleTimeoutError as exc:
+                # Accepted and still being reaped: creating over it would
+                # collide (#952), so this provision takes another name, but
+                # the name stays this daemon's and the next cleanup retries.
+                self._settling.add(name)
+                log.warning(
+                    "github_sandbox.stale_settling",
+                    sandbox=name,
+                    error=str(exc),
+                    action="the backend is still removing this box; the next cleanup retries it",
+                )
+                continue
             except SbxError as exc:
                 self._give_up_on(name, exc, reason="remove_failed")
                 continue
@@ -193,9 +214,11 @@ class DaemonGithub:
         self.name = self._free_name()
 
     def _free_name(self) -> str:
-        """The lowest generation this process has not given up on."""
+        """The lowest generation this process has not given up on and whose
+        removal is not still settling."""
+        skip = self._unusable | self._settling
         generation = 0
-        while generation_name(self._base_name, generation) in self._unusable:
+        while generation_name(self._base_name, generation) in skip:
             generation += 1
         return generation_name(self._base_name, generation)
 
@@ -354,6 +377,15 @@ class DaemonGithub:
                     log.info("github_sandbox.already_gone", sandbox=self.name)
                     return
                 log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+            except SbxSettleTimeoutError as exc:
+                # Slow, not wedged: the name is not retired, and the next
+                # provision's cleanup retries the removal.
+                log.warning(
+                    "github_sandbox.remove_settling",
+                    sandbox=sandbox.name,
+                    error=str(exc),
+                    action="the backend is still removing this box; the next provision retries it",
+                )
             except SbxError as exc:
                 log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
                 # A box that will not go away is not worth another 120s

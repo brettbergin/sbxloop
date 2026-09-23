@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError
+from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError, SbxSettleTimeoutError
 from sbxloop.sbx.cli import SbxCLI, _exec_failed_at_sbx_level, redacted_argv
 from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
@@ -87,6 +87,28 @@ class TestLifecycle:
         cli.rm("boxa", settle=False)
         with pytest.raises(SbxError, match="still lists it"):
             cli.wait_gone("boxa", timeout=0.05)
+
+    def test_a_teardown_still_in_flight_at_the_deadline_is_a_settle_timeout(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbx rm` succeeded and the backend is still reaping the box: slow,
+        not refused. Callers tell the two apart by type, so a slow teardown is
+        not handled like a backend that cannot remove the box."""
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_TIMEOUT_S", 0.05)
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.linger_removals(10_000)
+        with pytest.raises(SbxSettleTimeoutError, match="still lists it"):
+            cli.rm("boxa")
+
+    def test_a_removal_sbx_refuses_is_not_a_settle_timeout(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.fail_next("rm", stderr="ERROR: context deadline exceeded")
+        with pytest.raises(SbxError) as raised:
+            cli.rm("boxa")
+        assert not isinstance(raised.value, SbxSettleTimeoutError)
 
     def test_rm_can_skip_the_settle_wait(
         self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
