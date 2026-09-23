@@ -1772,8 +1772,9 @@ chronology (a `run.reconciled` event) — historical events are never mutated:
   run executing in this process nor one pinned for resume.
 - **The staleness safety net** runs every tick — including while paused — and
   closes any non-terminal run whose last activity (chronology, falling back to
-  the run row's `updated_at`) is older than `[daemon] run_stale_after_s` while
-  no run is executing. The default is 6h (`21600`); `0` disables this sweep.
+  the run row's `updated_at`) is older than `[daemon] run_stale_after_s` and
+  that no thread in this process is executing, however many other runs are in
+  flight. The default is 6h (`21600`); `0` disables this sweep.
 
 The reason recorded depends on the associated work item: a `cancelled` item
 gives run state `cancelled` with reason `work item cancelled` (plus the
@@ -1783,9 +1784,9 @@ staleness sweep, `orphaned: stale, no activity for <n>s`). Cancellation itself
 transitions the run record alongside the work item, so the two cannot diverge.
 
 The run that is legitimately in flight is **never** reconciled: both sweeps
-skip the daemon's `current` run and any item queued for resume, and the
-staleness sweep does not run at all while a run is executing. The persisted
-reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
+skip every run executing in this process and any item queued for resume, so
+a stale run beside live ones is still closed but a live one never is. The
+persisted reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
 on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
 
 ## Reconciling review findings on the pull request

@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+**A deploy's SIGTERM can no longer hang the daemon, and a stale run is
+closed even while other runs are busy.** The shutdown handler asks every
+run to cancel from the main thread, which is also the loop thread; the
+lock guarding the runs in flight was not reentrant, so a signal landing
+while the loop held it (about once a second whenever a run was live) left
+the daemon blocked on its own lock until the service manager killed it,
+with no run asked to cancel and no sandbox cleaned up. The lock is now
+reentrant. Separately, the `[daemon] run_stale_after_s` sweep skipped
+itself entirely whenever any run was live, so under steady concurrent load
+a run left `decomposing` by a settle step that died stayed "active" in
+`list_runs`, the API and the TUI for as long as the daemon stayed busy. It
+now skips only the runs actually executing and closes the rest. (#1271,
+#1270)
+
 ## [2.1.0] - 2026-09-22
 
 The 2.0 line, cut as one minor release: every entry below already shipped
