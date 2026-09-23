@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-22
+
+The 2.0 line, cut as one minor release: every entry below already shipped
+as a 1.5.x or 2.0.x patch since 1.5.0.
+
 **A member cannot give their own agent the power to start work, nor a
 daily cap above the operator's.** `POST /v1/agents` and
 `PATCH /v1/agents/{slug}` accepted `can_start` and `max_runs_per_day` from
