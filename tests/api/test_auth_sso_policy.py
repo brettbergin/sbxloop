@@ -120,6 +120,7 @@ def test_provider_outage_never_reenables_local_auth(served: Api, idp: FakeIdP) -
         "local": False,
         "oidc": None,
         "policy_version": 1,
+        "assistant_name": "Angie",
         "oidc_session_max_age_s": 600,
     }
 

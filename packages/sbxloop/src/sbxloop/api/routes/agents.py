@@ -20,6 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 
 from sbxloop.agentmodels import model_for_phase, refreshed_models
+from sbxloop.agents.builtin import CONCIERGE_NAME
 from sbxloop.agents.definition import AgentDefinition as RegistryAgent, AgentSpec
 from sbxloop.agents.memory import AgentMemoryError, Memory, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
@@ -58,7 +59,9 @@ __all__ = ["addressable", "agent_out", "router"]
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 
 
-def agent_out(agent: RegistryAgent, config: Config) -> AgentOut:
+def agent_out(agent: RegistryAgent, config: Config, *, product: str = CONCIERGE_NAME) -> AgentOut:
+    """``agent`` as clients read it; ``product`` is the name the product
+    agent answers to, which the other agents' prompts respond within."""
     view = AgentDefinition.from_registry(agent)
     selection = model_for_phase(config, view.phase)
     spec = agent.spec
@@ -69,7 +72,7 @@ def agent_out(agent: RegistryAgent, config: Config) -> AgentOut:
         capabilities=list(view.capabilities),
         category=view.category,
         instructions=view.instructions,
-        system_prompt=view.persona.strip(),
+        system_prompt=view.persona_in(product).strip(),
         backend=config.agent.backend,
         model=spec.model or selection.model,
         model_source="agent.model" if spec.model else selection.source,
@@ -187,7 +190,8 @@ async def list_agents(
         )
     config = await ctx.call(refreshed_models, ctx.config)
     agents = await ctx.call(ctx.agents.list, include_disabled)
-    return [agent_out(agent, config) for agent in agents]
+    product = ctx.assistant_name
+    return [agent_out(agent, config, product=product) for agent in agents]
 
 
 @router.get("/agents/{slug}", response_model=AgentOut)
@@ -197,7 +201,8 @@ async def get_agent(
     _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> AgentOut:
     agent = await ctx.call(_found, ctx.agents, slug)
-    return agent_out(agent, await ctx.call(refreshed_models, ctx.config))
+    config = await ctx.call(refreshed_models, ctx.config)
+    return agent_out(agent, config, product=ctx.assistant_name)
 
 
 @router.post("/agents", response_model=AgentOut, status_code=201)
@@ -214,7 +219,8 @@ async def create_agent(
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
-    return agent_out(agent, await ctx.call(refreshed_models, ctx.config))
+    config = await ctx.call(refreshed_models, ctx.config)
+    return agent_out(agent, config, product=ctx.assistant_name)
 
 
 @router.patch("/agents/{slug}", response_model=AgentOut)
@@ -235,7 +241,8 @@ async def update_agent(
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
-    return agent_out(agent, await ctx.call(refreshed_models, ctx.config))
+    config = await ctx.call(refreshed_models, ctx.config)
+    return agent_out(agent, config, product=ctx.assistant_name)
 
 
 @router.post("/agents/{slug}/archive", response_model=AgentOut)
@@ -250,7 +257,8 @@ async def archive_agent(
     except _REFUSALS as exc:
         raise _problem(exc) from exc
     ctx.hub.notify()
-    return agent_out(agent, await ctx.call(refreshed_models, ctx.config))
+    config = await ctx.call(refreshed_models, ctx.config)
+    return agent_out(agent, config, product=ctx.assistant_name)
 
 
 #: Member roles that may read memories learned in channels they cannot open.

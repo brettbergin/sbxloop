@@ -7,6 +7,7 @@ so both are pinned by tests.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from sbxloop.agents.definition import AgentDefinition, AgentSpec
@@ -20,32 +21,74 @@ __all__ = [
     "ANGIE_SLUG",
     "BUILTIN_AGENTS",
     "BUILTIN_BY_SLUG",
+    "CONCIERGE_ALIASES",
+    "CONCIERGE_NAME",
     "LEGACY_BUILTINS",
     "PRIMARY_BUILTINS",
     "builtin_display_name",
     "chat_persona",
     "chat_role",
+    "concierge_handle",
+    "concierge_name",
+    "mentioned_persona",
+    "product_persona",
     "run_persona",
 ]
 
 #: The native agent that speaks as the product itself.
 ANGIE_SLUG = "concierge"
+#: The name and aliases it ships with. An operator renames it with a
+#: ``[[agents]]`` entry for ``concierge``; the slug never changes.
+CONCIERGE_NAME = "Angie"
+CONCIERGE_ALIASES: tuple[str, ...] = ("angie",)
 
-ANGIE_PERSONA = """
+_PERSONA = """
 
 ## Product persona
 
-You are Angie, a concise personal assistant backed by sbxloop. Answer the
+You are {name}, a concise personal assistant backed by sbxloop. Answer the
 person in the current channel and preserve context only within that channel.
 Treat conversation as conversation. Do not claim that a person approved an
 action, and explain any sbxloop operation you actually perform.
 """
 
-ANGIE_MENTIONED = """
-The person addressed you as `@concierge` (or `@angie`), which is how they let
-you use your sbxloop tools in this turn. You are still Angie: speak as
+_MENTIONED = """
+The person addressed you as `@concierge`{aliases}, which is how they let
+you use your sbxloop tools in this turn. You are still {name}: speak as
 yourself, never as a separate "Concierge" agent, and say what you did.
 """
+
+
+def product_persona(name: str = CONCIERGE_NAME) -> str:
+    """The persona of the agent that speaks as the product, under ``name``."""
+    return _PERSONA.format(name=name)
+
+
+def mentioned_persona(
+    name: str = CONCIERGE_NAME, aliases: Sequence[str] = CONCIERGE_ALIASES
+) -> str:
+    """What the product agent is told when a person addressed it by name."""
+    also = " or ".join(f"`@{alias}`" for alias in aliases)
+    return _MENTIONED.format(name=name, aliases=f" (or {also})" if also else "")
+
+
+ANGIE_PERSONA = product_persona()
+
+ANGIE_MENTIONED = mentioned_persona()
+
+
+def concierge_name(agent: AgentDefinition | None) -> str:
+    """The name the product agent answers to: ``agent``'s (the resolved
+    ``concierge``), or the shipped one when it has none."""
+    return (agent.spec.name if agent is not None else "") or CONCIERGE_NAME
+
+
+def concierge_handle(agent: AgentDefinition | None) -> str:
+    """How a person addresses the product agent in prose: its first alias,
+    or its slug when it has none."""
+    aliases = CONCIERGE_ALIASES if agent is None else tuple(agent.spec.aliases)
+    return aliases[0] if aliases else ANGIE_SLUG
+
 
 _PRIMARY_CATEGORY = "SBXLOOP Agents"
 
@@ -94,15 +137,15 @@ def _legacy(
 #: Angie and the run roles, in the order clients list them.
 PRIMARY_BUILTINS: tuple[AgentDefinition, ...] = (
     _primary(
-        "concierge",
-        "Angie",
+        ANGIE_SLUG,
+        CONCIERGE_NAME,
         "Chat with sbxloop and direct its managed runs.",
         ("chat", "run controls", "coordination"),
         "Help the person direct the loop through the available tools.",
         role="lead",
         color="#84cc16",
         avatar="A",
-        aliases=("angie",),
+        aliases=CONCIERGE_ALIASES,
     ),
     _primary(
         "planner",
@@ -229,7 +272,11 @@ _API_NAMES = {ANGIE_SLUG: "Concierge"}
 
 
 def builtin_display_name(agent: AgentDefinition) -> str:
-    """The name the pre-registry API listed ``agent`` under."""
+    """The name the pre-registry API listed ``agent`` under. The product
+    agent keeps its old listing while it has the shipped name, and is
+    listed under the name an operator gave it otherwise."""
+    if agent.slug == ANGIE_SLUG and concierge_name(agent) != CONCIERGE_NAME:
+        return concierge_name(agent)
     return _API_NAMES.get(agent.slug, agent.spec.name)
 
 
@@ -255,11 +302,14 @@ def _builtin_instructions(agent: AgentDefinition) -> str | None:
     return None if shipped is None else shipped.spec.instructions
 
 
-def chat_persona(agent: AgentDefinition) -> str:
+def chat_persona(agent: AgentDefinition, product: str = CONCIERGE_NAME) -> str:
+    """The chat persona of ``agent``; ``product`` is the name the product
+    agent answers to, which the other roles respond within."""
     if agent.slug == ANGIE_SLUG:
-        # The lead is Angie herself: a mention is how the person lets her
-        # act, not a hand-off to a separate agent.
-        persona = ANGIE_PERSONA + ANGIE_MENTIONED
+        # The lead is the product agent itself: a mention is how the person
+        # lets it act, not a hand-off to a separate agent.
+        name = concierge_name(agent)
+        persona = product_persona(name) + mentioned_persona(name, agent.spec.aliases)
         instructions = agent.spec.instructions.strip()
         if instructions and instructions != _builtin_instructions(agent):
             persona += f"\n{instructions}\n"
@@ -268,7 +318,7 @@ def chat_persona(agent: AgentDefinition) -> str:
     name = agent.spec.name or agent.slug
     return (
         "\n\n## Collaboration role\n\n"
-        f"You are sbxloop's **{name}**, responding in Angie as `@{agent.slug}`. "
+        f"You are sbxloop's **{name}**, responding in {product} as `@{agent.slug}`. "
         + (f"{instructions} " if instructions else "")
         + "Keep the answer useful in a shared chat, state any "
         "action you took, and never imply that another agent or person approved it."

@@ -13,6 +13,7 @@ from sbxloop.agents.builtin import (
     ANGIE_MENTIONED,
     ANGIE_PERSONA,
     ANGIE_SLUG,
+    CONCIERGE_NAME,
     LEGACY_BUILTINS,
     PRIMARY_BUILTINS,
     builtin_display_name,
@@ -67,11 +68,16 @@ class AgentDefinition:
 
     @property
     def persona(self) -> str:
+        return self.persona_in(CONCIERGE_NAME)
+
+    def persona_in(self, product: str) -> str:
+        """The chat persona, responding within ``product``: the name the
+        product agent answers to."""
         if self.agent is not None:
-            return self.agent.chat_persona()
+            return self.agent.chat_persona(product)
         return (
             "\n\n## Collaboration role\n\n"
-            f"You are sbxloop's **{self.name}**, responding in Angie as `@{self.slug}`. "
+            f"You are sbxloop's **{self.name}**, responding in {product} as `@{self.slug}`. "
             f"{self.instructions} Keep the answer useful in a shared chat, state any "
             "action you took, and never imply that another agent or person approved it."
         )
