@@ -334,14 +334,47 @@ class Chronology:
             pruned = _int_state(session, PRUNED_KEY)
         return (None if oldest is None else int(oldest)), pruned
 
-    def expired(self, after: int) -> bool:
+    def expired(self, after: int, *, run_id: str | None = None) -> bool:
         """Whether a cursor points into pruned history: the event after it
-        is gone, so replaying from it would skip what a client never saw."""
-        if after <= 0:
-            _, pruned = self.bounds()
-            return pruned > 0
+        is gone, so replaying from it would skip what a client never saw.
+
+        A read narrowed to one run skips only that run's events, so it is
+        refused only when the run itself lost some: a run that began after
+        everything pruned so far replays whole from any cursor, the start
+        included, however long the daemon has been keeping its chronology.
+        """
         _, pruned = self.bounds()
-        return after < pruned
+        if after >= pruned:
+            return False
+        return run_id is None or self._run_pruned(run_id, pruned)
+
+    def _run_pruned(self, run_id: str, pruned: int) -> bool:
+        """Whether retention took any of ``run_id``'s events.
+
+        Pruning goes oldest first and the engine's own events are never
+        deleted, so the run lost nothing when the projection of its first
+        engine event is still held and nothing of it sits at or below the
+        pruned mark. A run with no engine event yet, or whose first one is
+        not yet projected, cannot be told apart from one that lost its
+        start, and counts as pruned.
+        """
+        with self.dstore.read() as session:
+            at_or_below = session.scalar(
+                select(ApiEventRow.seq)
+                .where(ApiEventRow.run_id == run_id, ApiEventRow.seq <= pruned)
+                .limit(1)
+            )
+            if at_or_below is not None:
+                return True
+            first = session.scalar(select(func.min(EventRow.seq)).where(EventRow.run_id == run_id))
+            if first is None:
+                return True
+            held = session.scalar(
+                select(ApiEventRow.seq)
+                .where(ApiEventRow.run_id == run_id, ApiEventRow.source_seq == int(first))
+                .limit(1)
+            )
+        return held is None
 
     def read(
         self,

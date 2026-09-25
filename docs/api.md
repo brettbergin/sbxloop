@@ -1193,7 +1193,11 @@ also the cursor.
 
 History is kept for `[api] replay_retention_s`; a cursor older than what
 remains is `410 cursor_expired` with a pointer to the snapshot, never a
-silent skip. The WebSocket takes the same typed commands as REST
+silent skip. A read of one run (`/v1/runs/{id}/events`, or `run_id` on the
+stream or the socket) is refused only when retention took some of that run's
+own events: a run begun after the last prune replays whole from its start.
+For one whose start is gone, `GET /v1/events?run_id=…&latest=true` still
+serves the newest events held. The WebSocket takes the same typed commands as REST
 (`command{id, action, target, params, idempotency_key, expected_revision}`,
 answered by `reply{id, ok, result | problem}`) — `item.*`, `run.*`,
 `gate.approve`, `daemon.*`, `repository.resume`, `schedule.*` — with the same

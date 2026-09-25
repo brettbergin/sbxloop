@@ -79,7 +79,7 @@ def read_after(
     return the next page of what ``viewer`` may see."""
     chronology = views.ctx.chronology
     chronology.project(views.now)
-    if chronology.expired(after):
+    if chronology.expired(after, run_id=run_id):
         raise Problem(
             410,
             "cursor_expired",
