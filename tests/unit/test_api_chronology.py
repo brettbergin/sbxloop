@@ -179,6 +179,26 @@ class TestRetention:
         assert chron.expired(a) and chron.expired(0)
         assert chron.bounds() == (c, b)
 
+    def test_a_run_is_expired_only_when_it_lost_events_itself(
+        self, stores: tuple[StateStore, DaemonStore]
+    ) -> None:
+        store, dstore = stores
+        chron = Chronology(dstore)
+        _engine_events(store, "old", 2)
+        chron.project(now=10.0)
+        assert chron.prune(before=15.0) == 2
+        _engine_events(store, "fresh", 2)
+        chron.project(now=20.0)
+        # A run begun after the prune replays whole, from the start too,
+        # while the workspace chronology from the start would skip rows.
+        assert not chron.expired(0, run_id="fresh")
+        assert chron.expired(0)
+        # The run whose events went is refused, and so is one with nothing
+        # of the engine's to date it by: it cannot be told apart.
+        assert chron.expired(0, run_id="old")
+        chron.record("run.started", 30.0, run_id="unstarted")
+        assert chron.expired(0, run_id="unstarted")
+
 
 def test_event_ids_round_trip() -> None:
     assert event_id(7) == "evt_7" and parse_event_id("evt_7") == 7

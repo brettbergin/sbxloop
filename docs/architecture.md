@@ -2400,7 +2400,9 @@ from the store when the hub (`api/stream.py`, a thread-safe "something
 changed") says there may be more — a stream's whole state is a cursor, so
 a slow client blocks nobody and a dropped one resumes where it was. Pruned
 history is refused as `cursor_expired` from the highest `seq` ever pruned,
-never skipped past. The WebSocket's commands go through `api/commands.py`,
+never skipped past; a read narrowed to one run is refused only when that run
+lost events itself, so a run begun after the last prune replays whole from
+its start. The WebSocket's commands go through `api/commands.py`,
 the same functions the REST routes call, with the same idempotency scope.
 
 **Steering and gates (#1038).** A remote instruction is a record before it

@@ -2100,7 +2100,9 @@ typed commands on one WebSocket — a bearer token in the `Authorization` header
 or an `auth{token}` first frame (never the query string), `subscribe{after, run_id, type_prefix}`, and `command{id, action, target, params, idempotency_key, expected_revision}` for `item.admit`, `item.retry`,
 `item.requeue` and `item.abandon`, answered by `reply{id, ok, result | problem}` with the same body and the same idempotency the REST route has.
 History is kept for `[api] replay_retention_s`; a cursor below what remains is
-`410 cursor_expired` with a pointer to the snapshot, never a silent skip. Live
+`410 cursor_expired` with a pointer to the snapshot, never a silent skip. A
+read of one run is refused only when that run itself lost events to the
+prune. Live
 streams are bounded by `[api] max_stream_clients`.
 
 **Steering and deciding.** `POST /v1/runs/{id}/steering` (`runs:steer`; body

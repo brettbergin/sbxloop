@@ -114,7 +114,7 @@ class _Session:
                 views = Views(ctx)
                 internal = views.run_by_public_id(str(run_id)).run_id if run_id else None
                 ctx.chronology.project(views.now)
-                if ctx.chronology.expired(after):
+                if ctx.chronology.expired(after, run_id=internal):
                     raise Problem(
                         410,
                         "cursor_expired",
