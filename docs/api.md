@@ -79,11 +79,16 @@ answers:
  "oidc": {"id": "authentik", "label": "Authentik",
           "authorize_url": "https://auth.example.com/application/o/authorize/",
           "client_id": "angie", "scopes": ["openid", "email", "profile"],
-          "end_session_url": "https://auth.example.com/application/o/angie/end-session/"}}
+          "end_session_url": "https://auth.example.com/application/o/angie/end-session/",
+          "native_redirect_uris": []}}
 ```
 
 `oidc` is `null` when the section is off or the provider's discovery document
-cannot be read (a failed read is retried at most every 30 seconds). The client
+cannot be read (a failed read is retried at most every 30 seconds).
+`native_redirect_uris` lists the private-use scheme redirects (RFC 8252
+section 7.1, such as `com.example.app:/oauth2/callback`) a native app may
+present instead of the web redirect; with at least one configured,
+`GET /v1/capabilities` also lists the feature `auth.oidc.native`. The client
 runs Authorization Code + PKCE against `authorize_url` with its own `state`,
 `nonce` and `code_challenge`, then posts the code, without a bearer token:
 
@@ -101,8 +106,8 @@ within `leeway_s`, `azp` when present, a `sub`, and a `nonce` equal to the
 request's), creates the account on a first sign-in, and answers with the same
 `TokenResponse` a local login returns; refresh and revoke work as for any
 other client. Refusals: `400 oidc_invalid_request` (unknown `provider`, or a
-`redirect_uri` that is not exactly one of `redirect_uris`; the provider is not
-called), `401 oidc_exchange_failed` (the provider refused the code, or the ID
+`redirect_uri` that is not exactly one of `redirect_uris` or
+`native_redirect_uris`; the provider is not called), `401 oidc_exchange_failed` (the provider refused the code, or the ID
 token did not check out; the message is generic), `403 oidc_not_allowed`
 (outside `allowed_groups`), `403 oidc_account_disabled` (inactive, or removed
 from the workspace), `403 oidc_not_provisioned` (unknown person with

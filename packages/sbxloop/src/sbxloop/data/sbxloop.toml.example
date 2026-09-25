@@ -1005,6 +1005,9 @@ service_memory = "2g"
 # client_id = "angie"              # the confidential client registered there
 # client_secret_env = "SBXLOOP_OIDC_CLIENT_SECRET"  # the variable's NAME
 # redirect_uris = ["https://angie.example.com/auth/callback"]  # exact matches
+# native_redirect_uris = []        # a native app's redirects, exact matches, in
+#                                  # reverse-DNS private-use form (RFC 8252), e.g.
+#                                  # ["com.example.app:/oauth2/callback"]
 # scopes = ["openid", "email", "profile"]  # what the browser asks for
 # audience = ""                    # the ID token's aud; empty = client_id
 # algorithms = ["RS256", "ES256"]  # asymmetric signatures only

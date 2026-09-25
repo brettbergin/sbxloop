@@ -4606,6 +4606,13 @@
             "title": "Label",
             "type": "string"
           },
+          "native_redirect_uris": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Native Redirect Uris",
+            "type": "array"
+          },
           "scopes": {
             "items": {
               "type": "string"

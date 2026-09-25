@@ -265,6 +265,9 @@ class OidcProviderOut(ApiModel):
     client_id: str
     scopes: list[str]
     end_session_url: str | None
+    #: Private-use scheme redirects (RFC 8252 section 7.1) a native app may
+    #: present beside the web redirect; empty when none is configured.
+    native_redirect_uris: list[str] = Field(default_factory=list)
 
 
 class AuthProviders(ApiModel):

@@ -195,6 +195,7 @@ def _providers(ctx: ApiContext) -> AuthProviders:
                 client_id=settings.client_id,
                 scopes=list(settings.scopes),
                 end_session_url=discovery.end_session_endpoint,
+                native_redirect_uris=list(settings.native_redirect_uris),
             )
     return AuthProviders(
         local=ctx.api.local_auth_enabled,
@@ -289,7 +290,7 @@ async def oidc_token(
     if (
         provider is None
         or body.provider != provider.config.id
-        or body.redirect_uri not in provider.config.redirect_uris
+        or not provider.config.allows_redirect(body.redirect_uri)
     ):
         _failed(ctx, keys)
         raise Problem(

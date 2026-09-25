@@ -86,6 +86,8 @@ def features(config: Config) -> list[str]:
     if config.api.oidc.enabled:
         served.append("auth.oidc")
         served.append("auth.oidc.backchannel_logout")
+        if config.api.oidc.native_redirect_uris:
+            served.append("auth.oidc.native")
     return served
 
 
