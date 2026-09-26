@@ -1917,11 +1917,11 @@ class DaemonConfig(_ConfigModel):
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"
-    # The workspace's daily token budget: input plus output tokens reported
-    # by every run and every chat turn since 00:00 in `run_cap_timezone`.
-    # Once reached, no new run starts and no chat turn, whoever asked for
-    # it, is sent to the model until the next day; the person is told so
-    # in reply. Unset: tokens never refuse work.
+    # The workspace's daily token admission threshold: input plus output
+    # tokens reported by runs and chat turns since 00:00 in `run_cap_timezone`.
+    # Once reached, no new run or chat turn starts until the next day.
+    # In-flight work continues and concurrent starts can exceed the threshold.
+    # Unset: tokens never refuse work.
     daily_token_budget: int | None = Field(default=None, ge=1)
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
