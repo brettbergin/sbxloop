@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+**A removed local member can rejoin with a new invite at login.** The
+account's username and email remain reserved after removal, so registering
+again could not work. The existing login now accepts an optional
+`invite_token`, checks the password first, restores membership with the
+invite's role and returns tokens with the new capabilities. The old
+`set_role` helper uses the audited member update path. (#1238)
+
 **An agent's daily cap and its "already asked" check hold when two turns
 start work at once, and a failed or day-old ask can be asked again.** An
 agent that may start work (`can_start`) was refused the same wording
