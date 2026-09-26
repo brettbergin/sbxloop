@@ -62,6 +62,7 @@ from sbxloop.api.guardrails import Guardrails
 from sbxloop.api.mentions import MENTION, MentionRouter, addressed_slugs
 from sbxloop.api.pdf_analysis import ChannelPdfAnalysis
 from sbxloop.api.publicids import PublicIds
+from sbxloop.api.push import PushService
 from sbxloop.api.stream import StreamHub
 from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
@@ -381,6 +382,10 @@ class ApiContext:
         self._summaries: ChannelSummarizer | None = None
         self._oidc: tuple[Any, Any] | None = None
         self._guardrails: Guardrails | None = None
+        self._push: PushService | None = None
+        #: The HTTP transport the push relay is reached through; ``None``
+        #: is the network. A test mounts its fake relay here.
+        self.relay_transport: Any = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -620,6 +625,26 @@ class ApiContext:
                 pool=getattr(self.loop, "usage_pool", None),
             )
         return self._guardrails
+
+    @property
+    def push(self) -> PushService:
+        """Devices, their notifications and the dispatcher that pings them."""
+        if self._push is None:
+            self._push = PushService(
+                self.loop.dstore,
+                lambda: self.config,
+                clock=self.clock,
+                agent_name=self._agent_name,
+                transport=lambda: self.relay_transport,
+            )
+        return self._push
+
+    def _agent_name(self, slug: str | None) -> str:
+        """An agent as a notification names it: its display name, and the
+        default assistant for a reply nobody is named on."""
+        slug = slug or ANGIE_SLUG
+        agent = self.agents.get(slug)
+        return agent.spec.name if agent is not None else slug
 
     @property
     def collaboration_available(self) -> bool:
@@ -1827,3 +1852,5 @@ class ApiContext:
         if running:
             wait_for_futures(running, timeout=COMPACTION_CLOSE_WAIT_S)
         self.turns.shutdown()
+        if self._push is not None:
+            self._push.stop()

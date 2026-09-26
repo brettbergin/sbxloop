@@ -847,6 +847,33 @@ def test_example_collaboration_section_documents_the_defaults() -> None:
     assert Config.model_validate({"collaboration": block}).collaboration == Config().collaboration
 
 
+def test_example_push_section_documents_the_defaults() -> None:
+    """The commented `[push]` block, uncommented whole, loads and equals the
+    model's defaults: push is off, names no relay, and the retry bounds it
+    advertises are the ones the dispatcher applies."""
+    text = ""
+    in_block = False
+    for line in DEFAULT_CONFIG_TOML.splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[push]":
+            in_block = True
+        elif in_block and re.match(r"^[a-z_]+ = ", stripped):
+            text += re.sub(r"\s{2,}#.*$", "", stripped) + "\n"
+        elif in_block and not line.strip():
+            break
+    block = tomllib.loads(text)
+    assert set(block) == {
+        "enabled",
+        "relay_url",
+        "timeout_s",
+        "max_attempts",
+        "backoff_s",
+        "backoff_max_s",
+        "max_devices_per_user",
+    }
+    assert Config.model_validate({"push": block}).push == Config().push
+
+
 def test_example_documents_the_ambient_model_as_an_opt_in() -> None:
     """`[collaboration] ambient_model` ships unset, so the classifier reuses
     the concierge's model until an operator names a cheaper one. It is shown

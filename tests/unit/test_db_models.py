@@ -62,6 +62,8 @@ API_TABLES = (
     "api_public_ids",
     "api_steering",
     "api_artifacts",
+    "api_push_devices",
+    "api_push_notifications",
 )
 COLLABORATION_TABLES = (
     "collaboration_users",

@@ -3035,6 +3035,62 @@ class ApiConfig(_ConfigModel):
         return value
 
 
+class PushConfig(_ConfigModel):
+    """Push notifications to people's mobile devices, through a push relay.
+
+    Off by default. On, with ``relay_url`` naming the relay, a signed-in
+    person may register a device (``/v1/users/me/devices``) and the daemon
+    pings it — through the relay, which alone holds the push provider's key
+    — when something they are waiting on happens. A ping carries only a
+    kind and an opaque reference: the relay and the provider never see what
+    was said, and the device fetches that from this daemon. Workspace-wide,
+    not per repository: a device belongs to a person, not to a repo.
+    """
+
+    enabled: bool = False
+    #: The relay's base URL (``http(s)://host[:port][/base]``); empty means
+    #: none, and registration is refused naming this key.
+    relay_url: str = ""
+    #: Each call to the relay, enrollment and push alike.
+    timeout_s: float = Field(default=10.0, gt=0, le=120)
+    #: How many times one push is tried before it is given up on.
+    max_attempts: int = Field(default=5, ge=1, le=20)
+    #: The first retry's delay; each further retry doubles it.
+    backoff_s: float = Field(default=2.0, gt=0)
+    #: The longest a retry waits, whatever the doubling or a relay's
+    #: ``Retry-After`` says.
+    backoff_max_s: float = Field(default=300.0, gt=0)
+    #: How many devices one person may register.
+    max_devices_per_user: int = Field(default=20, ge=1, le=200)
+
+    @field_validator("relay_url")
+    @classmethod
+    def _relay_is_an_http_origin(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        parts = urlsplit(value)
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or parts.query
+            or parts.fragment
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise ValueError(
+                "push.relay_url must be an http(s):// URL with a host and no "
+                f"credentials, query or fragment, got {value!r}"
+            )
+        return value.rstrip("/")
+
+    @property
+    def available(self) -> bool:
+        """Whether devices can be registered and pinged: switched on, with
+        a relay to ping them through."""
+        return self.enabled and bool(self.relay_url)
+
+
 class MemoryConfig(_ConfigModel):
     """Each agent's long-term memory: what it (or a person) chose to keep
     beyond one conversation, scoped by the channel it was learned in.
@@ -3189,6 +3245,8 @@ class Config(_ConfigModel):
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    # Push notifications to people's devices through a push relay.
+    push: PushConfig = Field(default_factory=PushConfig)
     entrygraph: EntrygraphConfig = Field(default_factory=EntrygraphConfig)
     # Named bounds for workload runs (#758) and the one a run gets by
     # default; a code run ignores both.

@@ -1620,6 +1620,16 @@
         "title": "ChannelMemberUserOut",
         "type": "object"
       },
+      "ChannelNotify": {
+        "description": "How much of one channel reaches a device: ``all`` of it (the\ndefault), only ``mentions`` of the device's owner, or ``none``.",
+        "enum": [
+          "all",
+          "mentions",
+          "none"
+        ],
+        "title": "ChannelNotify",
+        "type": "string"
+      },
       "ChannelOut": {
         "additionalProperties": false,
         "properties": {
@@ -2556,6 +2566,205 @@
           "detail"
         ],
         "title": "DetailOut",
+        "type": "object"
+      },
+      "DeviceIn": {
+        "additionalProperties": false,
+        "description": "Register a device, or update the one already registered with the same\ntoken. Registering enrolls the token with the push relay; so does a\nchange of `env`.",
+        "properties": {
+          "env": {
+            "$ref": "#/components/schemas/PushEnvironment",
+            "description": "The gateway the token was issued for."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A label the person recognises.",
+            "title": "Name"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/DevicePlatform",
+            "description": "The push platform."
+          },
+          "prefs": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DevicePrefs"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which pushes this device wants. Omitted on a new device: everything. Omitted on an update: unchanged."
+          },
+          "server_ref": {
+            "description": "The client's own opaque name for this server, echoed in every push as `srv` so a client registered with several servers knows which one to ask.",
+            "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+            "title": "Server Ref",
+            "type": "string"
+          },
+          "token": {
+            "description": "The device push token, hex. Stored only as a digest; never returned.",
+            "pattern": "^[0-9A-Fa-f]{64,200}$",
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "platform",
+          "token",
+          "env",
+          "server_ref"
+        ],
+        "title": "DeviceIn",
+        "type": "object"
+      },
+      "DeviceOut": {
+        "additionalProperties": false,
+        "description": "A registered device, as its owner sees it.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "env": {
+            "$ref": "#/components/schemas/PushEnvironment"
+          },
+          "id": {
+            "description": "The device id (`dev_\u2026`).",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_push_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When a push last reached the relay for it.",
+            "title": "Last Push At"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/DevicePlatform"
+          },
+          "prefs": {
+            "$ref": "#/components/schemas/DevicePrefs"
+          },
+          "server_ref": {
+            "title": "Server Ref",
+            "type": "string"
+          },
+          "token_suffix": {
+            "description": "The token's last six characters, to tell devices apart.",
+            "title": "Token Suffix",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "platform",
+          "env",
+          "server_ref",
+          "name",
+          "prefs",
+          "token_suffix",
+          "created_at",
+          "updated_at",
+          "last_push_at"
+        ],
+        "title": "DeviceOut",
+        "type": "object"
+      },
+      "DevicePage": {
+        "additionalProperties": false,
+        "description": "The caller's devices, oldest first.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeviceOut"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "DevicePage",
+        "type": "object"
+      },
+      "DevicePlatform": {
+        "description": "The push platform a device registers for.",
+        "enum": [
+          "ios"
+        ],
+        "title": "DevicePlatform",
+        "type": "string"
+      },
+      "DevicePrefs": {
+        "additionalProperties": false,
+        "description": "Which pushes a device wants. Every kind is on by default; a channel\nabsent from ``per_channel`` gets ``all``.",
+        "properties": {
+          "failures": {
+            "default": true,
+            "description": "Work or a reply you asked for could not finish.",
+            "title": "Failures",
+            "type": "boolean"
+          },
+          "gates": {
+            "default": true,
+            "description": "Work is waiting on your decision.",
+            "title": "Gates",
+            "type": "boolean"
+          },
+          "mentions": {
+            "default": true,
+            "description": "Another person mentioned you.",
+            "title": "Mentions",
+            "type": "boolean"
+          },
+          "per_channel": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ChannelNotify"
+            },
+            "description": "Channel id to how much of that channel reaches this device. `none` silences the channel, `mentions` lets only mentions through.",
+            "maxProperties": 500,
+            "title": "Per Channel",
+            "type": "object"
+          },
+          "work": {
+            "default": true,
+            "description": "Work or a reply you asked for arrived.",
+            "title": "Work",
+            "type": "boolean"
+          }
+        },
+        "title": "DevicePrefs",
         "type": "object"
       },
       "DiscoveryCredential": {
@@ -4575,6 +4784,18 @@
         "title": "MessageOut",
         "type": "object"
       },
+      "NotificationKind": {
+        "description": "What a push is about.\n\n``mention``: another person named you in a channel. ``gate``: work is\nwaiting on a decision you can make. ``work``: work or a reply you asked\nfor arrived. ``failure``: work or a reply you asked for could not\nfinish. ``test``: a test push you asked for.",
+        "enum": [
+          "mention",
+          "gate",
+          "work",
+          "failure",
+          "test"
+        ],
+        "title": "NotificationKind",
+        "type": "string"
+      },
       "OidcProviderOut": {
         "additionalProperties": false,
         "description": "What a signed-out browser needs to start Authorization Code + PKCE.",
@@ -5511,6 +5732,92 @@
           }
         },
         "title": "PullRequest",
+        "type": "object"
+      },
+      "PushEnvironment": {
+        "description": "Which push gateway issued the token: a development build's\n``sandbox`` or a distributed build's ``production``.",
+        "enum": [
+          "sandbox",
+          "production"
+        ],
+        "title": "PushEnvironment",
+        "type": "string"
+      },
+      "PushNotificationOut": {
+        "additionalProperties": false,
+        "description": "What a push was about: the text a device shows in place of the\nrelay's generic alert.",
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "channel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The channel it happened in, when one did.",
+            "title": "Channel Id"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NotificationKind"
+          },
+          "ref": {
+            "description": "The ref the push carried.",
+            "title": "Ref",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The turn it answers, when it answers one.",
+            "title": "Turn Id"
+          }
+        },
+        "required": [
+          "ref",
+          "kind",
+          "channel_id",
+          "turn_id",
+          "title",
+          "body",
+          "created_at"
+        ],
+        "title": "PushNotificationOut",
+        "type": "object"
+      },
+      "PushTestOut": {
+        "additionalProperties": false,
+        "description": "A test push, queued.",
+        "properties": {
+          "ref": {
+            "description": "The test notification's ref, fetchable once pushed.",
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "title": "PushTestOut",
         "type": "object"
       },
       "QueueEntry": {
@@ -14815,6 +15122,176 @@
         ]
       }
     },
+    "/v1/users/me/devices": {
+      "get": {
+        "operationId": "list_devices_v1_users_me_devices_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevicePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List your devices",
+        "tags": [
+          "push"
+        ]
+      },
+      "post": {
+        "description": "Register the device, or update the one already registered with this\ntoken (`201` created, `200` updated). A new device, or a change of\n`env`, is enrolled with the push relay before this answers; a relay that\nrefuses or cannot be reached is `502`, push switched off `503`.",
+        "operationId": "register_device_v1_users_me_devices_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceOut"
+                }
+              }
+            },
+            "description": "The device was already registered; updated."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "503": {
+            "description": "A refusal, as `application/problem+json`."
+          }
+        },
+        "summary": "Register a device for push notifications",
+        "tags": [
+          "push"
+        ]
+      }
+    },
+    "/v1/users/me/devices/{device_id}": {
+      "delete": {
+        "operationId": "delete_device_v1_users_me_devices__device_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove a device",
+        "tags": [
+          "push"
+        ]
+      }
+    },
+    "/v1/users/me/devices/{device_id}/test": {
+      "post": {
+        "description": "Queue a `test` push to this device, whatever its preferences; its\nnotification reads \"Test notification\".",
+        "operationId": "send_test_push_v1_users_me_devices__device_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushTestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "409": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "A refusal, as `application/problem+json`."
+          }
+        },
+        "summary": "Send a test push to one device",
+        "tags": [
+          "push"
+        ]
+      }
+    },
     "/v1/users/me/identities": {
       "get": {
         "operationId": "list_identities_v1_users_me_identities_get",
@@ -14891,6 +15368,52 @@
         "summary": "Delete Identity",
         "tags": [
           "collaboration"
+        ]
+      }
+    },
+    "/v1/users/me/notifications/{ref}": {
+      "get": {
+        "description": "The text a device shows for the push that carried `ref`.",
+        "operationId": "get_notification_v1_users_me_notifications__ref__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushNotificationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "A refusal, as `application/problem+json`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read what a push was about",
+        "tags": [
+          "push"
         ]
       }
     },

@@ -245,3 +245,56 @@ class ArtifactRow(Base):
     recorded_at: Mapped[float] = mapped_column(REAL, nullable=False)
     available: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     tombstoned_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class PushDeviceRow(Base):
+    """A person's mobile device, registered for push notifications.
+
+    The device's push token is kept only as a digest (the upsert key) and
+    its last six characters (what a person recognises it by); the relay's
+    opaque ``handle`` is what a push is addressed to. An empty handle is
+    one the relay stopped recognising: the device is re-enrolled the next
+    time it registers.
+    """
+
+    __tablename__ = "api_push_devices"
+    __table_args__ = (
+        UniqueConstraint("user_id", "token_digest"),
+        Index("idx_api_push_devices_user", "user_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    token_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    token_suffix: Mapped[str] = mapped_column(Text, nullable=False)
+    env: Mapped[str] = mapped_column(Text, nullable=False)
+    server_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str | None] = mapped_column(Text)
+    prefs_json: Mapped[str] = mapped_column(Text, nullable=False)
+    handle: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    last_push_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class PushNotificationRow(Base):
+    """What one push was about, for the one person it was for: the text a
+    device shows once it fetches it by ``ref``. Pruned with the public
+    chronology."""
+
+    __tablename__ = "api_push_notifications"
+    __table_args__ = (
+        Index("idx_api_push_notifications_user", "user_id", "created_at"),
+        Index("idx_api_push_notifications_created", "created_at"),
+    )
+
+    ref: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str | None] = mapped_column(Text)
+    turn_id: Mapped[str | None] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    event_seq: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)

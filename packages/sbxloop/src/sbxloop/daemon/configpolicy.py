@@ -28,6 +28,7 @@ NEVER_FROM_CHAT: dict[str, str] = {
     "mattermost": "it configures the chat channel the outcome is reported on",
     "tui": "it configures the operator console's own bridge",
     "api": "it opens the host's remote listener and sets who it trusts",
+    "push": "it names the relay every registered device's push handle is sent to",
     "concierge.enabled": "it is the concierge's own switch",
     "concierge.edit_config": "it is the gate on these tools — no self-widening",
     "concierge.config_locked": "it is the lock list these tools honour — no self-widening",
