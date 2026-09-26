@@ -43,6 +43,7 @@ FEATURES: tuple[str, ...] = (
     "daemon.holds",
     "daemon.lifecycle",
     "repositories.resume",
+    "repositories.issues",
     "schedules",
     "auth.local_user",
     "collaboration.channels",

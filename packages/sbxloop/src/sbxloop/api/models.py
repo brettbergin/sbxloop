@@ -568,6 +568,16 @@ class RepositoryDiscovery(ApiModel):
     truncated: bool = False
 
 
+class OpenIssue(ApiModel):
+    number: int
+    title: str
+
+
+class OpenIssuePage(ApiModel):
+    data: list[OpenIssue]
+    has_more: bool
+
+
 class Profile(ApiModel):
     id: str
     name: str
