@@ -206,6 +206,9 @@ class TestTransport:
                     assert r.status_code == 200
                     assert r.headers["content-type"].startswith("text/event-stream")
                     assert "no-transform" in r.headers["cache-control"]
+                    # A client that sniffs the first bytes before handing
+                    # over a response would otherwise hold an idle stream.
+                    assert r.headers["x-content-type-options"] == "nosniff"
                     got = 0
                     for line in r.iter_lines():
                         yield line

@@ -50,3 +50,25 @@ def test_every_response_carries_a_request_id(tmp_path: Path) -> None:
         echoed = client.get("/health/live", headers={"X-Request-Id": "abc-123"})
         assert echoed.headers["X-Request-Id"] == "abc-123"
     api.ctx.close()
+
+
+def test_every_response_forbids_content_sniffing(tmp_path: Path) -> None:
+    """Every answer declares its own type and says so: a client never holds
+    a response back to guess it, a problem and a refused body included."""
+    api = build(tmp_path)
+    with api.client as client:
+        responses = [
+            client.get("/health/live"),
+            client.get("/v1/openapi.json"),
+            client.get("/v1/capabilities"),
+            client.post(
+                "/v1/auth/token",
+                content=b"{}",
+                headers={"Content-Length": str(api.ctx.api.max_body_bytes + 1)},
+            ),
+        ]
+        assert [r.status_code for r in responses] == [200, 200, 401, 413]
+        for response in responses:
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers.get_list("X-Content-Type-Options") == ["nosniff"]
+    api.ctx.close()

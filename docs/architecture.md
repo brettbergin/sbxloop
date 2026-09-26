@@ -2300,7 +2300,9 @@ authenticates a `Principal` from a bearer token, builds a `ControlService`
 over the loop, and calls it on the context's bounded executor — the stores'
 single connections and the loop's locks are never touched from the event
 loop thread. Refusals are `application/problem+json` with the `ControlError`
-code mapped to a status; every response carries an `X-Request-Id`.
+code mapped to a status; every response carries an `X-Request-Id` and
+`X-Content-Type-Options: nosniff`, so no client holds a response back to guess
+its type (an event stream that has sent only a few bytes would look unopened).
 
 The additive collaboration layer gives local product clients durable users,
 channels, messages, turns, teams, preferences, workflow definitions, and a

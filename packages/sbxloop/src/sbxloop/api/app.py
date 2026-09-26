@@ -1,5 +1,7 @@
 """The FastAPI application: routers, error rendering, the two middlewares.
 
+Every response carries its request id and ``X-Content-Type-Options: nosniff``.
+
 ``create_app`` builds it over an :class:`ApiContext`; the daemon serves it
 through :class:`~sbxloop.api.server.ApiServer`, a test through Starlette's
 client. OpenAPI is published at ``/v1/openapi.json``; the interactive docs
@@ -113,6 +115,11 @@ def create_app(ctx: ApiContext) -> FastAPI:
                 duration_ms=round((time.monotonic() - started) * 1000, 1),
             )
         response.headers["X-Request-Id"] = request.state.request_id
+        # Every answer states its own type. Said outright, a client has no
+        # reason to hold the first bytes of a response back to guess one,
+        # which would leave an event stream that has sent less than that
+        # looking unopened until enough events arrive.
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response
 
     @app.middleware("http")
