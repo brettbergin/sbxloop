@@ -6,9 +6,11 @@ names (the same boundary the run cap has always used):
 
 * the run cap, ``[daemon] max_runs_per_day``, counted exactly as the loop
   counts it (fresh starts plus resumes); it applies to runs only;
-* the token budget, ``[daemon] daily_token_budget``: input plus output
-  tokens reported by runs *and* chat turns since the day began. Unset, it
-  never refuses. Cache figures are recorded but are not budget.
+* the token admission threshold, ``[daemon] daily_token_budget``: input plus
+  output tokens reported by runs *and* chat turns since the day began. It
+  checks reported spend before new work starts; concurrent starts and work
+  already in flight can take the final daily total above the threshold.
+  Unset, it never refuses. Cache figures are recorded but are not budget.
 
 Charges land in ``workspace_usage``: a run's ``agent.usage`` events through
 :meth:`UsagePool.subscriber` on the run's bus, and a chat turn's reported
