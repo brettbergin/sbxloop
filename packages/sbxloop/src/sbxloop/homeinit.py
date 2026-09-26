@@ -488,7 +488,7 @@ class HomeInit:
                 f"no {self.home.sbx_launcher.name} wrapper: Docker's MSI owns sbx.exe"
             )
         for path, name in written:
-            path.write_text(template(name))
+            path.write_text(template(name), encoding="utf-8")
             if not self.home.windows:
                 path.chmod(0o755)
         self.report.done.append("launchers")
@@ -603,7 +603,7 @@ class HomeInit:
         if not self._sbx_binary().exists():
             return None
         try:
-            stamped = self.home.sbx_version_file.read_text().strip() or None
+            stamped = self.home.sbx_version_file.read_text(encoding="utf-8").strip() or None
         except OSError:
             return None
         # The MSI is per user, not per home. Another home may have replaced
@@ -669,7 +669,7 @@ class HomeInit:
                     f"{self.home.sbx_prefix} {installer.name} from the release tarball"
                 )
             self._verify_sbx(wanted, env)
-        self.home.sbx_version_file.write_text(wanted + "\n")
+        self.home.sbx_version_file.write_text(wanted + "\n", encoding="utf-8")
         if partial is None:
             self.report.done.append(f"sbx {wanted}")
         else:
@@ -695,7 +695,7 @@ class HomeInit:
                     ) from exc
             self._verify_sbx(wanted, self.env)
         self.home.sbx_prefix.mkdir(parents=True, exist_ok=True)
-        self.home.sbx_version_file.write_text(wanted + "\n")
+        self.home.sbx_version_file.write_text(wanted + "\n", encoding="utf-8")
         self.report.done.append(f"sbx {wanted}")
         if reboot:
             self.report.notes.append("the sbx MSI requested a reboot before the backend can start")
@@ -757,7 +757,7 @@ class HomeInit:
         with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
             listing = Path(scratch) / "release.json"
             self.fetch(SBX_RELEASES_API.format(tag=tag), listing)
-            data = json.loads(listing.read_text())
+            data = json.loads(listing.read_text(encoding="utf-8"))
         assets = [
             a["browser_download_url"]
             for a in data.get("assets", [])
@@ -776,11 +776,13 @@ class HomeInit:
 
         wrote: list[str] = []
         if self.options.force or not self.home.config_toml.exists():
-            self.home.config_toml.write_text(render_config_template(self.options.preset))
+            self.home.config_toml.write_text(
+                render_config_template(self.options.preset), encoding="utf-8"
+            )
             wrote.append(self.home.config_toml.name)
         if not self.home.secrets_env.exists():
             create_private(self.home.secrets_env, os_name=self.home.os_name)
-            self.home.secrets_env.write_text(secrets_env_template())
+            self.home.secrets_env.write_text(secrets_env_template(), encoding="utf-8")
             wrote.append(self.home.secrets_env.name)
         make_private(self.home.secrets_env, os_name=self.home.os_name)
         if wrote:
@@ -809,7 +811,7 @@ class HomeInit:
         self.user_units.mkdir(parents=True, exist_ok=True)
         for name in self.unit_names:
             rendered = render_unit(name, self.home, runner_dir=self.options.runner_dir)
-            self.home.unit(name).write_text(rendered)
+            self.home.unit(name).write_text(rendered, encoding="utf-8")
             link = self.user_units / name
             if link.exists() and not link.is_symlink():
                 backup = self.home.backups / "units"

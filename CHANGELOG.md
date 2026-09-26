@@ -3,7 +3,8 @@
 **Native Windows installs can bootstrap Docker Sandboxes.** `sbxloop init`
 uses Astral's PowerShell uv installer and Docker's pinned per-user MSI,
 checks `sbx.exe version`, and records the installed version only after that
-check passes. The host gate now lets Windows reach backend readiness checks;
+check passes. Home text is written as UTF-8 so the config template works on
+Windows consoles using a legacy code page. The host gate now lets Windows reach backend readiness checks;
 the Windows CI job installs the real MSI and initializes a home. Live sandbox
 boot on a Windows Hypervisor Platform host remains field-unverified. (#899)
 

@@ -208,7 +208,10 @@ jobs:
           uv build --package sbxloop-worker -o dist
           uv build --package sbxloop -o dist
           uv run --no-sync --python 3.13 sbxloop init --no-systemd --wheels dist
+          if ($LASTEXITCODE -ne 0) { throw "sbxloop init failed" }
           & "$env:LOCALAPPDATA\DockerSandboxes\bin\sbx.exe" version
+          if ($LASTEXITCODE -ne 0) { throw "sbx version failed" }
+          if (!(Test-Path "$env:SBXLOOP_HOME\sbx\VERSION")) { throw "init did not verify sbx" }
           if (!(Test-Path "$env:SBXLOOP_HOME\home.json")) { throw "init did not record the home" }
 
   test:

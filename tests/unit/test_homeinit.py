@@ -306,6 +306,30 @@ class TestWindowsHost:
             init.execute()
         assert not home.sbx_version_file.exists()
 
+    def test_generated_config_is_written_as_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        original = Path.write_text
+        encodings: list[str | None] = []
+
+        def recording_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+            if path == home.config_toml:
+                encodings.append(kwargs.get("encoding"))
+            return original(path, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", recording_write)
+        HomeInit(
+            home,
+            InitOptions(version="1.2.3", sbx=False),
+            env={"USERPROFILE": str(tmp_path), "PATH": ""},
+            run=FakeRun(home),
+            fetch=FakeFetch(),
+            system="Windows",
+            machine="AMD64",
+        ).execute()
+        assert encodings == ["utf-8"]
+
     def test_the_secrets_file_is_restricted_not_chmodded(
         self, tmp_path: Path, icacls: list[list[str]]
     ) -> None:
