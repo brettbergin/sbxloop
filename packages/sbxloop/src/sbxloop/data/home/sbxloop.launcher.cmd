@@ -6,10 +6,8 @@ rem home it lives in and runs the venv's sbxloop. There are no secrets in this
 rem file — sbxloop reads config\secrets.env itself, and nothing is exported to
 rem other processes.
 rem
-rem A native Windows host cannot boot sandboxes (Docker Sandboxes ships no
-rem native Windows `sbx`), so there is no sbx wrapper beside this one and the
-rem commands that need one refuse by name. The read-only commands — doctor,
-rem config, logs — answer, so the refusal can be diagnosed from the host.
+rem Docker's per-user MSI owns sbx.exe outside this home; the Python client
+rem resolves it from LOCALAPPDATA. No sbx wrapper is needed beside this one.
 setlocal
 set "SBXLOOP_HOME=%~dp0.."
 set "PATH=%~dp0;%PATH%"

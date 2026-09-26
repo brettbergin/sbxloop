@@ -4,16 +4,16 @@ One idempotent command builds everything a host needs under the home
 (:mod:`sbxloop.paths`):
 
 1. the directory tree, with ``config/`` private;
-2. the launchers ``bin/sbxloop`` and ``bin/sbx`` — bound to the home they
-   live in, exporting no secrets;
+2. the ``sbxloop`` launcher and, on POSIX, the ``sbx`` launcher — bound to
+   the home they live in, exporting no secrets;
 3. the interpreter: ``uv`` in ``bin/``, a uv-managed CPython under
    ``python/``, and ``venv/`` with ``sbxloop[discord,slack]`` and the
    worker pinned to this exact version (skipped when init already runs
    from that venv) — every uv command pointed at the home's own
    directories, never the ones the invoking user's environment names;
-4. Docker's ``sbx``, installed by its own installer with the home as
-   ``PREFIX``, pinned to the series sbxloop is tested against and recorded
-   in ``sbx/VERSION`` only once the installed executable reports it;
+4. Docker's ``sbx``, installed under the home on POSIX or by its per-user MSI
+   on Windows, pinned to the tested series and recorded in ``sbx/VERSION``
+   only once the installed executable reports it;
 5. ``config/sbxloop.toml`` from the packaged template and
    ``config/secrets.env`` (0600) from the packaged example — never
    overwritten unless asked;
@@ -48,10 +48,9 @@ from pathlib import Path
 import sbxloop
 from sbxloop.errors import SbxloopError
 from sbxloop.hostfiles import create_private, make_private
-from sbxloop.hostos import WSL2_GUIDE
 from sbxloop.hostprep import SBIN_PATH, HostPrep
 from sbxloop.log import get_logger
-from sbxloop.paths import SbxloopHome
+from sbxloop.paths import SbxloopHome, windows_sbx_binary
 from sbxloop.sbx.parse import parse_version
 
 log = get_logger(__name__)
@@ -62,6 +61,7 @@ log = get_logger(__name__)
 SBX_VERSION = "0.43.0"
 SBX_RELEASES_API = "https://api.github.com/repos/docker/sbx-releases/releases/tags/{tag}"
 UV_INSTALLER_URL = "https://astral.sh/uv/install.sh"
+UV_WINDOWS_INSTALLER_URL = "https://astral.sh/uv/install.ps1"
 PYTHON_SERIES = "3.13"
 INSTALL_EXTRAS = "discord,slack"
 #: The units `--systemd` renders and enables; the runner unit is opt-in.
@@ -311,7 +311,9 @@ def _apparmor_only_failure(detail: str) -> bool:
 
 
 def sbx_asset_name_matches(name: str, *, system: str, machine: str) -> bool:
-    """Whether a docker/sbx-releases asset is the tarball for this host."""
+    """Whether a docker/sbx-releases asset installs this host's build."""
+    if system.lower() == "windows":
+        return machine.lower() in ("amd64", "x86_64") and name == "DockerSandboxes.msi"
     if not name.endswith(".tar.gz"):
         return False
     lowered = name.lower()
@@ -394,10 +396,12 @@ class HomeInit:
             )
         if self.options.sbx:
             installed = self._installed_sbx_version()
-            if self.home.windows:
-                steps.append(("sbx", f"refuse: {self.SBX_UNSUPPORTED}"))
-            elif installed == self.options.sbx_version:
-                steps.append(("sbx", f"keep sbx {installed} at {home.sbx_binary}"))
+            if installed == self.options.sbx_version:
+                steps.append(("sbx", f"keep sbx {installed} at {self._sbx_binary()}"))
+            elif self.home.windows:
+                steps.append(
+                    ("sbx", f"install sbx {self.options.sbx_version} from its per-user MSI")
+                )
             else:
                 steps.append(
                     ("sbx", f"install sbx {self.options.sbx_version} under {home.sbx_prefix}")
@@ -452,6 +456,10 @@ class HomeInit:
             self.report.notes.append(f"host preparation needed — {device.name}: {device.message}")
         if not self.options.sbx:
             return
+        if self.home.windows:
+            self._sbx_binary()
+            if self.machine.lower() not in ("amd64", "x86_64"):
+                raise InitError(f"Docker's per-user MSI supports Windows x64, not {self.machine}")
         tools = self.prep.filesystem_tools()
         if tools.applicable and not tools.ready:
             raise InitError(f"this host cannot install the sandbox backend — {tools.message}")
@@ -464,11 +472,8 @@ class HomeInit:
         """``bin/``: the command that binds a shell to this home, and — on a
         host that can boot sandboxes — the wrapper around its own ``sbx``.
 
-        Windows gets neither POSIX file. A ``#!/bin/sh`` script named
-        ``bin\\sbxloop`` is not something cmd or PowerShell can run, and
-        there is no native Windows ``sbx`` for a wrapper to stand in front
-        of (:mod:`sbxloop.hostos`), so writing one would promise a sandbox
-        runtime this host does not have.
+        Windows gets its native ``.cmd`` launcher; Docker's MSI owns the
+        native ``sbx.exe`` and places it outside the sbxloop home.
         """
         written: list[tuple[Path, str]] = [
             (
@@ -480,7 +485,7 @@ class HomeInit:
             written.append((self.home.sbx_launcher, "sbx.launcher.sh"))
         else:
             self.report.notes.append(
-                f"no {self.home.sbx_launcher.name} wrapper: this host has no native sbx"
+                f"no {self.home.sbx_launcher.name} wrapper: Docker's MSI owns sbx.exe"
             )
         for path, name in written:
             path.write_text(template(name))
@@ -541,7 +546,7 @@ class HomeInit:
         return self._run_env(argv, self._uv_env())
 
     def _ensure_uv(self) -> Path:
-        """``bin/uv``: the home's own, downloaded with Astral's installer into
+        """The home's own uv, downloaded with Astral's installer into
         ``bin/`` when missing (UV_INSTALL_DIR, no PATH edits). A ``uv`` already
         on PATH is used only to bootstrap, never relied on afterwards."""
         uv = self.home.uv
@@ -554,9 +559,23 @@ class HomeInit:
             self.report.notes.append(f"copied uv from {on_path}")
             return uv
         with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
-            script = Path(scratch) / "uv-install.sh"
-            self.fetch(UV_INSTALLER_URL, script)
-            self._uv_run(["sh", str(script)])
+            if self.home.windows:
+                script = Path(scratch) / "uv-install.ps1"
+                self.fetch(UV_WINDOWS_INSTALLER_URL, script)
+                self._uv_run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(script),
+                    ]
+                )
+            else:
+                script = Path(scratch) / "uv-install.sh"
+                self.fetch(UV_INSTALLER_URL, script)
+                self._uv_run(["sh", str(script)])
         if not uv.exists():
             raise InitError(f"the uv installer did not leave {uv} behind")
         return uv
@@ -581,29 +600,33 @@ class HomeInit:
     # -- sbx ----------------------------------------------------------------------
 
     def _installed_sbx_version(self) -> str | None:
-        if not self.home.sbx_binary.exists():
+        if not self._sbx_binary().exists():
             return None
         try:
-            return self.home.sbx_version_file.read_text().strip() or None
+            stamped = self.home.sbx_version_file.read_text().strip() or None
         except OSError:
             return None
+        # The MSI is per user, not per home. Another home may have replaced
+        # its binary since this home's marker was written.
+        if stamped and self.home.windows and self._sbx_problem(stamped, self.env) is not None:
+            return None
+        return stamped
 
-    #: What `init --sbx` says on a host the sandbox runtime has no build for.
-    #: The assets are a POSIX `.tar.gz` around an `install.sh`, so the step
-    #: cannot be attempted: it is refused before anything is downloaded,
-    #: rather than failing part-way through with a path or shell error.
-    SBX_UNSUPPORTED = (
-        "the sandbox runtime (Docker Sandboxes, `sbx`) has no native Windows build, so "
-        "`sbxloop init --sbx` cannot install one here; " + WSL2_GUIDE + ". The rest of "
-        "`sbxloop init` runs on this host — pass --no-sbx to lay the home out without it."
-    )
+    def _sbx_binary(self) -> Path:
+        if not self.home.windows:
+            return self.home.sbx_binary
+        binary = windows_sbx_binary(self.env)
+        if binary is None:
+            raise InitError("LOCALAPPDATA is required to locate Docker's per-user sbx.exe")
+        return binary
 
     def _sbx(self) -> None:
-        if self.home.windows:
-            raise InitError(self.SBX_UNSUPPORTED)
         wanted = self.options.sbx_version
         if self._installed_sbx_version() == wanted:
             self.report.skipped.append(f"sbx {wanted} (installed)")
+            return
+        if self.home.windows:
+            self._sbx_windows(wanted)
             return
         tarball_url = self._sbx_asset_url(wanted)
         with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
@@ -653,8 +676,32 @@ class HomeInit:
             self.report.notes.append(partial)
             self.report.done.append(f"sbx {wanted} (AppArmor profile pending)")
 
+    def _sbx_windows(self, wanted: str) -> None:
+        url = self._sbx_asset_url(wanted)
+        reboot = False
+        with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
+            installer = Path(scratch) / "DockerSandboxes.msi"
+            self.fetch(url, installer)
+            try:
+                self._run_env(["msiexec", "/i", str(installer), "/qn", "/norestart"], self.env)
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode == 3010:
+                    reboot = True
+                else:
+                    self._forget_sbx(wanted)
+                    detail = (exc.stderr or exc.stdout or "no output").strip()
+                    raise InitError(
+                        f"sbx MSI install failed (exit {exc.returncode}): {detail}"
+                    ) from exc
+            self._verify_sbx(wanted, self.env)
+        self.home.sbx_prefix.mkdir(parents=True, exist_ok=True)
+        self.home.sbx_version_file.write_text(wanted + "\n")
+        self.report.done.append(f"sbx {wanted}")
+        if reboot:
+            self.report.notes.append("the sbx MSI requested a reboot before the backend can start")
+
     def _verify_sbx(self, wanted: str, env: Mapping[str, str]) -> None:
-        """What the prefix must hold before ``sbx/VERSION`` may claim *wanted*:
+        """What the installed binary must show before ``sbx/VERSION`` claims *wanted*:
         an executable, and that executable reporting the version asked for.
         Anything this cannot establish — a missing component, an executable
         that will not answer, output with no version in it — is a failed
@@ -666,7 +713,7 @@ class HomeInit:
         raise InitError(problem)
 
     def _sbx_problem(self, wanted: str, env: Mapping[str, str]) -> str | None:
-        binary = self.home.sbx_binary
+        binary = self._sbx_binary()
         if not binary.is_file() or not os.access(binary, os.X_OK):
             return f"sbx {wanted} install left no executable at {binary}"
         try:

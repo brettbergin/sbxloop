@@ -70,6 +70,15 @@ class FakeRun:
             return subprocess.CompletedProcess(argv, 0, Path(argv[0]).read_text(), "")
         if argv[0] == "sh" and argv[1].endswith("uv-install.sh"):
             self.home.uv.write_text("#!uv\n")
+        if argv[0] == "powershell.exe" and argv[-1].endswith("uv-install.ps1"):
+            self.home.uv.write_text("#!uv\n")
+        if argv[0] == "msiexec":
+            binary = self.home.root.parent / "local" / "DockerSandboxes" / "bin" / "sbx.exe"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(f"sbx version {self.sbx_version}\n")
+            binary.chmod(0o755)
+        if argv[0].endswith("sbx.exe") and argv[1:] == ["version"]:
+            return subprocess.CompletedProcess(argv, 0, Path(argv[0]).read_text(), "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     @staticmethod
@@ -133,11 +142,14 @@ class FakeFetch:
                                 "name": "sbx-0.38.0-linux-arm64.tar.gz",
                                 "browser_download_url": "u/arm",
                             },
+                            {"name": "DockerSandboxes.msi", "browser_download_url": "u/windows"},
                             {"name": "checksums.txt", "browser_download_url": "u/sums"},
                         ]
                     }
                 )
             )
+        elif url == "u/windows":
+            target.write_bytes(b"fake MSI")
         elif url.startswith("u/"):
             with tarfile.open(target, "w:gz") as tf:
                 script = target.parent / "install.sh"
@@ -194,8 +206,7 @@ def make(
 
 
 class TestWindowsHost:
-    """#899: `sbxloop init` on a native Windows host writes entry points
-    that host can run, and promises no sandbox runtime it does not have."""
+    """#899: native Windows bootstrap uses native installers and a pinned sbx."""
 
     @pytest.fixture(autouse=True)
     def icacls(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
@@ -230,18 +241,19 @@ class TestWindowsHost:
         assert not home.sbx_launcher.exists()
         assert any("no sbx wrapper" in note for note in init.report.notes)
 
-    def test_init_sbx_is_refused_before_anything_is_downloaded(self, tmp_path: Path) -> None:
-        """Fail closed on unsupported work: the sbx assets are a POSIX
-        tarball around an install.sh, so the step is refused by name rather
-        than attempted and failed part-way through."""
+    def test_init_installs_the_pinned_windows_msi(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("shutil.which", lambda _name: None)
         home = SbxloopHome(tmp_path / "home", os_name="nt")
         options = InitOptions(version="1.2.3", sbx=True, systemd=False)
         fetch = FakeFetch()
+        run = FakeRun(home, options.sbx_version)
         init = HomeInit(
             home,
             options,
-            env={"USERPROFILE": str(tmp_path), "PATH": ""},
-            run=FakeRun(home, options.sbx_version),
+            env={"USERPROFILE": str(tmp_path), "LOCALAPPDATA": str(tmp_path / "local"), "PATH": ""},
+            run=run,
             fetch=fetch,
             system="Windows",
             machine="AMD64",
@@ -249,12 +261,50 @@ class TestWindowsHost:
             say=[].append,
             user_units=tmp_path / "units",
         )
-        with pytest.raises(InitError, match="no native Windows build"):
-            init.execute()
-        assert not any("sbx-releases" in url or url.startswith("u/") for url in fetch.urls)
-        assert "--no-sbx" in init.SBX_UNSUPPORTED
+        init.execute()
+        assert "u/windows" in fetch.urls
+        assert "https://astral.sh/uv/install.ps1" in fetch.urls
+        assert any(call[0] == "powershell.exe" for call in run.calls)
+        assert any(call[0].lower() == "msiexec" for call in run.calls)
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
         (step,) = [what for name, what in init.plan() if name == "sbx"]
-        assert "no native Windows build" in step
+        assert "keep sbx" in step
+        (tmp_path / "local" / "DockerSandboxes" / "bin" / "sbx.exe").write_text(
+            "sbx version 0.99.0\n"
+        )
+        (step,) = [what for name, what in init.plan() if name == "sbx"]
+        assert "install sbx" in step
+
+    def test_windows_msi_requires_local_app_data(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        init = HomeInit(
+            home,
+            InitOptions(version="1.2.3"),
+            env={"USERPROFILE": str(tmp_path), "PATH": ""},
+            run=FakeRun(home),
+            fetch=FakeFetch(),
+            system="Windows",
+            machine="AMD64",
+        )
+        with pytest.raises(InitError, match="LOCALAPPDATA"):
+            init.plan()
+
+    def test_failed_msi_never_stamps_the_version(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        run = FakeRun(home)
+        run.fail = {"msiexec /i": 1603}
+        init = HomeInit(
+            home,
+            InitOptions(version="1.2.3"),
+            env={"USERPROFILE": str(tmp_path), "LOCALAPPDATA": str(tmp_path / "local")},
+            run=run,
+            fetch=FakeFetch(),
+            system="Windows",
+            machine="AMD64",
+        )
+        with pytest.raises(InitError, match="MSI install failed"):
+            init.execute()
+        assert not home.sbx_version_file.exists()
 
     def test_the_secrets_file_is_restricted_not_chmodded(
         self, tmp_path: Path, icacls: list[list[str]]
@@ -612,6 +662,9 @@ class TestTemplates:
             ("DockerSandboxes-darwin.tar.gz", "Darwin", "x86_64", False),
             ("DockerSandboxes-darwin.dmg", "Darwin", "arm64", False),
             ("DockerSandboxes-linux-amd64-ubuntu2404.deb", "Linux", "x86_64", False),
+            ("DockerSandboxes.msi", "Windows", "AMD64", True),
+            ("DockerSandboxesMachine.msi", "Windows", "AMD64", False),
+            ("DockerSandboxes.msi", "Windows", "ARM64", False),
             ("sbx-0.38.0-darwin-arm64.tar.gz", "Linux", "x86_64", False),
             ("sbx-0.38.0-linux-amd64.deb", "Linux", "x86_64", False),
             ("checksums.txt", "Linux", "x86_64", False),

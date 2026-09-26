@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError, SbxSettleTimeoutError
-from sbxloop.sbx.cli import SbxCLI, _exec_failed_at_sbx_level, redacted_argv
+from sbxloop.sbx.cli import SbxCLI, _exec_failed_at_sbx_level, redacted_argv, resolve_sbx_binary
 from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
 
@@ -18,6 +18,16 @@ def cli(fake_sbx: FakeSbx) -> SbxCLI:
 
 def spec(name: str = "sbxloop-r1-agent", tmp: Path = Path("/tmp")) -> SandboxSpec:
     return SandboxSpec(name=name, role="agent", workspace=tmp)
+
+
+def test_native_windows_finds_the_newly_installed_per_user_binary(tmp_path: Path) -> None:
+    binary = tmp_path / "DockerSandboxes" / "bin" / "sbx.exe"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"sbx")
+    env = {"LOCALAPPDATA": str(tmp_path)}
+    assert resolve_sbx_binary("sbx", system="Windows", env=env) == str(binary)
+    assert resolve_sbx_binary("custom", system="Windows", env=env) == "custom"
+    assert resolve_sbx_binary("sbx", system="Linux", env=env) == "sbx"
 
 
 class TestAppName:
