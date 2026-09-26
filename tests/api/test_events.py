@@ -3,6 +3,7 @@ sequence, per run or for the workspace, and pruned history refused."""
 
 from __future__ import annotations
 
+from sbxloop_worker.protocol import Event
 from tests.api.conftest import Api
 from tests.unit.test_daemon_loop import gh_item
 
@@ -131,6 +132,24 @@ class TestReplay:
         mark = api.client.get("/v1/status", headers=headers).json()["watermark"]
         after_mark = api.client.get("/v1/events", params={"after": f"evt_{mark}"}, headers=headers)
         assert after_mark.status_code == 200 and after_mark.json()["data"] == []
+
+    def test_a_run_begun_after_a_prune_replays_from_its_start(self, api: Api) -> None:
+        api.loop.store.create_run("old", "Compile a report", kind="workload")
+        api.loop.store.append_event(Event(type="run.start", run_id="old", ts=api.clock()))
+        api.ctx.chronology.project(api.clock())
+        api.clock.t += 604800 + 10
+        api.ctx.chronology.prune(api.clock() - 604800)
+        api.loop.store.create_run("fresh", "Compile a report", kind="workload")
+        for type_ in ("run.start", "agent.message"):
+            api.loop.store.append_event(Event(type=type_, run_id="fresh", ts=api.clock()))
+        headers = api.bearer()
+        fresh = api.client.get("/v1/runs/run_fresh/events", headers=headers)
+        assert fresh.status_code == 200, fresh.text
+        assert [e["type"] for e in fresh.json()["data"]] == ["run.start", "agent.message"]
+        # The run that lost its start, and the whole chronology, still say so.
+        old = api.client.get("/v1/runs/run_old/events", headers=headers)
+        assert old.status_code == 410 and old.json()["code"] == "cursor_expired"
+        assert api.client.get("/v1/events", headers=headers).status_code == 410
 
     def test_bad_cursors_and_permissions(self, api: Api) -> None:
         headers = api.bearer()

@@ -223,7 +223,7 @@ async def stream_events(
         views = Views(ctx)
         internal_run = views.run_by_public_id(run_id).run_id if run_id else None
         # An expired cursor is refused before the stream opens.
-        _resolve_start(views, start)
+        _resolve_start(views, start, internal_run)
         return start, internal_run
 
     begin, internal_run = await ctx.call(prepare)
@@ -257,9 +257,9 @@ async def stream_events(
     )
 
 
-def _resolve_start(views: Views, start: int) -> None:
+def _resolve_start(views: Views, start: int, run_id: str | None = None) -> None:
     views.ctx.chronology.project(views.now)
-    if views.ctx.chronology.expired(start):
+    if views.ctx.chronology.expired(start, run_id=run_id):
         raise Problem(
             410,
             "cursor_expired",
