@@ -128,8 +128,8 @@ class TestApiHostProbe:
         report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
         outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
         assert outcome.verdict == "unreachable" and outcome.drifts == []
-        assert "policy denies 127.0.0.1, 10.0.2.2" in outcome.detail
-        # The policy was asked about both addresses, scoped to the sandbox.
+        assert "policy denies 127.0.0.1, host.docker.internal, 10.0.2.2" in outcome.detail
+        # The policy was asked about all addresses, scoped to the sandbox.
         checks = [p for p in fake_sbx.policies() if p[:3] == ["check", "network", "127.0.0.1"]]
         assert checks and "--sandbox" in checks[0]
 
@@ -154,6 +154,16 @@ class TestApiHostProbe:
         outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
         assert outcome.verdict == verdict
         assert bool(outcome.drifts) == (verdict != "unreachable")
+
+    def test_policy_allowing_host_alias_drifts(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_HOST_ALIAS_ALLOWED", "1")
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
+        outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
+        assert outcome.verdict == "policy-allows"
+        assert "host.docker.internal" in outcome.detail
+        assert outcome.drifts
 
     def test_the_configured_bind_address_is_probed_and_policy_checked(
         self, fake_sbx: FakeSbx
@@ -187,6 +197,9 @@ class TestApiHostProbe:
         assert seen and "9000" in seen[0] and "192.168.6.101" in seen[0]
         assert "192.168.6.101" in detail
         assert any(p[:3] == ["check", "network", "192.168.6.101"] for p in fake_sbx.policies())
+        assert any(
+            p[:3] == ["check", "network", "host.docker.internal"] for p in fake_sbx.policies()
+        )
 
 
 class _HandshakeOnly:
