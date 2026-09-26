@@ -282,7 +282,14 @@ class PushDispatcher:
             log.warning("push.dropped", **fields)
             return
         if job.attempts >= push.max_attempts:
-            log.error("push.gave_up", **fields)
+            log.error(
+                "push.gave_up",
+                hint=(
+                    "the push relay kept failing this push; check that [push] relay_url "
+                    "is reachable from this host and the relay's own log"
+                ),
+                **fields,
+            )
             return
         delay = min(push.backoff_s * 2 ** (job.attempts - 1), push.backoff_max_s)
         if result.retry_after is not None:
