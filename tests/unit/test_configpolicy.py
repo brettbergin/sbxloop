@@ -12,6 +12,7 @@ def test_the_chat_sections_and_the_concierges_own_switches_are_never_from_chat()
     assert never_from_chat("mattermost.command_prefix") is not None
     assert never_from_chat("tui.chronology_level") is not None
     assert never_from_chat("chat.backend") == NEVER_FROM_CHAT["chat"]
+    assert never_from_chat("push.relay_url") == NEVER_FROM_CHAT["push"]
     assert never_from_chat("concierge.enabled") == "it is the concierge's own switch"
     assert "no self-widening" in (never_from_chat("concierge.edit_config") or "")
     assert "no self-widening" in (never_from_chat("concierge.config_locked") or "")

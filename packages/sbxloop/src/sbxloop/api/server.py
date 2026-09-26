@@ -62,6 +62,9 @@ class ApiServer:
             )
             ctx.projector.catalog_with(self._catalog_run)
         ctx.projector.deliver_work_with(ctx.project_work)
+        # Push rides the chronology too: the projector wakes the dispatcher
+        # as it wakes the streams, and the dispatcher polls on its own.
+        ctx.projector.listen(ctx.push.dispatcher.wake)
         # uvicorn's loggers are noisy at INFO; the daemon narrates the start.
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -83,6 +86,10 @@ class ApiServer:
         except Exception:
             log.warning("api.steering_settle_failed", exc_info=True)
         self.ctx.projector.start()
+        # Started whether or not push is on, so switching it on later needs
+        # no restart; while it is off the dispatcher only moves its cursor.
+        # Live only: it starts at the chronology's head, never replaying it.
+        self.ctx.push.start()
         log.info("api.started", bind=self.config.bind, port=self.port)
 
     def _catalog_run(self, run_id: str) -> None:
@@ -128,6 +135,7 @@ class ApiServer:
         self.ctx.hub.notify()
         if self.ctx.projector is not None:
             self.ctx.projector.stop()
+        self.ctx.push.stop()
         self._uv.should_exit = True
         if self._thread is not None:
             self._thread.join(timeout=GRACEFUL_SHUTDOWN_S + 5)

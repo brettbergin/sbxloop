@@ -49,6 +49,8 @@ class Projector:
         self._catalog: Callable[[str], None] | None = None
         self._deliver_work: Callable[[], object] | None = None
         self._pending: deque[str] = deque()
+        #: Woken, like the streams, whenever the chronology grows.
+        self._listeners: list[Callable[[], None]] = []
 
     def wake(self) -> None:
         """Called from any thread: there is something to project."""
@@ -60,6 +62,11 @@ class Projector:
 
     def deliver_work_with(self, fn: Callable[[], object]) -> None:
         self._deliver_work = fn
+
+    def listen(self, fn: Callable[[], None]) -> None:
+        """Call ``fn`` (on this thread; it must only wake its own) whenever
+        the chronology's high-water mark moves."""
+        self._listeners.append(fn)
 
     def catalog(self, run_id: str) -> None:
         """From any thread: catalog this run's artifacts when convenient."""
@@ -104,6 +111,8 @@ class Projector:
         if copied or newest != self._last_seen:
             self._last_seen = newest
             self.hub.notify()
+            for listener in self._listeners:
+                listener()
         if now - self._last_prune >= PRUNE_EVERY_S:
             self._last_prune = now
             try:

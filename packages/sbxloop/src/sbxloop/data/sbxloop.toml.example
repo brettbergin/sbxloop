@@ -1039,6 +1039,21 @@ service_memory = "2g"
 #                                  # only if users cannot edit their email
 # request_timeout_s = 10           # each call to the provider
 
+# [push]
+# Push notifications to people's phones: a mention, a decision waiting on
+# them, work they asked for finishing or failing. Pings go through a push
+# relay, which alone holds the push provider's key; each carries a kind and
+# an opaque reference, never what was said, and the device fetches the text
+# from this server. A person registers a device at /v1/users/me/devices.
+# Needs [api] enabled. Workspace-wide, so there is no per-repo override.
+# enabled = false
+# relay_url = ""                   # the relay's http(s) base URL; empty = none
+# timeout_s = 10.0                 # each call to the relay
+# max_attempts = 5                 # tries per push before it is given up on
+# backoff_s = 2.0                  # the first retry's delay; doubled each time
+# backoff_max_s = 300.0            # the longest a retry waits, Retry-After included
+# max_devices_per_user = 20        # devices one person may register
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue

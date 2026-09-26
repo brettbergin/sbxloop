@@ -1001,6 +1001,95 @@ linked message cannot be accepted, the surface hears a refusal only if it
 was worded for people (a channel that is gone, say); any other failure is
 reported as "check the daemon logs" and detailed there alone.
 
+### Push notifications
+
+When `/v1/capabilities` lists `push.apns_relay` (`[push] enabled` with a
+`relay_url`), a signed-in person registers their devices for push
+notifications. Every route acts for the caller only; someone else's device or
+notification is `404`, like one that does not exist. A plain API client with
+no local profile is `403 local_profile_required`.
+
+| Route                                        | Needs | Result                                                                                                                                                      |
+| -------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/users/me/devices`                  | write | Body `DeviceIn`; `201` a new `DeviceOut`, `200` the one already registered with that token, updated; `409 device_limit_reached`, `502`, `503 push_disabled` |
+| `GET /v1/users/me/devices`                   | read  | `DevicePage` `{items: [DeviceOut]}`, oldest first                                                                                                           |
+| `DELETE /v1/users/me/devices/{device_id}`    | write | `204`; `404 device_not_found`                                                                                                                               |
+| `POST /v1/users/me/devices/{device_id}/test` | write | `202 {ref}`: a `test` push queued to that device whatever its preferences; `404 device_not_found`, `409 device_not_enrolled`, `503 push_disabled`           |
+| `GET /v1/users/me/notifications/{ref}`       | read  | `PushNotificationOut`; `404 notification_not_found`                                                                                                         |
+
+```json
+{
+  "platform": "ios",
+  "token": "<the device push token, 64 to 200 hex characters>",
+  "env": "sandbox",
+  "server_ref": "home",
+  "name": "My phone",
+  "prefs": {
+    "mentions": true,
+    "gates": true,
+    "work": true,
+    "failures": true,
+    "per_channel": { "chn_…": "mentions" }
+  }
+}
+```
+
+`env` is `sandbox` or `production`, the gateway that issued the token.
+`server_ref` (1 to 64 of `A-Z a-z 0-9 _ . : -`) is the client's own name for
+this server, echoed in every push so a client registered with several servers
+knows which to ask. `prefs` is optional: a new device gets every kind, an
+update without it keeps what was stored. `per_channel` maps a channel id to
+`all` (the default for an absent channel), `mentions` (only mentions of you)
+or `none`.
+
+Registration is an upsert keyed by the caller and the token (matched
+case-insensitively). A new device, a change of `env`, and a device whose
+handle the relay stopped recognising are enrolled with the push relay before
+the answer: a relay that refuses is `502 push_relay_refused`, one that cannot
+be reached or answers with nothing usable `502 push_relay_unavailable`, and
+nothing is stored. Changing the name, `server_ref` or `prefs` does not call
+the relay. `DeviceOut` is
+`{id, platform, env, server_ref, name, prefs, token_suffix, created_at, updated_at, last_push_at}`:
+`token_suffix` is the token's last six characters. The token is kept only as
+a digest and is never returned; the relay's handle is never returned at all,
+and neither is logged or put in an event.
+
+A push carries only references — `{srv, k, ref, thread}`: the device's
+`server_ref`, the kind, a notification ref and the channel id (empty when
+there is none) — and the relay shows generic text. A notification service
+extension fetches the real text with the person's own token:
+
+```json
+{
+  "ref": "ntf_…",
+  "kind": "mention",
+  "channel_id": "chn_…",
+  "turn_id": "trn_…",
+  "title": "Ada Lovelace mentioned you",
+  "body": "@grace can you take a look at this?",
+  "created_at": "2026-09-25T12:00:00Z"
+}
+```
+
+What is pushed, and to whom (never to the person whose message or action it
+was):
+
+| `kind`    | When                                                                                                                                                             | Title                                                                            |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `mention` | Another person's message names you as `@username` (word-bounded, any case) in a channel you can open; the body is the message on one line, cut to 140 characters | `<author> mentioned you`                                                         |
+| `work`    | `collaboration.work.delivered` (not failed) or `collaboration.turn.completed` for a turn you asked for; a job's `work` attention to the channel's members        | `<agent> delivered <title>` / `<agent> replied` / the job's title                |
+| `failure` | The same when the work ended `failed`, `blocked`, `cancelled` or `abandoned`, or `collaboration.turn.failed`; a job's `failure` attention                        | `<agent> could not finish <title>` / `<agent> could not reply` / the job's title |
+| `gate`    | A job's `action_required` attention, or `gate.opened`, to workspace owners and admins who can see where it happened; one push per gate                           | the job's title / `Decision needed`                                              |
+| `test`    | `POST …/test`                                                                                                                                                    | `Test notification`                                                              |
+
+Only live events are pushed: the dispatcher reads the chronology from where
+it stood when the daemon started, so historical events and a restart's replay
+never are. Delivery retries a relay's retryable `502`, a `429` (at least its
+`Retry-After`) and an unreachable relay with exponential backoff up to
+`[push] max_attempts`; a `410` removes the device, and any `400` drops the
+push. Notifications are kept as long as the chronology
+(`[api] replay_retention_s`).
+
 ## Clients and tokens
 
 sbxloop issues its own tokens. A client is registered on the host with the
@@ -1124,6 +1213,8 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/bridges`                                | collaboration read     | The chat services a channel can be linked to                          |
 | CRUD     | `/v1/channels/{id}/links`                    | collaboration          | The bridge surfaces mirroring a channel                               |
 | CRUD     | `/v1/users/me/identities[/{backend}]`        | collaboration          | Who you are on a bridge, and the code that proves it                  |
+| CRUD     | `/v1/users/me/devices[/{id}[/test]]`         | collaboration          | Devices registered for push notifications; a test push                |
+| `GET`    | `/v1/users/me/notifications/{ref}`           | collaboration read     | What a push was about                                                 |
 | CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted connections and owner management           |
 | `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
 | `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
@@ -1310,20 +1401,21 @@ gets. `GET /v1/events` and `GET /v1/events/stream` accept
 Every refusal is `application/problem+json` with a stable `code`, the
 request's `X-Request-Id`, and the fields a client needs to act:
 
-| Status | Codes                                                                                                                                                                                                                                                                                                                                        |
-| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                  |
-| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                     |
-| 403    | `forbidden` (with `capability`), `agent_forbidden`, `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                      |
-| 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                                             |
-| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict` |
-| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                          |
-| 411    | `length_required`                                                                                                                                                                                                                                                                                                                            |
-| 413    | `body_too_large` (with `limit`)                                                                                                                                                                                                                                                                                                              |
-| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`, `invalid_agent` (with `problems`)                                                                                                                                                                                                       |
-| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                                                                                                                                                      |
-| 500    | `internal_error` (never the exception's text)                                                                                                                                                                                                                                                                                                |
-| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`, `oidc_unavailable`                                                                                                                                                                                                                                         |
+| Status | Codes                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                                                                                |
+| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                                                                                   |
+| 403    | `forbidden` (with `capability`), `agent_forbidden`, `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                                                                                    |
+| 404    | `not_found`, `unknown_target`, `agent_not_found`, `device_not_found`, `notification_not_found`                                                                                                                                                                                                                                                                                                             |
+| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict`, `device_limit_reached` (with `limit`), `device_not_enrolled` |
+| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                                                                                        |
+| 411    | `length_required`                                                                                                                                                                                                                                                                                                                                                                                          |
+| 413    | `body_too_large` (with `limit`)                                                                                                                                                                                                                                                                                                                                                                            |
+| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`, `invalid_agent` (with `problems`)                                                                                                                                                                                                                                                                     |
+| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                                                                                                                                                                                                                    |
+| 500    | `internal_error` (never the exception's text)                                                                                                                                                                                                                                                                                                                                                              |
+| 502    | `push_relay_refused`, `push_relay_unavailable`                                                                                                                                                                                                                                                                                                                                                             |
+| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`, `oidc_unavailable`, `push_disabled`                                                                                                                                                                                                                                                                                      |
 
 `unknown_target` and `not_eligible` carry the daemon's own sentence in
 `detail` — the same one `ctl` prints.
