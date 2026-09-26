@@ -57,8 +57,14 @@ def test_required_checks_run_after_failed_dependencies_and_keep_names():
     assert jobs["test"]["strategy"]["matrix"]["python-version"] == ["3.13", "3.14"]
     assert set(jobs["test"]["needs"]) == {"pytest", "codex-sdk", "openai-sdk", "playwright-preset"}
     assert jobs["verified"]["if"] == "${{ always() }}"
-    assert set(jobs["verified"]["needs"]) == {"lint", "typecheck", "test", "build"}
-    assert all(name in jobs for name in ("lint", "typecheck", "build"))
+    assert set(jobs["verified"]["needs"]) == {
+        "lint",
+        "typecheck",
+        "test",
+        "build",
+        "windows-host",
+    }
+    assert all(name in jobs for name in ("lint", "typecheck", "build", "windows-host"))
 
 
 def test_five_mixed_shards_cover_the_whole_collection_and_supply_the_verdict():

@@ -550,44 +550,53 @@ print(result.state, result.run_id)
 
 ### Platform support
 
-sbxloop runs on Linux and macOS. The hard constraint is the sandbox layer:
-every run, the daemon and the bake boot Docker Sandboxes microVMs through
-`sbx`, which Docker ships for those two systems.
+sbxloop runs on Linux, macOS and native Windows through Docker Sandboxes.
+Docker's native Windows backend requires [Windows 11 x64 and Windows
+Hypervisor Platform](https://docs.docker.com/ai/sandboxes/install/). The
+older WSL2 route is also available: install a
+Linux distribution, turn on Docker Desktop's WSL integration for it, and
+install sbxloop inside that distribution.
 
-On **Windows** the supported path is **WSL2**: install a Linux distribution,
-turn on Docker Desktop's WSL integration for it, and install sbxloop inside
-that distribution — the install script, `sbxloop init`, the daemon and the
-console all run there unchanged, and `sbxloop doctor` reports the host as
-WSL. Developing sbxloop on Windows works the same way: clone and run the
-test suite inside the distribution. Native Windows is refused by name:
-`sbxloop run`, `resume`, `shell`, `daemon` and `bake` exit with a line
-naming the WSL2 path before writing any state, and `sbxloop doctor`'s
-first row (`host`) says the same. The read-only commands still answer so
-the refusal can be diagnosed from the host itself.
+For a native Windows install, first install Git and uv (see the
+[uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)).
+Then run this in PowerShell:
 
-What a **native Windows** host does support, precisely, is that diagnosis
-— and nothing beyond it:
+```powershell
+uvx --python 3.13 --from sbxloop sbxloop init --no-systemd
+& "$env:USERPROFILE\.sbxloop\bin\sbxloop.cmd" doctor
+```
+
+`init` fetches the pinned `DockerSandboxes.msi` from Docker's release and
+installs it for the current user. It verifies that `sbx.exe` reports the
+requested version before recording it. The MSI owns that binary under
+`%LOCALAPPDATA%\DockerSandboxes\bin`; sbxloop does not copy it into its
+home. The first shell can run sbxloop through the launcher above; later
+shells can add `%USERPROFILE%\.sbxloop\bin` to `PATH`.
+
+Native Windows details and current limits:
 
 - **The home resolves from `USERPROFILE`.** A Windows session need not set
   a Unix `HOME`, so the home, `config\sbxloop.toml` and `config\secrets.env`
   are all found from `%USERPROFILE%\.sbxloop` (or `%HOMEDRIVE%%HOMEPATH%`).
   `SBXLOOP_HOME` overrides it as it does anywhere, spaces in the path and
-  all. `doctor`, `config` and `logs` therefore read the same home the
-  process runs out of, which is what makes the refusal legible.
+  all.
 - **`sbxloop init` writes a `bin\sbxloop.cmd`, not a shell script**, and
   points it at `venv\Scripts\sbxloop.exe`. It writes no `bin\sbx`
-  wrapper: there is no native Windows `sbx` for one to stand in front of,
-  and `init` says so in its notes.
+  wrapper: Docker's MSI owns `sbx.exe`, which the Python client finds from
+  `LOCALAPPDATA` even before a new shell inherits the MSI's `PATH` change.
 - **Secrets are private by ACL, not by mode.** `chmod 600` does nothing on
   Windows — a file written that way still reports `0666` — so
   `config\secrets.env` is restricted with `icacls` and doctor's
   `secrets file` row reads the ACL back. A host whose ACL could not be
   read **fails** that row saying so, rather than passing a file it could
   not vouch for.
-- **`sbxloop init --sbx` is not supported.** The sbx installer and its
-  release assets are POSIX (`install.sh`, `.tar.gz`); installing the
-  sandbox runtime natively is the WSL2 path above. The agent backends
-  themselves are not the constraint here — the sandbox layer is.
+- **No native service installer is included.** `--systemd` is for Linux;
+  use `--no-systemd` and run `sbxloop daemon` in a supervised Windows
+  session if unattended operation is needed.
+- **Live sandbox boot remains field-unverified.** The Windows CI job checks
+  native host paths and ACLs, installs the real MSI and initializes a home;
+  hosted runners do not prove nested microVM boot. Use `sbxloop doctor` to
+  check this host's backend and prerequisites before a run.
 
 ## How a run works
 
@@ -1482,7 +1491,11 @@ repositories registered they are shared across all of them —
   was; the daemon says so once that day for runs. The
   day's runs and tokens are at `GET /v1/usage/pool`. When more than one run
   may execute, the next slot goes to the oldest queued item whose requester
-  has no run in flight, before falling back to the oldest item;
+  has no run in flight, before falling back to the oldest item. This is a
+  **soft start threshold** on reported spend, not a cap on total usage:
+  concurrent starts can all pass before any usage is reported, and a run or
+  turn already in flight continues after the threshold is reached. Plan for
+  that overage when choosing a value;
 - a **concurrency cap** (`max_concurrent_runs`, default 1): how many runs
   execute at once. Above 1, a tick starts runs until the cap is reached and
   returns while they work; each is settled once it finishes. Two code runs
@@ -1599,7 +1612,7 @@ workload_label = "sbxloop:workload"       # queues an issue as a workload, not a
 max_runs_per_day = 12                     # calendar-day cap, persisted across restarts
 max_concurrent_runs = 1                   # runs executing at once; two code runs never share a repo
 run_cap_timezone = "UTC"                  # day boundary for the cap (resets at 00:00 there)
-# daily_token_budget = 2000000             # tokens per day across runs and chat turns; unset: none
+# daily_token_budget = 2000000             # soft start threshold on reported tokens; in-flight work may exceed it
 max_attempts_per_item = 2
 max_resumes_per_item = 2                  # interrupted runs resumed at most this often per item
 retry_backoff_s = 900.0                   # times the attempt number
@@ -3508,7 +3521,7 @@ The notable knobs:
 | `[daemon] warm_pairs`                                                                                                      | `0`                                                                                                                                                                                                                 | Sandbox sets kept provisioned ahead of dispatch, 0 to 4: microVMs booted and workers installed under run ids no run has taken yet. A fresh run takes one and skips the boot and the install ladder. A set from another configuration, older than `warm_ttl_s`, or missing a sandbox is retired; `status` reports `warm`, and `sbxloop sandbox prune` leaves warm sets alone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `[daemon] warm_ttl_s`                                                                                                      | `21600`                                                                                                                                                                                                             | How long a ready warm set stands before it is removed and replaced.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `[daemon] run_cap_timezone`                                                                                                | `UTC`                                                                                                                                                                                                               | IANA timezone defining the run cap's day boundary.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `[daemon] daily_token_budget`                                                                                              | unset                                                                                                                                                                                                               | The workspace's daily token budget: input plus output tokens reported by every run and every chat turn since 00:00 in `run_cap_timezone`. Once reached, no new run starts (the daemon idles as `budget` and says so once that day) and every chat turn, a person's as much as an agent's, is refused with a reply naming the spend and the reset time, until the next day; `GET /v1/usage/pool` shows the day's figures. Unset: tokens never hold work back.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `[daemon] daily_token_budget`                                                                                              | unset                                                                                                                                                                                                               | The workspace's daily token budget: input plus output tokens reported by every run and every chat turn since 00:00 in `run_cap_timezone`. Once reached, no new run starts (the daemon idles as `budget` and says so once that day) and every chat turn, a person's as much as an agent's, is refused with a reply naming the spend and the reset time, until the next day; `GET /v1/usage/pool` shows the day's figures. This checks reported spend at admission; concurrent starts and in-flight work can exceed it. Unset: tokens never hold work back.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `[daemon] max_attempts_per_item` / `max_resumes_per_item`                                                                  | `2` / `2`                                                                                                                                                                                                           | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `[daemon] run_stale_after_s`                                                                                               | `21600`                                                                                                                                                                                                             | Non-terminal runs no thread is executing, idle this long, are reconciled to a terminal state, even while other runs execute (`0` disables).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `[daemon] supervised`                                                                                                      | `false`                                                                                                                                                                                                             | `restart` (ctl, `!sbx`, the concierge) exits and relies on a service manager to start the daemon again. Under systemd the daemon can tell on its own; set `true` under any other supervisor (launchd, a container runtime, a process manager). With neither, `restart` is refused by name rather than exiting into nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |

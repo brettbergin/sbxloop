@@ -2143,30 +2143,9 @@ class CollaborationStore:
         )
         return _member(user, row)
 
-    def add_member(self, user_id: str, role: Role, invited_by: str | None, now: float) -> Member:
-        """Make an existing user a member with ``role``."""
-        role = _role(role)
-        with self.dstore.transaction() as session:
-            return self._insert_member(session, user_id, role, invited_by, now)
-
-    def set_role(self, user_id: str, role: Role) -> Member:
-        """Change a member's role. The workspace always keeps an owner."""
-        role = _role(role)
-        with self.dstore.transaction() as session:
-            row = self._member_row(session, user_id)
-            user = session.get(LocalUserRow, user_id)
-            if row is None or user is None:
-                raise CollaborationError("member_not_found", "member not found")
-            if (
-                row.role == "owner"
-                and role != "owner"
-                and not self._owner_count(session, besides=user_id)
-            ):
-                raise CollaborationError("last_owner", "the workspace must keep an owner")
-            row.role = role
-            self._grant_role(session, user, role if user.active else None)
-            session.flush()
-            return _member(user, row)
+    def set_role(self, user_id: str, role: Role, *, now: float | None = None) -> Member:
+        """Change a member's role through the audited update path."""
+        return self.update_member(user_id, role=role, now=time.time() if now is None else now)
 
     def update_member(
         self,
@@ -2342,6 +2321,8 @@ class CollaborationStore:
             user = session.get(LocalUserRow, user_id)
             if user is None:
                 raise CollaborationError("user_not_found", "user not found")
+            if not user.active:
+                raise CollaborationError("user_inactive", "a deactivated user cannot rejoin")
             invite, role = self._open_invite(session, raw_token, now, email=str(user.email))
             member = self._insert_member(session, user_id, role, str(invite.created_by), now)
             invite.accepted_at = now

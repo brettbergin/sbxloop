@@ -60,8 +60,9 @@ additive layer around the existing run API: it uses the daemon's store,
 concierge, operation controls, schedules, events, artifacts, and usage instead
 of starting another scheduler or opening another SQLite writer.
 
-The installation has at most one local user. `POST /v1/auth/local/register`
-creates that profile and its scoped API principal; a `username` beginning
+The first local user owns the workspace; later users register with an invite.
+`POST /v1/auth/local/register` creates a profile and its scoped API principal;
+a `username` beginning
 with `usr_` is refused (`422 invalid_request`), since that is how the user
 ids in `GET /v1/users` read and no name may stand in for one; `/v1/auth/local/login` returns
 the same short-lived access and rotating refresh tokens as the existing client
@@ -742,6 +743,13 @@ member leaves their client with no capability and revokes its refresh
 tokens. The refresh tokens are revoked in the same database transaction as
 the membership change, so either both happen or neither does.
 
+A removed local user can rejoin without creating a duplicate account. After
+an admin or owner creates a fresh invite, the user sends their username,
+password and `invite_token` to `POST /v1/auth/local/login`. The password is
+checked before the invite is spent; an email-addressed invite must match the
+account's email. The response contains new access and refresh tokens with
+the invite's role. A deactivated user cannot rejoin this way.
+
 Removing or deactivating a member also ends every standing they had:
 
 - They are taken out of every channel. A private channel they were in stays
@@ -754,8 +762,8 @@ Removing or deactivating a member also ends every standing they had:
   `creator_removed`, `creator_deactivated` or `creator_demoted`.
 
 An invite stands only while its creator does: one whose creator is no longer
-an active member admits nobody (`403 invite_invalid`), and one above its
-creator's current role grants that role instead. An invite a plain operator
+an active member admits nobody (`403 invite_invalid`). Demoting its creator
+withdraws any pending invite above the new role. An invite a plain operator
 client created (`created_by` of `client:<id>`) is not measured against a
 membership.
 

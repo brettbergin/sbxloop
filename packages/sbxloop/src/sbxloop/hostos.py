@@ -1,13 +1,8 @@
 """Which hosts sbxloop runs on (#596), decided once and said clearly.
 
-The sandbox layer is the hard constraint: runs, the daemon and the bake
-all boot Docker Sandboxes microVMs through ``sbx``, which Docker ships for
-macOS and Linux. On Windows the supported path is WSL2 — a Linux
-distribution with Docker Desktop's WSL integration on — where sbxloop is
-just a Linux install. Native Windows is refused by name at the commands
-that need a sandbox, rather than failing part-way through provisioning
-with a path or shell error; the read-only commands (``doctor``, ``logs``,
-``config``) still answer so the refusal can be diagnosed from the host.
+Runs, the daemon and the bake boot Docker Sandboxes microVMs through
+``sbx``. Docker ships a per-user MSI for native Windows as well as Linux
+and macOS builds. WSL2 remains another path for Windows hosts.
 """
 
 from __future__ import annotations
@@ -38,15 +33,15 @@ class HostSupport(NamedTuple):
 def host_support(system: str | None = None, release: str | None = None) -> HostSupport:
     """Judge the host from ``platform.system()`` / ``platform.release()``
     (injectable for tests). WSL2 is a Linux kernel whose release names
-    Microsoft; native Windows is the one unsupported host."""
+    Microsoft; native Windows uses Docker's MSI."""
     system = system if system is not None else platform.system()
     release = release if release is not None else platform.release()
     if system == "Windows":
         return HostSupport(
             "Windows",
-            False,
-            f"the sandbox runtime (Docker Sandboxes, `sbx`) has no native Windows build; "
-            f"{WSL2_GUIDE}",
+            True,
+            "native Windows — Docker Sandboxes requires Windows 11 x64 and the "
+            "Windows Hypervisor Platform; run `sbxloop doctor` for backend readiness",
         )
     if system == "Linux" and "microsoft" in release.lower():
         return HostSupport(
@@ -60,7 +55,7 @@ def host_support(system: str | None = None, release: str | None = None) -> HostS
     return HostSupport(
         system or "unknown",
         True,
-        f"{system or 'an unknown OS'} — untested; sbxloop is developed on Linux and macOS",
+        f"{system or 'an unknown OS'} — untested; sbxloop targets Linux, macOS and Windows",
     )
 
 

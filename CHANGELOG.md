@@ -1,5 +1,26 @@
 ## [Unreleased]
 
+**Native Windows installs can bootstrap Docker Sandboxes.** `sbxloop init`
+uses Astral's PowerShell uv installer and Docker's pinned per-user MSI,
+checks `sbx.exe version`, and records the installed version only after that
+check passes. Home text is written as UTF-8 so the config template works on
+Windows consoles using a legacy code page. The host gate now lets Windows reach backend readiness checks;
+the Windows CI job installs the real MSI and initializes a home. Live sandbox
+boot on a Windows Hypervisor Platform host remains field-unverified. (#899)
+
+**A removed local member can rejoin with a new invite at login.** The
+account's username and email remain reserved after removal, so registering
+again could not work. The existing login now accepts an optional
+`invite_token`, checks the password first, restores membership with the
+invite's role and returns tokens with the new capabilities. The old
+`set_role` helper uses the audited member update path. (#1238)
+
+**The daily token budget is documented as a soft start threshold.** It
+checks reported usage before work starts. Concurrent starts can all pass
+before a charge arrives, and runs or chat turns already in flight continue
+after the threshold is reached, so the final total may exceed the configured
+value. Set it with that possible overage in mind. (#1244)
+
 **An agent's daily cap and its "already asked" check hold when two turns
 start work at once, and a failed or day-old ask can be asked again.** An
 agent that may start work (`can_start`) was refused the same wording
@@ -1010,7 +1031,7 @@ a code run's checkout, is `404` like any other id from elsewhere.
   (migration 0024). A run with no assignment, or with the built-in team, is
   unchanged. Nothing starts a run with an assignment yet.
 
-- **Runs and chat turns share one daily token budget.** `[daemon] daily_token_budget` (unset by default) caps the input and output tokens
+- **Runs and chat turns share one daily token budget.** `[daemon] daily_token_budget` (unset by default) checks the input and output tokens
   every run and every chat turn reports in a calendar day in
   `run_cap_timezone`. Once reached, no new run starts until the next day:
   the daemon idles as `budget` and says so once that day. The run cap is

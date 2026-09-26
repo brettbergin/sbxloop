@@ -57,6 +57,14 @@ HOME_DIRNAME = ".sbxloop"
 #: sets ``HOME``; a native Windows session sets ``USERPROFILE`` instead and
 #: may set neither ``HOME`` nor the older ``HOMEDRIVE``/``HOMEPATH`` pair.
 USER_HOME_ENV = ("HOME", "USERPROFILE")
+
+
+def windows_sbx_binary(env: Mapping[str, str]) -> Path | None:
+    """The Docker per-user MSI's binary, managed by Docker outside our home."""
+    local = env.get("LOCALAPPDATA", "").strip()
+    return Path(local) / "DockerSandboxes" / "bin" / "sbx.exe" if local else None
+
+
 #: Bumped when the on-disk layout changes shape; ``home.json`` records the
 #: version a home was laid out with so a later ``sbxloop init`` can migrate.
 LAYOUT_VERSION = 1
@@ -238,9 +246,8 @@ class SbxloopHome:
 
     @property
     def sbx_launcher(self) -> Path:
-        """The wrapper around the home's own ``sbx``. There is no native
-        Windows ``sbx`` to wrap (:mod:`sbxloop.hostos`), so this path is
-        written only on a host that can boot sandboxes."""
+        """The POSIX wrapper around the home's own ``sbx``. Windows uses
+        Docker's per-user MSI binary directly."""
         return self.bin / "sbx"
 
     @property
@@ -334,6 +341,8 @@ class SbxloopHome:
 
     @property
     def sbx_binary(self) -> Path:
+        """The home prefix binary used by POSIX installers. Windows uses
+        :func:`windows_sbx_binary` for Docker's vendor-managed MSI path."""
         return self.sbx_prefix / "bin" / self.exe("sbx")
 
     @property

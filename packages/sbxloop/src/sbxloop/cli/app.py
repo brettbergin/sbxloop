@@ -2083,7 +2083,7 @@ def init(
     ] = None,
     sbx: Annotated[
         bool,
-        typer.Option("--sbx/--no-sbx", help="Install Docker's sbx into the home."),
+        typer.Option("--sbx/--no-sbx", help="Install Docker's sbx for this host."),
     ] = True,
     sbx_version: Annotated[
         str | None,
@@ -2131,8 +2131,8 @@ def init(
 ) -> None:
     """Initialise this host's sbxloop home (~/.sbxloop, or $SBXLOOP_HOME).
 
-    Lays out the tree, writes the launchers (bin/sbxloop, bin/sbx), installs
-    uv, a CPython and sbxloop into venv/, installs Docker's sbx under sbx/,
+    Lays out the tree, writes the host launchers, installs uv, a CPython and
+    sbxloop into venv/, and installs Docker's sbx for this host,
     writes config/sbxloop.toml and config/secrets.env once, and with
     --systemd renders and enables the user units. Idempotent: re-run it after
     an upgrade or to repair a home. `--project` writes a repository's own

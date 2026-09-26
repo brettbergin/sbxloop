@@ -8,12 +8,15 @@ invisible to the user's interactive sbx usage.
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError, SbxSettleTimeoutError
 from sbxloop.log import get_logger
+from sbxloop.paths import windows_sbx_binary
 from sbxloop.sbx.models import ExecResult, SandboxInfo, SandboxSpec
 from sbxloop.sbx.parse import parse_ls, parse_version
 
@@ -32,6 +35,17 @@ SLOW_CALL_S = 60.0
 # to re-create a stable name (the daemon's boxes) depends on that.
 RM_SETTLE_TIMEOUT_S = 30.0
 RM_SETTLE_POLL_S = 0.5
+
+
+def resolve_sbx_binary(
+    binary: str, *, system: str | None = None, env: Mapping[str, str] | None = None
+) -> str:
+    """Find Docker's per-user MSI even in the shell that ran the installer."""
+    if binary != "sbx" or (system or platform.system()) != "Windows":
+        return binary
+    installed = windows_sbx_binary(os.environ if env is None else env)
+    return str(installed) if installed is not None and installed.is_file() else binary
+
 
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
 
@@ -162,7 +176,7 @@ class SbxCLI:
         app_name: str | None = None,
         default_timeout: float = 120.0,
     ) -> None:
-        self.binary = binary
+        self.binary = resolve_sbx_binary(binary)
         self.app_name = app_name
         self.default_timeout = default_timeout
 
