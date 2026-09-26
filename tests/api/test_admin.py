@@ -15,6 +15,7 @@ from sbxloop.api import ws as ws_module
 from sbxloop.daemon.loop import RESTART_MARKER_KEY
 from sbxloop.daemon.sources import RepoHealth
 from tests.api.conftest import Api, build
+from tests.fakes.fake_github import FakeGithub
 from tests.unit.test_daemon_loop import FakeSource
 
 MANAGE = frozenset({"daemon:manage", "runs:read"})
@@ -223,6 +224,46 @@ class TestRestart:
 
 
 class TestRepositories:
+    def test_open_issues_are_scoped_and_exclude_pull_requests(self, api: Api) -> None:
+        ops = FakeGithub()
+        ops.existing_issues = [
+            {"number": 42, "title": "Fix the clock", "state": "open"},
+            {"number": 43, "title": "A pull request", "state": "open", "pull_request": {}},
+            {"number": 44, "title": "Already closed", "state": "closed"},
+        ]
+
+        class Forge:
+            def call(self, fn: Any) -> Any:
+                return fn(ops)
+
+        api.loop.github = Forge()
+        (repo,) = api.client.get("/v1/repositories", headers=api.bearer(READ)).json()["data"]
+        path = f"/v1/repositories/{repo['id']}/issues"
+        response = api.client.get(path, headers=api.bearer(READ))
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "data": [{"number": 42, "title": "Fix the clock"}],
+            "has_more": False,
+        }
+        assert api.client.get(path).status_code == 401
+        assert (
+            api.client.get(
+                "/v1/repositories/repo_missing/issues", headers=api.bearer(READ)
+            ).status_code
+            == 404
+        )
+
+        ops.issue_list_payload = [
+            {"number": number, "title": f"Issue {number}", "state": "open"}
+            for number in range(1, 101)
+        ]
+        first = api.client.get(path, headers=api.bearer(READ))
+        assert first.status_code == 200
+        assert len(first.json()["data"]) == 100 and first.json()["has_more"]
+        second = api.client.get(path, params={"page": 2}, headers=api.bearer(READ))
+        assert second.json() == {"data": [], "has_more": False}
+        assert any("page=2" in requested for _, requested, _ in ops.raw_calls)
+
     class SuspendedSource(FakeSource):
         def __init__(self) -> None:
             super().__init__()

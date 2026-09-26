@@ -4696,6 +4696,47 @@
         "title": "OidcTokenRequest",
         "type": "object"
       },
+      "OpenIssue": {
+        "additionalProperties": false,
+        "properties": {
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "title"
+        ],
+        "title": "OpenIssue",
+        "type": "object"
+      },
+      "OpenIssuePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/OpenIssue"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "OpenIssuePage",
+        "type": "object"
+      },
       "OperationOut": {
         "additionalProperties": false,
         "properties": {
@@ -13385,6 +13426,60 @@
         "summary": "Update Repository",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/v1/repositories/{repository_id}/issues": {
+      "get": {
+        "description": "Open forge issues for a configured repository, without pull requests.",
+        "operationId": "list_open_issues_v1_repositories__repository_id__issues_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "title": "Repository Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenIssuePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Open Issues",
+        "tags": [
+          "catalog"
         ]
       }
     },
