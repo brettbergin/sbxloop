@@ -2451,6 +2451,20 @@ reported, and `spend` is `null` by construction with the basis stated —
 telemetry, not an invoice. A window folds every run touched in it from the
 samples' own timestamps and is at most 90 days wide.
 
+**Push notifications.** `api/push/` pings people's devices through a push
+relay that holds the provider's key and nothing else. `api_push_devices`
+keeps a device's token only as a digest and suffix, plus the relay's opaque
+handle; `api_push_notifications` keeps what each push was about, per person,
+for the device to fetch by ref, pruned with the chronology. The dispatcher
+(`api/push/dispatcher.py`, its own thread, woken by the projector as the
+streams are) reads `api_events` *live*: its cursor lives in memory and starts
+at the head, so history and a restart's replay are never pushed. The rules
+(`api/push/rules.py`) are the chat clients' notice rules decided with what
+the daemon knows first-hand — a message's author, a turn's asker, a role's
+right to approve a gate. Delivery never runs on a request thread; retries
+back off exponentially (honouring `Retry-After`), a `410` forgets the
+device and a `400` drops the push. The relay only ever sees references.
+
 **Diagnostics and administration (#1040).** `api/diagnostics.py` reads the
 same in-process log ring `ctl log` and the concierge read
 (`ControlService.log_records`, bounded by `LOG_TAIL_MAX`) and masks every

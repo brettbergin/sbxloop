@@ -14,7 +14,7 @@ from pydantic import Field
 from sbxloop.api.models import ApiModel
 
 #: A device push token as the platform issues it: hex, 32 to 100 bytes.
-TOKEN_PATTERN = r"^[0-9A-Fa-f]{64,200}$"
+TOKEN_PATTERN = r"^[0-9A-Fa-f]{64,200}$"  # nosec B105 - a shape, not a secret
 #: An opaque reference a client or the relay may carry: 1 to 64 of
 #: letters, digits and ``_ . : -``.
 SERVER_REF_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
