@@ -2812,6 +2812,38 @@ def _oidc_url(value: str, key: str) -> str:
     return raw
 
 
+def _native_redirect(value: str, key: str) -> str:
+    """A native app's redirect URI (RFC 8252 section 7.1): a private-use
+    scheme in reverse-DNS form, such as ``com.example.app:/oauth2/callback``.
+
+    A bare scheme (``app:/cb``) could be claimed by any app on the device,
+    so it is refused; https and loopback redirects belong in
+    ``redirect_uris``."""
+    raw = value.strip()
+    if any(ch.isspace() for ch in raw):
+        raise ValueError(f"{key}: {raw!r} must contain no whitespace")
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        raise ValueError(f"{key}: {raw!r} must use a private-use URI scheme") from None
+    scheme = parts.scheme
+    if not scheme or scheme in ("http", "https"):
+        raise ValueError(
+            f"{key}: {raw!r} must use a private-use URI scheme "
+            "(http and https redirects belong in api.oidc.redirect_uris)"
+        )
+    if "." not in scheme:
+        raise ValueError(
+            f"{key}: {raw!r} must use a reverse-DNS scheme such as com.example.app, "
+            f"not the bare scheme {scheme!r}"
+        )
+    if "@" in parts.netloc or parts.fragment or raw.endswith("#"):
+        raise ValueError(f"{key}: {raw!r} must carry no credential or fragment")
+    if not parts.path.strip("/") and not parts.netloc:
+        raise ValueError(f"{key}: {raw!r} must name a path after the scheme")
+    return raw
+
+
 class ApiOidcConfig(_ConfigModel):
     """`[api.oidc]`: sign-in through an OpenID Connect provider.
 
@@ -2834,6 +2866,9 @@ class ApiOidcConfig(_ConfigModel):
     client_secret_env: str = OIDC_CLIENT_SECRET_ENV
     #: Exact-match allowlist for the ``redirect_uri`` a client presents.
     redirect_uris: list[str] = Field(default_factory=list)
+    #: Exact-match allowlist for a native app's private-use scheme redirect
+    #: (RFC 8252 section 7.1), accepted beside ``redirect_uris``.
+    native_redirect_uris: list[str] = Field(default_factory=list)
     scopes: list[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
     #: The ID token's expected ``aud``; empty means ``client_id``.
     audience: str | None = None
@@ -2897,6 +2932,16 @@ class ApiOidcConfig(_ConfigModel):
     @classmethod
     def _redirects_are_https(cls, value: list[str]) -> list[str]:
         return [_oidc_url(uri, "api.oidc.redirect_uris") for uri in value]
+
+    @field_validator("native_redirect_uris")
+    @classmethod
+    def _native_redirects_are_private_use(cls, value: list[str]) -> list[str]:
+        return [_native_redirect(uri, "api.oidc.native_redirect_uris") for uri in value]
+
+    def allows_redirect(self, uri: str) -> bool:
+        """Whether a client may present ``uri``: an exact match against the
+        web redirects or the native ones."""
+        return uri in self.redirect_uris or uri in self.native_redirect_uris
 
     @field_validator("client_secret_env")
     @classmethod

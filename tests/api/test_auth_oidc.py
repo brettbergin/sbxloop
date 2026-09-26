@@ -232,10 +232,12 @@ def test_providers_describe_the_configured_provider_without_a_token(
             "client_id": CLIENT_ID,
             "scopes": ["openid", "email", "profile"],
             "end_session_url": ISSUER + "end-session/",
+            "native_redirect_uris": [],
         },
     }
     features = served.client.get("/v1/capabilities", headers=served.bearer()).json()["features"]
     assert "auth.oidc" in features
+    assert "auth.oidc.native" not in features
 
 
 def test_providers_offer_no_oidc_when_discovery_fails(served: Api, idp: FakeIdP) -> None:
@@ -494,6 +496,68 @@ def test_a_redirect_uri_outside_the_allowlist_is_refused_before_the_provider_is_
     _refused(served, 400, "oidc_invalid_request", redirect_uri=REDIRECT + "/evil")
     _refused(served, 400, "oidc_invalid_request", redirect_uri=REDIRECT.upper())
     assert idp.token_requests() == []
+
+
+# -- native-app redirect URIs (RFC 8252 section 7.1) --------------------------------
+
+NATIVE = "com.example.app:/oauth2/callback"
+
+
+@pytest.fixture
+def native(tmp_path: Path, idp: FakeIdP) -> Iterator[Api]:
+    yield from _serve(tmp_path, idp, native_redirect_uris=[NATIVE])
+
+
+def test_a_configured_native_redirect_is_redeemed_with_the_provider(
+    native: Api, idp: FakeIdP
+) -> None:
+    idp.identity("alice")
+
+    response = _exchange(native, redirect_uri=NATIVE)
+
+    assert response.status_code == 200, response.text
+    (request,) = idp.token_requests()
+    form = urllib.parse.parse_qs((request["body"] or b"").decode())
+    assert form["redirect_uri"] == [NATIVE]
+
+
+def test_the_web_redirect_still_works_beside_a_native_one(native: Api, idp: FakeIdP) -> None:
+    assert _sign_in(native, idp, "alice")["token_type"] == "Bearer"
+
+
+def test_a_native_redirect_that_is_not_configured_is_refused(native: Api, idp: FakeIdP) -> None:
+    idp.identity("alice")
+    for uri in (
+        "com.example.other:/oauth2/callback",
+        NATIVE + "/evil",
+        "COM.EXAMPLE.APP:/oauth2/callback",
+        "com.example.app://oauth2/callback",
+    ):
+        _refused(native, 400, "oidc_invalid_request", redirect_uri=uri)
+    assert idp.token_requests() == []
+
+
+def test_a_native_redirect_is_refused_when_none_is_configured(served: Api, idp: FakeIdP) -> None:
+    idp.identity("alice")
+    _refused(served, 400, "oidc_invalid_request", redirect_uri=NATIVE)
+    assert idp.token_requests() == []
+
+
+def test_providers_advertise_the_native_redirects_and_the_feature(native: Api) -> None:
+    oidc_out = native.client.get("/v1/auth/providers").json()["oidc"]
+    assert oidc_out["native_redirect_uris"] == [NATIVE]
+    features = native.client.get("/v1/capabilities", headers=native.bearer()).json()["features"]
+    assert "auth.oidc" in features
+    assert "auth.oidc.native" in features
+
+
+def test_native_redirects_are_not_advertised_while_oidc_is_off(tmp_path: Path) -> None:
+    built = build(tmp_path, oidc={**OIDC, "enabled": False, "native_redirect_uris": [NATIVE]})
+    with built.client:
+        assert built.client.get("/v1/auth/providers").json()["oidc"] is None
+        features = built.client.get("/v1/capabilities", headers=built.bearer()).json()["features"]
+    built.ctx.close()
+    assert "auth.oidc.native" not in features
 
 
 def test_an_unknown_provider_is_refused(served: Api, idp: FakeIdP) -> None:
@@ -919,6 +983,56 @@ def test_the_audience_defaults_to_the_client_id() -> None:
 def test_an_enabled_provider_must_be_complete_and_safe(overrides: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         ApiOidcConfig.model_validate({**OIDC, **overrides})
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "com.example.app:/oauth2/callback",
+        "com.example.app://oauth2/callback",
+        "net.example.my-app+beta:/cb",
+        "  com.example.app:/oauth2/callback  ",
+    ],
+)
+def test_a_reverse_dns_private_use_scheme_is_a_native_redirect(uri: str) -> None:
+    config = ApiOidcConfig.model_validate({**OIDC, "native_redirect_uris": [uri]})
+    assert config.native_redirect_uris == [uri.strip()]
+    assert config.redirect_uris == [REDIRECT]
+
+
+def test_native_redirects_default_to_none() -> None:
+    assert ApiOidcConfig.model_validate(OIDC).native_redirect_uris == []
+
+
+@pytest.mark.parametrize(
+    ("uri", "reason"),
+    [
+        ("app:/cb", "reverse-DNS"),
+        ("myapp://callback", "reverse-DNS"),
+        ("https://angie.example.test/auth/callback", "private-use"),
+        ("http://localhost:3000/cb", "private-use"),
+        ("com.example.app:", "path"),
+        ("com.example.app:/cb#frag", "fragment"),
+        ("com.example.app:/c b", "whitespace"),
+        ("com.example.app://user:pw@host/cb", "credential"),
+        ("/oauth2/callback", "private-use"),
+        ("1com.example:/cb", "private-use"),
+        ("", "private-use"),
+    ],
+)
+def test_a_malformed_native_redirect_is_refused_at_load(uri: str, reason: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        ApiOidcConfig.model_validate({**OIDC, "native_redirect_uris": [uri]})
+    message = str(caught.value)
+    assert "api.oidc.native_redirect_uris" in message
+    assert reason in message
+
+
+def test_native_redirects_do_not_relax_the_web_redirect_rules() -> None:
+    with pytest.raises(ValidationError):
+        ApiOidcConfig.model_validate(
+            {**OIDC, "redirect_uris": ["com.example.app:/oauth2/callback"]}
+        )
 
 
 def test_plain_http_is_allowed_only_for_localhost() -> None:
