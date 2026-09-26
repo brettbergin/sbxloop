@@ -128,8 +128,8 @@ class TestApiHostProbe:
         report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
         outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
         assert outcome.verdict == "unreachable" and outcome.drifts == []
-        assert "policy denies 127.0.0.1, 10.0.2.2" in outcome.detail
-        # The policy was asked about both addresses, scoped to the sandbox.
+        assert "policy denies 127.0.0.1, host.docker.internal, 10.0.2.2" in outcome.detail
+        # The policy was asked about all addresses, scoped to the sandbox.
         checks = [p for p in fake_sbx.policies() if p[:3] == ["check", "network", "127.0.0.1"]]
         assert checks and "--sandbox" in checks[0]
 
