@@ -3810,6 +3810,19 @@
       "LocalLoginRequest": {
         "additionalProperties": false,
         "properties": {
+          "invite_token": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invite Token"
+          },
           "password": {
             "maxLength": 1024,
             "minLength": 1,

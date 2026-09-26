@@ -210,6 +210,17 @@ def test_a_role_change_rewrites_the_client_capabilities(api: Any) -> None:
     assert _client_capabilities(api, owner.user.client_id) == set(ROLE_CAPABILITIES["member"])
 
 
+def test_set_role_records_the_same_audit_event_as_member_update(api: Any) -> None:
+    _owner(api)
+    _, user_id = _join(api, "member", "bea")
+
+    api.ctx.collaboration.set_role(user_id, "admin", now=api.clock())
+
+    events = _events(api, "workspace.member.updated")
+    assert len(events) == 1
+    assert json.loads(events[0].data_json) == {"user_id": user_id, "role": "admin"}
+
+
 def test_a_removed_member_loses_membership_and_capabilities(api: Any) -> None:
     owner = _owner(api)
     store = api.ctx.collaboration
@@ -582,6 +593,38 @@ def test_removing_a_member_ends_their_access(api: Any) -> None:
     assert member_id not in {entry["id"] for entry in directory}
     again = api.client.delete(f"/v1/workspace/members/{member_id}", headers=owner)
     assert again.status_code == 404 and _code(again) == "user_not_found"
+
+
+def test_removed_member_rejoins_with_their_password_and_a_new_invite(api: Any) -> None:
+    owner = _headers(_owner_token(api))
+    previous, user_id = _join(api, "member", "bea")
+    removed = api.client.delete(f"/v1/workspace/members/{user_id}", headers=owner)
+    assert removed.status_code == 204
+    assert api.client.get("/v1/users/me", headers=_headers(previous)).status_code == 401
+
+    invite = api.client.post(
+        "/v1/workspace/invites",
+        json={"role": "admin", "email": "bea@example.test"},
+        headers=owner,
+    ).json()
+    login = {
+        "username": "bea",
+        "password": "bea has a long password",
+        "invite_token": invite["token"],
+    }
+    wrong = api.client.post("/v1/auth/local/login", json={**login, "password": "wrong password"})
+    assert wrong.status_code == 401
+    assert _client_capabilities(api, previous["client_id"]) == set()
+
+    response = api.client.post("/v1/auth/local/login", json=login)
+    assert response.status_code == 200, response.text
+    fresh = response.json()
+    assert fresh["client_id"] == previous["client_id"]
+    assert set(fresh["scope"].split()) == set(ROLE_CAPABILITIES["admin"])
+    profile = api.client.get("/v1/users/me", headers=_headers(fresh))
+    assert profile.status_code == 200 and profile.json()["role"] == "admin"
+    assert api.ctx.collaboration.member_for_user(user_id).role == "admin"
+    assert len(_events(api, "workspace.invite.accepted")) == 2
 
 
 def test_invites_are_created_listed_and_revoked(api: Any) -> None:
@@ -1011,18 +1054,16 @@ def test_an_invite_grants_at_most_its_creators_current_role(api: Any) -> None:
     ] == [above["id"]]
     assert _registration(api, "cal", within["token"]).status_code == 201
 
-    # An owner invite whose creator is an admin by the time it is accepted
-    # admits an admin, with an admin's capabilities.
-    _, raw = store.create_invite("owner", None, created_by=owner_id, ttl_s=3600, now=api.clock())
+    # The legacy role helper now uses the audited update path, so an owner
+    # invite is withdrawn when its creator steps down to admin.
+    owner_invite, raw = store.create_invite(
+        "owner", None, created_by=owner_id, ttl_s=3600, now=api.clock()
+    )
     store.set_role(ada_id, "owner")
     assert store.set_role(owner_id, "admin").role == "admin"
     joined = _registration(api, "dan", raw)
-    assert joined.status_code == 201, joined.text
-    dan = store.member_for_client(joined.json()["client_id"])
-    assert dan is not None and dan.role == "admin"
-    assert _client_capabilities(api, joined.json()["client_id"]) == set(ROLE_CAPABILITIES["admin"])
-    accepted = _events(api, "workspace.invite.accepted")
-    assert json.loads(accepted[-1].data_json)["role"] == "admin"
+    assert joined.status_code == 403 and _code(joined) == "invite_invalid"
+    assert owner_invite.id not in _pending_invite_ids(api, owner)
 
 
 def test_the_endpoint_catalog_lists_only_real_workspace_methods() -> None:

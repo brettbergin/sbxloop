@@ -39,6 +39,8 @@ class LocalRegisterRequest(ApiModel):
 class LocalLoginRequest(ApiModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=1024)
+    #: A removed member may log in and spend a new workspace invite to rejoin.
+    invite_token: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class LocalUserOut(ApiModel):

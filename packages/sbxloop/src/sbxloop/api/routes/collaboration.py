@@ -462,6 +462,15 @@ async def login_local(
         raise Problem(401, "invalid_credentials", "unknown user or wrong password") from exc
     if user is None or not user.active:
         raise Problem(401, "invalid_credentials", "unknown user or wrong password")
+    if body.invite_token is not None:
+        try:
+            await ctx.call(ctx.collaboration.accept_invite, body.invite_token, user.id, now)
+        except CollaborationError as exc:
+            raise _problem(exc) from exc
+        updated_client = await ctx.call(ctx.auth.get_client, user.client_id)
+        assert updated_client is not None  # nosec B101 - account just authenticated
+        client = updated_client
+        ctx.hub.notify()
     for key in keys:
         ctx.limiter.reset(key)
     return await ctx.call(grant_tokens, ctx, client, family_id=None)
