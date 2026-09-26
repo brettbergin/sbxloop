@@ -200,11 +200,13 @@ class AgentDefinition:
         """Only a person's own agents are edited through the registry."""
         return self.source != "user"
 
-    def chat_persona(self) -> str:
-        """The block appended to the chat session's system message."""
-        from sbxloop.agents.builtin import chat_persona
+    def chat_persona(self, product: str | None = None) -> str:
+        """The block appended to the chat session's system message;
+        ``product`` is the name the product agent answers to (the shipped
+        one when not given)."""
+        from sbxloop.agents.builtin import CONCIERGE_NAME, chat_persona
 
-        return chat_persona(self)
+        return chat_persona(self, product or CONCIERGE_NAME)
 
     def run_persona(self) -> str:
         """The block a run session taken by this agent opens with: empty

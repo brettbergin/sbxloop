@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import Depends, Request
 from sqlalchemy.exc import SQLAlchemyError
 
+from sbxloop.agents.builtin import CONCIERGE_NAME
 from sbxloop.api.auth.store import AuthError, Client
 from sbxloop.api.auth.tokens import AccessClaims, TokenError, verify_access
 from sbxloop.api.collaboration import Member
@@ -40,6 +41,8 @@ class Authenticated:
     #: client with no local user; such a client keeps its capability grant.
     #: Removed or inactive human users are refused rather than becoming clients.
     member: Member | None = None
+    #: The name the product agent answers to, for what a refusal says.
+    assistant: str = CONCIERGE_NAME
 
 
 #: A member's last-seen time is written at most this often.
@@ -117,7 +120,12 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
         if seen is None or now - seen >= LAST_SEEN_INTERVAL_S:
             _touch_last_seen(ctx, member.user.id, now)
     return Authenticated(
-        principal=principal, claims=claims, client=client, token=token, member=member
+        principal=principal,
+        claims=claims,
+        client=client,
+        token=token,
+        member=member,
+        assistant=ctx.assistant_name,
     )
 
 
@@ -140,7 +148,9 @@ def member_of(auth: Authenticated) -> Member:
     profile has always been refused with."""
     member = auth.member
     if member is None or not member.user.active:
-        raise Problem(403, "local_profile_required", "this client is not the local Angie user")
+        raise Problem(
+            403, "local_profile_required", f"this client is not the local {auth.assistant} user"
+        )
     return member
 
 

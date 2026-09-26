@@ -201,6 +201,7 @@ def _providers(ctx: ApiContext) -> AuthProviders:
         local=ctx.api.local_auth_enabled,
         oidc=oidc,
         oidc_session_max_age_s=None if provider is None else provider.config.session_max_age_s,
+        assistant_name=ctx.assistant_name,
     )
 
 
