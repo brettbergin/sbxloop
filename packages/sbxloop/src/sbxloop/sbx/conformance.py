@@ -465,7 +465,8 @@ for host in dict.fromkeys(hosts):
     for route, opener in routes:
         try:
             with opener.open("http://" + netloc + ":" + str(PORT) + "/health/live", timeout=3) as r:
-                if json.loads(r.read(4096)) == {{"status": "ok"}}:
+                payload = json.loads(r.read(4096))
+                if isinstance(payload, dict) and payload.get("status") == "ok":
                     reached.append(host + "/" + route)
         except Exception:
             pass
@@ -499,7 +500,7 @@ def _probe_api_host_unreachable(ctx: ProbeContext) -> tuple[str, str]:
         return "reachable", f"the API answered from inside the sandbox: {detail}"
     if verdict != "unreachable":
         return "unknown", f"the in-sandbox probe answered {line!r} (rc={result.returncode})"
-    hosts = ["127.0.0.1"]
+    hosts = ["127.0.0.1", "host.docker.internal"]
     if detail.startswith("gateway="):
         hosts.append(detail.removeprefix("gateway="))
     hosts.extend(host for host in extra if host not in hosts)

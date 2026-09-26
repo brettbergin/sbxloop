@@ -537,12 +537,17 @@ def cmd_rm(root: Path, args: list[str]) -> int:
 def cmd_policy(root: Path, args: list[str]) -> int:
     append_jsonl(root / "policies.jsonl", {"args": args, "ts": time.time()})
     if args[:1] == ["check"]:
-        # A domain allowlist never admits a bare address: loopback and the
-        # host gateway read as denied (the verdict the api-host-unreachable
-        # probe depends on; SBX_FAKE_API_REACH flips it for drift tests).
+        # A domain allowlist never admits a bare address or the host alias:
+        # these read as denied unless a drift test explicitly allows them.
         host = args[2] if len(args) > 2 else ""
         literal = host.replace(".", "").isdigit()
-        if literal and not os.environ.get("SBX_FAKE_API_REACH", "").startswith("policy"):
+        host_alias = host == "host.docker.internal"
+        alias_allowed = bool(os.environ.get("SBX_FAKE_HOST_ALIAS_ALLOWED"))
+        if (
+            (literal or host_alias)
+            and not os.environ.get("SBX_FAKE_API_REACH", "").startswith("policy")
+            and not (host_alias and alias_allowed)
+        ):
             print(f"network access to {host} denied by policy")
         elif literal:
             print("allowed")
