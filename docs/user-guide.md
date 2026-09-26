@@ -550,44 +550,53 @@ print(result.state, result.run_id)
 
 ### Platform support
 
-sbxloop runs on Linux and macOS. The hard constraint is the sandbox layer:
-every run, the daemon and the bake boot Docker Sandboxes microVMs through
-`sbx`, which Docker ships for those two systems.
+sbxloop runs on Linux, macOS and native Windows through Docker Sandboxes.
+Docker's native Windows backend requires [Windows 11 x64 and Windows
+Hypervisor Platform](https://docs.docker.com/ai/sandboxes/install/). The
+older WSL2 route is also available: install a
+Linux distribution, turn on Docker Desktop's WSL integration for it, and
+install sbxloop inside that distribution.
 
-On **Windows** the supported path is **WSL2**: install a Linux distribution,
-turn on Docker Desktop's WSL integration for it, and install sbxloop inside
-that distribution — the install script, `sbxloop init`, the daemon and the
-console all run there unchanged, and `sbxloop doctor` reports the host as
-WSL. Developing sbxloop on Windows works the same way: clone and run the
-test suite inside the distribution. Native Windows is refused by name:
-`sbxloop run`, `resume`, `shell`, `daemon` and `bake` exit with a line
-naming the WSL2 path before writing any state, and `sbxloop doctor`'s
-first row (`host`) says the same. The read-only commands still answer so
-the refusal can be diagnosed from the host itself.
+For a native Windows install, first install Git and uv (see the
+[uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)).
+Then run this in PowerShell:
 
-What a **native Windows** host does support, precisely, is that diagnosis
-— and nothing beyond it:
+```powershell
+uvx --python 3.13 --from sbxloop sbxloop init --no-systemd
+& "$env:USERPROFILE\.sbxloop\bin\sbxloop.cmd" doctor
+```
+
+`init` fetches the pinned `DockerSandboxes.msi` from Docker's release and
+installs it for the current user. It verifies that `sbx.exe` reports the
+requested version before recording it. The MSI owns that binary under
+`%LOCALAPPDATA%\DockerSandboxes\bin`; sbxloop does not copy it into its
+home. The first shell can run sbxloop through the launcher above; later
+shells can add `%USERPROFILE%\.sbxloop\bin` to `PATH`.
+
+Native Windows details and current limits:
 
 - **The home resolves from `USERPROFILE`.** A Windows session need not set
   a Unix `HOME`, so the home, `config\sbxloop.toml` and `config\secrets.env`
   are all found from `%USERPROFILE%\.sbxloop` (or `%HOMEDRIVE%%HOMEPATH%`).
   `SBXLOOP_HOME` overrides it as it does anywhere, spaces in the path and
-  all. `doctor`, `config` and `logs` therefore read the same home the
-  process runs out of, which is what makes the refusal legible.
+  all.
 - **`sbxloop init` writes a `bin\sbxloop.cmd`, not a shell script**, and
   points it at `venv\Scripts\sbxloop.exe`. It writes no `bin\sbx`
-  wrapper: there is no native Windows `sbx` for one to stand in front of,
-  and `init` says so in its notes.
+  wrapper: Docker's MSI owns `sbx.exe`, which the Python client finds from
+  `LOCALAPPDATA` even before a new shell inherits the MSI's `PATH` change.
 - **Secrets are private by ACL, not by mode.** `chmod 600` does nothing on
   Windows — a file written that way still reports `0666` — so
   `config\secrets.env` is restricted with `icacls` and doctor's
   `secrets file` row reads the ACL back. A host whose ACL could not be
   read **fails** that row saying so, rather than passing a file it could
   not vouch for.
-- **`sbxloop init --sbx` is not supported.** The sbx installer and its
-  release assets are POSIX (`install.sh`, `.tar.gz`); installing the
-  sandbox runtime natively is the WSL2 path above. The agent backends
-  themselves are not the constraint here — the sandbox layer is.
+- **No native service installer is included.** `--systemd` is for Linux;
+  use `--no-systemd` and run `sbxloop daemon` in a supervised Windows
+  session if unattended operation is needed.
+- **Live sandbox boot remains field-unverified.** The Windows CI job checks
+  native host paths and ACLs, installs the real MSI and initializes a home;
+  hosted runners do not prove nested microVM boot. Use `sbxloop doctor` to
+  check this host's backend and prerequisites before a run.
 
 ## How a run works
 
