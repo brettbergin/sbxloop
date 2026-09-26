@@ -7,6 +7,13 @@ check passes. The host gate now lets Windows reach backend readiness checks;
 the Windows CI job installs the real MSI and initializes a home. Live sandbox
 boot on a Windows Hypervisor Platform host remains field-unverified. (#899)
 
+**A removed local member can rejoin with a new invite at login.** The
+account's username and email remain reserved after removal, so registering
+again could not work. The existing login now accepts an optional
+`invite_token`, checks the password first, restores membership with the
+invite's role and returns tokens with the new capabilities. The old
+`set_role` helper uses the audited member update path. (#1238)
+
 **The daily token budget is documented as a soft start threshold.** It
 checks reported usage before work starts. Concurrent starts can all pass
 before a charge arrives, and runs or chat turns already in flight continue
