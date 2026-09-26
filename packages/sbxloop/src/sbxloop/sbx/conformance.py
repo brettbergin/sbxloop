@@ -465,7 +465,8 @@ for host in dict.fromkeys(hosts):
     for route, opener in routes:
         try:
             with opener.open("http://" + netloc + ":" + str(PORT) + "/health/live", timeout=3) as r:
-                if json.loads(r.read(4096)) == {{"status": "ok"}}:
+                payload = json.loads(r.read(4096))
+                if isinstance(payload, dict) and payload.get("status") == "ok":
                     reached.append(host + "/" + route)
         except Exception:
             pass

@@ -285,7 +285,21 @@ class TestApiProbeScript:
             listener.close()
 
     def test_the_api_answering_its_liveness_route_is_reachable(self) -> None:
-        listener = _Http(200, b'{"status":"ok"}')
+        from sbxloop.api.models import Health
+
+        listener = _Http(200, Health().model_dump_json().encode())
+        try:
+            line = self._run(listener.port)
+        finally:
+            listener.close()
+        assert line.startswith("reachable") and "127.0.0.1" in line
+
+    def test_extra_health_fields_do_not_hide_a_reachable_api(self) -> None:
+        from sbxloop.api.models import Health
+
+        payload = json.loads(Health().model_dump_json())
+        payload["version"] = "1.2"
+        listener = _Http(200, json.dumps(payload).encode())
         try:
             line = self._run(listener.port)
         finally:
