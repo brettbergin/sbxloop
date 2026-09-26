@@ -736,6 +736,30 @@ def test_example_agent_entry_loads_with_its_credential_and_server() -> None:
     assert resolved.source == "config"
 
 
+def test_example_documents_renaming_the_assistant() -> None:
+    """The commented `[[agents]]` entry for `concierge` loads on its own and
+    renames the assistant without changing its slug."""
+    from sbxloop.agents.registry import ConfigAgentRegistry
+
+    lines = EXAMPLE.read_text().splitlines()
+    start = next(
+        i
+        for i, line in enumerate(lines)
+        if line == "# [[agents]]" and lines[i + 1] == '# slug = "concierge"'
+    )
+    text = ""
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            break
+        text += re.sub(r"\s{2,}#.*$", "", re.sub(r"^#\s?", "", line)) + "\n"
+    entry = tomllib.loads(text)
+    registry = ConfigAgentRegistry(Config.model_validate({"agents": [entry]}))
+    concierge = registry.get(entry["aliases"][0])
+    assert concierge is not None and concierge.slug == "concierge"
+    assert concierge.spec.name == entry["name"] != "Angie"
+    assert f"You are {entry['name']}," in concierge.chat_persona()
+
+
 def test_example_credential_entry_loads() -> None:
     """The commented `[[credentials]]` entry loads as one block: its keys
     are coupled (a bare `X-Api-Key` header wants `scheme = ""`), so it is

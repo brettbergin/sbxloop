@@ -28,6 +28,7 @@ from concurrent.futures import (
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from sbxloop.agents.assignment import RUN_ROLES, agent_memory_block
+from sbxloop.agents.builtin import concierge_handle, concierge_name, product_persona
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
@@ -36,7 +37,7 @@ from sbxloop.agents.registry import (
     default_registry,
 )
 from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools, work_granted
-from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
+from sbxloop.api.agents import ANGIE_SLUG, AgentDefinition
 from sbxloop.api.ambient import AMBIENT, AmbientSelector, classifier_prompt, is_relevant
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -420,6 +421,17 @@ class ApiContext:
         return cached[1]
 
     @property
+    def assistant_name(self) -> str:
+        """The name the product agent (``concierge``) answers to: the
+        shipped one unless a ``[[agents]]`` entry renames it."""
+        return concierge_name(self.agents.get(ANGIE_SLUG))
+
+    @property
+    def assistant_handle(self) -> str:
+        """How a person addresses the product agent in prose (``@handle``)."""
+        return concierge_handle(self.agents.get(ANGIE_SLUG))
+
+    @property
     def memory(self) -> MemoryService:
         """Every agent's long-term memory, bounded by the config held now."""
         cached = self._memory
@@ -642,7 +654,8 @@ class ApiContext:
     def _agent_name(self, slug: str | None) -> str:
         """An agent as a notification names it: its display name, and the
         default assistant for a reply nobody is named on."""
-        slug = slug or ANGIE_SLUG
+        if not slug or slug == ANGIE_SLUG:
+            return self.assistant_name
         agent = self.agents.get(slug)
         return agent.spec.name if agent is not None else slug
 
@@ -863,6 +876,8 @@ class ApiContext:
         addressed: list[str] = []
         for role, slug in _recorded_assignees(turn).items():
             turn_roles.setdefault(role, slug)
+        # How a failure names the product agent when it answered.
+        handle = self.assistant_handle
         index = 0
         while True:
             # The daemon reads its own accepted turn: whoever asked may have
@@ -969,7 +984,10 @@ class ApiContext:
                 agent_tools += self._agent_work(
                     definition, turn.channel_id, on_behalf_of=author, depth=depth
                 )
-            persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
+            product = self.assistant_name
+            persona = (
+                definition.persona_in(product) if definition else product_persona(product)
+            ) + memory_block
             persona += preference_context
             model = definition.agent.spec.model if definition and definition.agent else None
             # A named agent acts in its own persona, so it keeps its tools;
@@ -1149,9 +1167,9 @@ class ApiContext:
                     if delivered is not None and reply.after is not None:
                         reply.after()
                 else:
-                    errors.append(reply.error or f"@{target or 'angie'} did not answer")
+                    errors.append(reply.error or f"@{target or handle} did not answer")
             except Exception:
-                errors.append(f"@{target or 'angie'} could not finish. Check the daemon logs.")
+                errors.append(f"@{target or handle} could not finish. Check the daemon logs.")
             if len(errors) > previous_errors:
                 store.participant_failed(turn.id, index, errors[-1], self.clock())
             self.hub.notify()

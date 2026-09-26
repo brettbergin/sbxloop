@@ -383,6 +383,16 @@ service_memory = "2g"
 # aliases = ["weatherbot"]  # other @-names for it, never another agent's
 # enabled = true  # false hides it and routes nothing to it
 
+# Renaming the assistant: an entry for `concierge` sets the name the agent
+# that speaks as the product calls itself, which the agent directory, the
+# preference prompts and GET /v1/auth/providers (before sign-in) show;
+# `aliases` replaces its @-names (keep "angie" to keep @angie). Its slug,
+# chat sessions and stored history keep their names.
+# [[agents]]
+# slug = "concierge"
+# name = "Robin"  # unset: Angie
+# aliases = ["robin", "angie"]  # unset: ["angie"]
+
 # [memory]
 # Each agent's long-term memory: what it, or a person through the API,
 # chose to keep beyond one conversation. A memory learned in a channel is

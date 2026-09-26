@@ -209,6 +209,7 @@ def test_providers_offer_only_local_login_when_oidc_is_off(api: Api) -> None:
         "local": True,
         "oidc": None,
         "policy_version": 1,
+        "assistant_name": "Angie",
         "oidc_session_max_age_s": None,
     }
     features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
@@ -224,6 +225,7 @@ def test_providers_describe_the_configured_provider_without_a_token(
     assert response.json() == {
         "local": True,
         "policy_version": 1,
+        "assistant_name": "Angie",
         "oidc_session_max_age_s": 28800,
         "oidc": {
             "id": "authentik",
@@ -250,6 +252,7 @@ def test_providers_offer_no_oidc_when_discovery_fails(served: Api, idp: FakeIdP)
         "local": True,
         "oidc": None,
         "policy_version": 1,
+        "assistant_name": "Angie",
         "oidc_session_max_age_s": 28800,
     }
 

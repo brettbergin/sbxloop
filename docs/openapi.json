@@ -831,6 +831,10 @@
       "AuthProviders": {
         "additionalProperties": false,
         "properties": {
+          "assistant_name": {
+            "title": "Assistant Name",
+            "type": "string"
+          },
           "local": {
             "title": "Local",
             "type": "boolean"
@@ -864,7 +868,8 @@
         },
         "required": [
           "local",
-          "oidc"
+          "oidc",
+          "assistant_name"
         ],
         "title": "AuthProviders",
         "type": "object"

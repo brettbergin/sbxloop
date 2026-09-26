@@ -75,7 +75,7 @@ people in through the provider. `GET /v1/auth/providers` needs no token and
 answers:
 
 ```json
-{"local": true,
+{"local": true, "assistant_name": "Angie",
  "oidc": {"id": "authentik", "label": "Authentik",
           "authorize_url": "https://auth.example.com/application/o/authorize/",
           "client_id": "angie", "scopes": ["openid", "email", "profile"],
@@ -136,6 +136,13 @@ for the configuration and role mapping.
 built-ins (Angie and the planner, builder, critic and operator), then the
 operator's `[[agents]]` from `sbxloop.toml`, then the agents people saved.
 `GET /v1/agents/{slug}` also answers an alias and a retired built-in name.
+The assistant that speaks as the product is always the slug `concierge`.
+Under its shipped name it is listed as `Concierge`, as it always has been;
+an operator who renames it (a `[[agents]]` entry for `concierge` with a
+`name` and `aliases`) has it listed under that name, and its persona, the
+other agents' prompts, `GET /v1/prompts/definitions` and the refusals that
+name it use the same name. Before anyone signs in, `GET /v1/auth/providers`
+reports it as `assistant_name` (`"Angie"` unless renamed).
 Beside the original fields, each entry carries its identity (`avatar`, a
 `#rrggbb` `color`, `aliases`), its narrowing (`roles`, `tools`, `skills`,
 `mcp`, `credentials`, `interests`, `can_start`, `max_runs_per_day`),

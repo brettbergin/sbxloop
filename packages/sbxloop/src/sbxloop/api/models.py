@@ -278,6 +278,9 @@ class AuthProviders(ApiModel):
     local: bool
     #: The OpenID Connect provider, when one is configured and reachable.
     oidc: OidcProviderOut | None
+    #: The name the product agent (``concierge``) answers to, so a
+    #: signed-out client can say who it is signing in to.
+    assistant_name: str
 
 
 class OidcTokenRequest(ApiModel):

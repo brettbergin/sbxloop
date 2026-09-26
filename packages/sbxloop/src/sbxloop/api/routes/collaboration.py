@@ -106,13 +106,13 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
         "name": "personality",
         "label": "Personality",
-        "description": "How would you like Angie to communicate with you?",
+        "description": "How would you like {assistant} to communicate with you?",
         "placeholder": "formal, casual, friendly, brief, etc.",
     },
     {
         "name": "interests",
         "label": "Interests",
-        "description": "What are your main interests and areas Angie should know about?",
+        "description": "What are your main interests and areas {assistant} should know about?",
         "placeholder": "cybersecurity, woodworking, gaming, gardening...",
     },
     {
@@ -124,7 +124,7 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
         "name": "priorities",
         "label": "Priorities",
-        "description": "What are your top priorities that Angie should always keep in mind?",
+        "description": "What are your top priorities that {assistant} should always keep in mind?",
         "placeholder": "monitoring communications, GitHub alerts, email tracking...",
     },
     {
@@ -136,7 +136,7 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
         "name": "home",
         "label": "Home",
-        "description": "Describe your home setup relevant for Angie (devices and location).",
+        "description": "Describe your home setup relevant for {assistant} (devices and location).",
         "placeholder": "Hue lights, Home Assistant, Ubiquiti network...",
     },
     {
@@ -148,11 +148,19 @@ PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
         "name": "style",
         "label": "Style",
-        "description": "How detailed should Angie's responses be? Any tone preferences?",
+        "description": "How detailed should {assistant}'s responses be? Any tone preferences?",
         "placeholder": "English, kind and light, detailed and verbose...",
     },
 )
 PREFERENCE_NAMES = frozenset(item["name"] for item in PREFERENCE_DEFINITIONS)
+
+
+def _preference_definitions(assistant: str) -> list[dict[str, str]]:
+    """The preference prompts, naming the product agent as ``assistant``."""
+    return [
+        {**item, "description": item["description"].format(assistant=assistant)}
+        for item in PREFERENCE_DEFINITIONS
+    ]
 
 
 def _problem(exc: CollaborationError) -> Problem:
@@ -618,9 +626,13 @@ def _preference_name(name: str) -> str:
 
 @router.get("/prompts/definitions", response_model=list[PreferenceDefinitionOut])
 async def preference_definitions(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> list[PreferenceDefinitionOut]:
-    return [PreferenceDefinitionOut.model_validate(item) for item in PREFERENCE_DEFINITIONS]
+    return [
+        PreferenceDefinitionOut.model_validate(item)
+        for item in _preference_definitions(ctx.assistant_name)
+    ]
 
 
 @router.get("/prompts", response_model=list[PreferenceOut])
@@ -1021,7 +1033,8 @@ async def create_turn(
         raise Problem(
             422,
             "runner_target_conflict",
-            "Code and workload runner turns are coordinated by Angie; omit target_slugs.",
+            f"Code and workload runner turns are coordinated by {ctx.assistant_name}; "
+            "omit target_slugs.",
         )
     # Agent mentions remain part of an explicit runner ask, but do not seed
     # parallel chat participants. The runner owns its own internal roles.
